@@ -4,7 +4,7 @@
 
 Build a lightweight, terminal-first Zulip client with a reusable Rust core, a scriptable CLI, and a fast TUI. The first version should focus only on Zulip reading, digest/search, local cache, and safe draft/reply mechanics. It should be useful over SSH, avoid Electron, and provide a clean base for future LibreQoS-specific triage features without requiring them now.
 
-Working binary name in this PRD: `zq`.
+Working binaries in this PRD: `zul-cli` for scriptable CLI workflows and `zul-tui` for the terminal UI.
 
 ## Background
 
@@ -73,16 +73,16 @@ The first useful version should provide:
 Representative commands:
 
 ```bash
-zq auth login
-zq auth status
-zq sync --hours 24
-zq streams
-zq topics "core team"
-zq topic "core team" "Release 1.6"
-zq search "installer"
-zq digest --hours 24
-zq reply --stream "core team" --topic "Release 1.6" --message "Looking now."
-zq tui
+zul-cli auth login
+zul-cli auth status
+zul-cli sync --hours 24
+zul-cli streams
+zul-cli topics "core team"
+zul-cli topic "core team" "Release 1.6"
+zul-cli search "installer"
+zul-cli digest --hours 24
+zul-cli reply --stream "core team" --topic "Release 1.6" --message "Looking now."
+zul-tui
 ```
 
 CLI behavior:
@@ -172,8 +172,8 @@ Normalize API responses into app-owned structs before caching. Preserve raw JSON
 
 Config locations:
 
-- Linux config: `$XDG_CONFIG_HOME/zq/config.toml`
-- Linux cache: `$XDG_CACHE_HOME/zq/cache.sqlite`
+- Linux config: `$XDG_CONFIG_HOME/zul/config.toml`
+- Linux cache: `$XDG_CACHE_HOME/zul/cache.sqlite`
 
 Environment overrides:
 
@@ -252,7 +252,7 @@ Search:
 
 ## Digest Requirements
 
-`zq digest --hours 24` should produce a useful summary without AI requirements:
+`zul-cli digest --hours 24` should produce a useful summary without AI requirements:
 
 - Activity grouped by stream/topic.
 - Likely bug/help/question items using simple keyword heuristics.
@@ -446,8 +446,8 @@ These are intentionally outside the core PRD.
 
 ## Success Metrics
 
-- `zq digest --hours 24` can replace the current Zulip summary script for read-only digest use.
-- `zq tui` starts quickly from cache and makes stream/topic review faster than opening Zulip web for routine triage.
+- `zul-cli digest --hours 24` can replace the current Zulip summary script for read-only digest use.
+- `zul-tui` starts quickly from cache and makes stream/topic review faster than opening Zulip web for routine triage.
 - Cached search finds known messages reliably.
 - Human and JSON outputs are stable enough for cron/OpenClaw integration.
 - No send action can happen accidentally in normal use.
@@ -464,7 +464,7 @@ These are intentionally outside the core PRD.
 
 ## Open Questions
 
-- Should the binary be named `zq`, `zulipq`, `zcli`, or something else?
+- Should the binaries stay named `zul-cli` and `zul-tui`, or should a future release add shorter aliases?
 - Should v1 support multiple Zulip realms or only one?
 - Should v1 include sends, or defer all writes until the reader is solid?
 - Should SQLite use `sqlx` or `rusqlite`?
@@ -473,11 +473,11 @@ These are intentionally outside the core PRD.
 
 ## Suggested First Coding Loop Prompt
 
-Build Phase 1 of `zq`: a Rust CLI core for Zulip sync, digest, and search backed by SQLite.
+Build Phase 1 of `zul-cli`: a Rust CLI core for Zulip sync, digest, and search backed by SQLite.
 
 Requirements:
 
-- Create a Rust workspace with one binary named `zq`.
+- Create a Rust workspace with separate `zul-cli` and `zul-tui` binaries.
 - Use `clap`, `tokio`, `reqwest`, `serde`, `tracing`, and SQLite.
 - Load Zulip config from env vars and a config file.
 - Implement `auth status`, `sync --hours <n>`, `streams`, `topics <stream>`, `topic <stream> <topic>`, `search <query>`, and `digest --hours <n>`.

@@ -56,6 +56,46 @@ pub struct ZulipMessage {
     pub raw_json: serde_json::Value,
 }
 
+/// Renderable image attachment discovered in a Zulip message.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImageAttachment {
+    /// Zulip message ID that referenced the image.
+    pub message_id: i64,
+    /// Original image URL as it appeared in rendered Zulip HTML.
+    pub source_url: String,
+    /// Absolute URL suitable for fetching the image.
+    pub absolute_url: String,
+    /// Optional alternate text from the HTML.
+    pub alt_text: Option<String>,
+    /// Best-effort filename or label for placeholder rendering.
+    pub filename_hint: Option<String>,
+}
+
+impl ImageAttachment {
+    /// Stable cache key for this image URL.
+    pub fn cache_key(&self) -> String {
+        self.absolute_url.clone()
+    }
+
+    /// Human-facing label for terminal placeholders.
+    pub fn label(&self) -> String {
+        self.filename_hint
+            .as_ref()
+            .or(self.alt_text.as_ref())
+            .cloned()
+            .unwrap_or_else(|| self.absolute_url.clone())
+    }
+}
+
+/// Image bytes fetched for terminal rendering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageBytes {
+    /// Raw encoded image bytes.
+    pub bytes: Vec<u8>,
+    /// HTTP content type when available.
+    pub content_type: Option<String>,
+}
+
 /// Current Zulip user identity.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CurrentUser {

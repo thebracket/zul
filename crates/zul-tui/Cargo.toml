@@ -5,6 +5,10 @@ edition.workspace = true
 description = "Ratatui interface for Zulip"
 license.workspace = true
 
+[features]
+default = ["tui-images"]
+tui-images = ["dep:image", "dep:ratatui-image"]
+
 [[bin]]
 name = "zul-tui"
 path = "src/main.rs"
@@ -13,8 +17,11 @@ path = "src/main.rs"
 anyhow.workspace = true
 chrono.workspace = true
 crossterm.workspace = true
+image = { workspace = true, optional = true }
+dotenvy.workspace = true
 libzul.workspace = true
 ratatui.workspace = true
+ratatui-image = { workspace = true, optional = true }
 tokio.workspace = true
 tracing-subscriber.workspace = true
 

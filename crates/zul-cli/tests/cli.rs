@@ -8,7 +8,7 @@ fn offline_sync_json_is_stable() {
     let cache_dir = TempDir::new().unwrap();
     let config_dir = TempDir::new().unwrap();
 
-    let mut cmd = Command::cargo_bin("zq").unwrap();
+    let mut cmd = Command::cargo_bin("zul-cli").unwrap();
     cmd.env("XDG_CACHE_HOME", cache_dir.path())
         .env("XDG_CONFIG_HOME", config_dir.path())
         .args(["--json", "--offline", "sync", "--hours", "1"])
@@ -32,10 +32,10 @@ fn auth_login_reads_dotenv_values() {
     )
     .unwrap();
 
-    let mut cmd = Command::cargo_bin("zq").unwrap();
+    let mut cmd = Command::cargo_bin("zul-cli").unwrap();
     cmd.env("XDG_CACHE_HOME", cache_dir.path())
         .env("XDG_CONFIG_HOME", config_dir.path())
-        .env("ZQ_DOTENV", &dotenv_path)
+        .env("ZUL_DOTENV", &dotenv_path)
         .args(["--json", "auth", "login"])
         .assert()
         .success()
@@ -48,7 +48,7 @@ fn auth_login_reads_dotenv_values() {
         .stdout(predicate::str::contains("\"secret_saved\": true"));
 
     assert_eq!(
-        fs::read_to_string(config_dir.path().join("zq").join("api_key")).unwrap(),
+        fs::read_to_string(config_dir.path().join("zul").join("api_key")).unwrap(),
         "dotenv-secret\n"
     );
 }

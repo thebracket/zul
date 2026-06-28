@@ -5,24 +5,40 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+#[cfg(feature = "tui-images")]
+use image::ImageReader;
 use libzul::app::{App, PollResult};
-use libzul::config::{Settings, ThemeConfig};
+use libzul::config::{ImageMode, Settings, ThemeConfig};
 use libzul::digest::{self, Digest};
-use libzul::zulip::models::{ZulipMessage, ZulipStream, ZulipTopic};
+use libzul::zulip::models::{ImageAttachment, ImageBytes, ZulipMessage, ZulipStream, ZulipTopic};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
-use std::collections::BTreeMap;
+#[cfg(feature = "tui-images")]
+use ratatui_image::picker::{Picker, ProtocolType};
+#[cfg(feature = "tui-images")]
+use ratatui_image::protocol::StatefulProtocol;
+#[cfg(feature = "tui-images")]
+use ratatui_image::{Resize, StatefulImage};
+use std::collections::{BTreeMap, BTreeSet};
+#[cfg(feature = "tui-images")]
+use std::io::Cursor;
 use std::io::{self, Stdout};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
+const IMAGE_ROWS: u16 = 8;
 
 type PollEvent = Result<PollResult, String>;
+type ImageEvent = (ImageAttachment, Result<ImageBytes, String>);
+#[cfg(feature = "tui-images")]
+type ImagePicker = Picker;
+#[cfg(not(feature = "tui-images"))]
+struct ImagePicker;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -62,6 +78,15 @@ struct TuiState {
     last_poll_at: Option<DateTime<Utc>>,
     last_poll_new: usize,
     poll_error: Option<String>,
+    image_entries: BTreeMap<String, ThreadImageEntry>,
+    image_inflight: BTreeSet<String>,
+}
+
+struct ThreadImageEntry {
+    #[cfg(feature = "tui-images")]
+    protocol: Option<StatefulProtocol>,
+    #[cfg(feature = "tui-images")]
+    error: Option<String>,
 }
 
 impl TuiState {
@@ -89,6 +114,8 @@ impl TuiState {
             last_poll_at: None,
             last_poll_new: 0,
             poll_error: None,
+            image_entries: BTreeMap::new(),
+            image_inflight: BTreeSet::new(),
         };
         state.reload_topics(app)?;
         state.reload_messages(app)?;
@@ -219,7 +246,8 @@ impl TuiState {
 pub async fn run(app: App) -> Result<()> {
     let theme = TuiTheme::resolve(app.settings())?;
     let mut terminal = setup_terminal()?;
-    let result = run_loop(&mut terminal, app, theme).await;
+    let image_picker = detect_image_picker(app.settings());
+    let result = run_loop(&mut terminal, app, theme, image_picker).await;
     restore_terminal(&mut terminal)?;
     result
 }
@@ -228,22 +256,31 @@ async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: App,
     theme: TuiTheme,
+    image_picker: Option<ImagePicker>,
 ) -> Result<()> {
     let mut state = TuiState::load(&app)?;
     let (poll_tx, poll_rx) = mpsc::channel();
+    let (image_tx, image_rx) = mpsc::channel();
     let mut next_poll_at = Instant::now() + POLL_INTERVAL;
     let mut poll_inflight = false;
 
     loop {
         drain_poll_events(&poll_rx, &mut poll_inflight, &mut state, &app)?;
+        drain_image_events(&image_rx, &mut state, image_picker.as_ref());
         if !app.offline() && !poll_inflight && Instant::now() >= next_poll_at {
             state.status = "polling Zulip...".to_string();
             spawn_poll(app.settings().clone(), app.offline(), poll_tx.clone());
             poll_inflight = true;
             next_poll_at = Instant::now() + POLL_INTERVAL;
         }
+        maybe_spawn_selected_image_fetch(
+            &mut state,
+            &app,
+            image_tx.clone(),
+            image_picker.as_ref().is_some(),
+        );
 
-        terminal.draw(|frame| draw(frame, &state, &app, &theme))?;
+        terminal.draw(|frame| draw(frame, &mut state, &app, &theme, image_picker.as_ref()))?;
         if !event::poll(Duration::from_millis(150))? {
             continue;
         }
@@ -419,6 +456,111 @@ fn spawn_poll(settings: Settings, offline: bool, poll_tx: Sender<PollEvent>) {
     });
 }
 
+#[cfg(feature = "tui-images")]
+fn detect_image_picker(settings: &Settings) -> Option<ImagePicker> {
+    if settings.ui.images != ImageMode::Auto {
+        return None;
+    }
+    let Ok(picker) = Picker::from_query_stdio() else {
+        return None;
+    };
+    (picker.protocol_type() != ProtocolType::Halfblocks).then_some(picker)
+}
+
+#[cfg(not(feature = "tui-images"))]
+fn detect_image_picker(_settings: &Settings) -> Option<ImagePicker> {
+    None
+}
+
+#[cfg(feature = "tui-images")]
+fn drain_image_events(
+    image_rx: &Receiver<ImageEvent>,
+    state: &mut TuiState,
+    picker: Option<&ImagePicker>,
+) {
+    while let Ok((attachment, result)) = image_rx.try_recv() {
+        let key = attachment.cache_key();
+        state.image_inflight.remove(&key);
+        let mut entry = ThreadImageEntry {
+            protocol: None,
+            error: None,
+        };
+        match (result, picker) {
+            (Ok(image), Some(picker)) => match decode_image(image.bytes) {
+                Ok(decoded) => {
+                    entry.protocol = Some(picker.new_resize_protocol(decoded));
+                    state.status = "image ready".to_string();
+                }
+                Err(err) => {
+                    entry.error = Some(format!("image decode failed: {err}"));
+                    state.status = "image decode failed".to_string();
+                }
+            },
+            (Ok(_), None) => {
+                entry.error = Some("terminal image protocol unavailable".to_string());
+            }
+            (Err(err), _) => {
+                state.status = format!("image unavailable: {err}");
+                entry.error = Some(err);
+            }
+        }
+        state.image_entries.insert(key, entry);
+    }
+}
+
+#[cfg(not(feature = "tui-images"))]
+fn drain_image_events(
+    image_rx: &Receiver<ImageEvent>,
+    state: &mut TuiState,
+    _picker: Option<&ImagePicker>,
+) {
+    while let Ok((attachment, result)) = image_rx.try_recv() {
+        state.image_inflight.remove(&attachment.cache_key());
+        if let Err(err) = result {
+            state.status = format!("image unavailable: {err}");
+        }
+    }
+}
+
+#[cfg(feature = "tui-images")]
+fn decode_image(bytes: Vec<u8>) -> Result<image::DynamicImage> {
+    ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .context("detecting image format")?
+        .decode()
+        .context("decoding image")
+}
+
+fn maybe_spawn_selected_image_fetch(
+    state: &mut TuiState,
+    app: &App,
+    image_tx: Sender<ImageEvent>,
+    terminal_images_supported: bool,
+) {
+    if app.settings().ui.images != ImageMode::Auto || !terminal_images_supported {
+        return;
+    }
+    let Some(message) = state.messages.get(state.message_idx) else {
+        return;
+    };
+    let Some(attachment) = app.image_attachments(message).into_iter().next() else {
+        return;
+    };
+    let key = attachment.cache_key();
+    if state.image_entries.contains_key(&key) || state.image_inflight.contains(&key) {
+        return;
+    }
+    state.image_inflight.insert(key);
+    let settings = app.settings().clone();
+    let offline = app.offline();
+    tokio::spawn(async move {
+        let result = App::fetch_image_bytes_with_settings(settings, offline, attachment.clone())
+            .await
+            .map_err(|err| err.to_string());
+        let _ = image_tx.send((attachment, result));
+    });
+}
+
 async fn handle_input_key(key: KeyEvent, state: &mut TuiState, app: &App) -> Result<bool> {
     let target = if state.mode == Mode::Composer {
         &mut state.draft
@@ -523,7 +665,13 @@ fn handle_scrollable_mode_key(key: KeyEvent, state: &mut TuiState) -> Result<boo
     Ok(false)
 }
 
-fn draw(frame: &mut Frame<'_>, state: &TuiState, app: &App, theme: &TuiTheme) {
+fn draw(
+    frame: &mut Frame<'_>,
+    state: &mut TuiState,
+    app: &App,
+    theme: &TuiTheme,
+    image_picker: Option<&ImagePicker>,
+) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(5), Constraint::Length(1)])
@@ -535,7 +683,7 @@ fn draw(frame: &mut Frame<'_>, state: &TuiState, app: &App, theme: &TuiTheme) {
 
     draw_streams(frame, panes[0], state, theme);
     draw_topics(frame, panes[1], state, theme);
-    draw_thread(frame, panes[2], state, theme);
+    draw_thread(frame, panes[2], state, app, theme, image_picker);
     draw_status(frame, outer[1], state, app, theme);
 
     match state.mode {
@@ -607,12 +755,28 @@ fn draw_topics(frame: &mut Frame<'_>, area: Rect, state: &TuiState, theme: &TuiT
     );
 }
 
-fn draw_thread(frame: &mut Frame<'_>, area: Rect, state: &TuiState, theme: &TuiTheme) {
+fn draw_thread(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &mut TuiState,
+    app: &App,
+    theme: &TuiTheme,
+    image_picker: Option<&ImagePicker>,
+) {
     let content_height = list_content_height(area);
     let active = state.focus == Focus::Thread;
     let width = area.width.saturating_sub(4).max(1) as usize;
-    let all_lines = thread_lines(&state.messages, state.message_idx, width, active, theme);
-    let selected_line = selected_message_line_start(&state.messages, state.message_idx, width);
+    let image_slot_rows = image_slot_rows(app.settings().ui.images, image_picker.is_some());
+    let all_lines = thread_lines(
+        &state.messages,
+        state.message_idx,
+        width,
+        active,
+        theme,
+        app,
+        image_slot_rows,
+    );
+    let selected_line = selected_message_line_start(&state.messages, state.message_idx, width, app);
     let start = visible_line_start(selected_line, all_lines.len(), content_height);
     let lines = all_lines
         .into_iter()
@@ -625,6 +789,111 @@ fn draw_thread(frame: &mut Frame<'_>, area: Rect, state: &TuiState, theme: &TuiT
             .block(block("Thread", active, theme)),
         area,
     );
+    render_selected_image(frame, area, state, app, width, start, image_slot_rows);
+}
+
+#[cfg(feature = "tui-images")]
+fn render_selected_image(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &mut TuiState,
+    app: &App,
+    width: usize,
+    viewport_start: usize,
+    image_slot_rows: u16,
+) {
+    if image_slot_rows == 0 {
+        return;
+    }
+    let Some(message) = state.messages.get(state.message_idx) else {
+        return;
+    };
+    let Some(attachment) = app.image_attachments(message).into_iter().next() else {
+        return;
+    };
+    let Some(label_line) =
+        selected_image_label_line_start(&state.messages, state.message_idx, width, app)
+    else {
+        return;
+    };
+    let image_line = label_line + 1;
+    let content_height = list_content_height(area);
+    if image_line < viewport_start || image_line >= viewport_start + content_height {
+        return;
+    }
+    let inner = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    let visible_y = inner.y + (image_line - viewport_start) as u16;
+    let available_rows = inner
+        .y
+        .saturating_add(inner.height)
+        .saturating_sub(visible_y)
+        .min(image_slot_rows);
+    if available_rows == 0 {
+        return;
+    }
+    let image_area = Rect {
+        x: inner.x,
+        y: visible_y,
+        width: inner.width,
+        height: available_rows,
+    };
+    let key = attachment.cache_key();
+    let Some(entry) = state.image_entries.get_mut(&key) else {
+        return;
+    };
+    let Some(protocol) = entry.protocol.as_mut() else {
+        return;
+    };
+
+    frame.render_widget(Clear, image_area);
+    frame.render_stateful_widget(
+        StatefulImage::default().resize(Resize::Fit(None)),
+        image_area,
+        protocol,
+    );
+    if let Some(Err(err)) = protocol.last_encoding_result() {
+        entry.error = Some(err.to_string());
+    }
+}
+
+#[cfg(not(feature = "tui-images"))]
+fn render_selected_image(
+    _frame: &mut Frame<'_>,
+    _area: Rect,
+    _state: &mut TuiState,
+    _app: &App,
+    _width: usize,
+    _viewport_start: usize,
+    _image_slot_rows: u16,
+) {
+}
+
+fn image_slot_rows(mode: ImageMode, terminal_images_supported: bool) -> u16 {
+    if mode == ImageMode::Auto && terminal_images_supported {
+        IMAGE_ROWS
+    } else {
+        0
+    }
+}
+
+#[cfg(feature = "tui-images")]
+fn selected_image_label_line_start(
+    messages: &[ZulipMessage],
+    selected_idx: usize,
+    width: usize,
+    app: &App,
+) -> Option<usize> {
+    let message = messages.get(selected_idx)?;
+    if app.settings().ui.images == ImageMode::Off || app.image_attachments(message).is_empty() {
+        return None;
+    }
+    let preceding = selected_message_line_start(messages, selected_idx, width, app);
+    Some(preceding + 1 + wrap_text(&message.plain_text, width).len())
 }
 
 fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &TuiState, app: &App, theme: &TuiTheme) {
@@ -725,7 +994,7 @@ fn draw_overlay(frame: &mut Frame<'_>, state: &TuiState, app: &App, theme: &TuiT
     frame.render_widget(
         Paragraph::new(text)
             .style(Style::default().fg(theme.modal_text).bg(theme.background))
-            .block(block("zq", true, theme))
+            .block(block("zul-tui", true, theme))
             .scroll((state.popup_scroll as u16, 0))
             .wrap(Wrap { trim: false }),
         area,
@@ -996,6 +1265,8 @@ fn thread_lines<'a>(
     width: usize,
     active: bool,
     theme: &TuiTheme,
+    app: &App,
+    image_slot_rows: u16,
 ) -> Vec<Line<'a>> {
     let mut lines = Vec::new();
     for (idx, message) in messages.iter().enumerate() {
@@ -1018,6 +1289,29 @@ fn thread_lines<'a>(
             let style = selection_style
                 .unwrap_or_else(|| Style::default().fg(theme.text).bg(theme.background));
             lines.push(Line::from(Span::styled(wrapped, style)));
+        }
+        if app.settings().ui.images != ImageMode::Off {
+            let attachments = app.image_attachments(message);
+            for (image_idx, attachment) in attachments.iter().enumerate() {
+                let style = selection_style.unwrap_or_else(|| {
+                    Style::default()
+                        .fg(theme.inactive_title)
+                        .bg(theme.background)
+                });
+                lines.push(Line::from(Span::styled(
+                    format!("[image: {}]", attachment.label()),
+                    style,
+                )));
+                if selected && image_idx == 0 {
+                    for _ in 0..image_slot_rows {
+                        lines.push(Line::from(Span::styled(
+                            "",
+                            selection_style
+                                .unwrap_or_else(|| Style::default().bg(theme.background)),
+                        )));
+                    }
+                }
+            }
         }
         lines.push(Line::from(Span::styled(
             "",
@@ -1044,16 +1338,27 @@ fn selected_message_line_start(
     messages: &[ZulipMessage],
     selected_idx: usize,
     width: usize,
+    app: &App,
 ) -> usize {
     messages
         .iter()
         .take(selected_idx)
-        .map(|message| message_line_height(message, width))
+        .map(|message| message_line_height(message, width, app, 0))
         .sum()
 }
 
-fn message_line_height(message: &ZulipMessage, width: usize) -> usize {
-    1 + wrap_text(&message.plain_text, width).len() + 1
+fn message_line_height(
+    message: &ZulipMessage,
+    width: usize,
+    app: &App,
+    image_slot_rows: u16,
+) -> usize {
+    let attachment_rows = if app.settings().ui.images == ImageMode::Off {
+        0
+    } else {
+        app.image_attachments(message).len() + image_slot_rows as usize
+    };
+    1 + wrap_text(&message.plain_text, width).len() + attachment_rows + 1
 }
 
 fn visible_line_start(selected_line: usize, total_lines: usize, height: usize) -> usize {
@@ -1258,15 +1563,17 @@ mod tests {
 
     #[test]
     fn wrapped_thread_viewport_uses_message_heights() {
+        let fixture = TuiFixture::new(&[]);
+        let app = App::open(fixture.settings.clone(), false).unwrap();
         let messages = vec![
             test_message_with_text(1, "short"),
             test_message_with_text(2, "one two three four five six seven eight"),
             test_message_with_text(3, "tail"),
         ];
 
-        assert_eq!(selected_message_line_start(&messages, 0, 10), 0);
-        assert!(selected_message_line_start(&messages, 2, 10) > 6);
-        assert!(visible_line_start(selected_message_line_start(&messages, 2, 10), 12, 5) > 0);
+        assert_eq!(selected_message_line_start(&messages, 0, 10, &app), 0);
+        assert!(selected_message_line_start(&messages, 2, 10, &app) > 6);
+        assert!(visible_line_start(selected_message_line_start(&messages, 2, 10, &app), 12, 5) > 0);
     }
 
     #[test]
@@ -1302,6 +1609,47 @@ mod tests {
         state.refresh_from_cache(&app, false).unwrap();
 
         assert_eq!(state.messages[state.message_idx].id, 1);
+    }
+
+    #[test]
+    fn thread_lines_show_image_placeholders_and_selected_slot() {
+        let mut settings = test_settings(TempDir::new().unwrap().path());
+        settings.zulip.base_url = Some("https://zulip.example".to_string());
+        let app = App::open(settings, false).unwrap();
+        let messages = vec![test_message_with_html(
+            1,
+            r#"<p>look</p><img src="/user_uploads/1/rack.png" alt="rack">"#,
+            "look",
+        )];
+        let theme = TuiTheme::zenburn();
+
+        let lines = thread_lines(&messages, 0, 40, true, &theme, &app, IMAGE_ROWS);
+        let text = lines.iter().map(line_text).collect::<Vec<_>>();
+
+        assert!(text.iter().any(|line| line == "[image: rack.png]"));
+        assert_eq!(
+            lines.len(),
+            message_line_height(&messages[0], 40, &app, IMAGE_ROWS)
+        );
+    }
+
+    #[test]
+    fn image_mode_off_hides_placeholders() {
+        let mut settings = test_settings(TempDir::new().unwrap().path());
+        settings.zulip.base_url = Some("https://zulip.example".to_string());
+        settings.ui.images = ImageMode::Off;
+        let app = App::open(settings, false).unwrap();
+        let messages = vec![test_message_with_html(
+            1,
+            r#"<p>look</p><img src="/user_uploads/1/rack.png" alt="rack">"#,
+            "look",
+        )];
+        let theme = TuiTheme::zenburn();
+
+        let lines = thread_lines(&messages, 0, 40, true, &theme, &app, 0);
+        let text = lines.iter().map(line_text).collect::<Vec<_>>();
+
+        assert!(!text.iter().any(|line| line.contains("[image:")));
     }
 
     struct TuiFixture {
@@ -1357,6 +1705,10 @@ mod tests {
     }
 
     fn test_message_with_text(id: i64, text: &str) -> ZulipMessage {
+        test_message_with_html(id, &format!("<p>{text}</p>"), text)
+    }
+
+    fn test_message_with_html(id: i64, html: &str, text: &str) -> ZulipMessage {
         ZulipMessage {
             id,
             stream_id: Some(1),
@@ -1366,11 +1718,18 @@ mod tests {
             sender_name: "Ada".to_string(),
             sender_email: Some("ada@example.com".to_string()),
             timestamp: Utc::now(),
-            rendered_html: format!("<p>{text}</p>"),
+            rendered_html: html.to_string(),
             plain_text: text.to_string(),
             permalink: None,
             raw_json: json!({ "id": id }),
         }
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
     }
 
     fn test_settings(path: &std::path::Path) -> Settings {

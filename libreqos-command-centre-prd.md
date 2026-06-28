@@ -582,7 +582,7 @@ Manual verification:
 
 ## Open Questions
 
-- Should the binary be named `lqosctl`, `libreqos`, `zq`, or something else?
+- Should the binary be named `lqosctl`, `libreqos`, or something else?
 - Should v1 include GitHub from the start, or should Zulip CLI/TUI land first?
 - Should the initial SQLite layer use `sqlx` or `rusqlite`?
 - Should the tool have a background daemon early, or should sync remain explicit until the TUI is useful?

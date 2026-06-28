@@ -3,7 +3,7 @@ use clap::{Args, Parser, Subcommand};
 use libzul::{digest, App, AuthLogin, AuthStatus, Settings};
 
 #[derive(Debug, Parser)]
-#[command(name = "zq", version, about = "Terminal-first Zulip client")]
+#[command(name = "zul-cli", version, about = "Terminal-first Zulip client")]
 pub struct Cli {
     #[arg(long, global = true, help = "Emit stable JSON output")]
     json: bool,
@@ -26,7 +26,6 @@ enum Command {
     Search(SearchArgs),
     Digest(DigestArgs),
     Reply(ReplyArgs),
-    Tui,
 }
 
 #[derive(Debug, Subcommand)]
@@ -109,7 +108,7 @@ pub async fn run() -> anyhow::Result<()> {
                         println!("Saved API key to {}", saved.secret_file);
                     } else {
                         println!("No API key was provided.");
-                        println!("Run `zq auth login --base-url ... --email ... --api-key ...` or set ZULIP_API_KEY.");
+                        println!("Run `zul-cli auth login --base-url ... --email ... --api-key ...` or set ZULIP_API_KEY.");
                     }
                 }
             }
@@ -175,17 +174,13 @@ pub async fn run() -> anyhow::Result<()> {
                 .await?;
             mode.print_reply(&result)?;
         }
-        Command::Tui => {
-            let app = App::open(settings, cli.offline)?;
-            zul_tui::run(app).await?;
-        }
     }
 
     Ok(())
 }
 
 fn load_dotenv() {
-    match std::env::var("ZQ_DOTENV") {
+    match std::env::var("ZUL_DOTENV") {
         Ok(path) if path.trim().is_empty() => {}
         Ok(path) => {
             let _ = dotenvy::from_path(path);

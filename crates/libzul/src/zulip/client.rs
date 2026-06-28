@@ -1,12 +1,15 @@
 use crate::zulip::models::{
-    CurrentUser, CurrentUserResponse, MessagesResponse, SendMessageResponse, SubscriptionsResponse,
-    ZulipApiResponse, ZulipMessage, ZulipStream,
+    CurrentUser, CurrentUserResponse, ImageBytes, MessagesResponse, SendMessageResponse,
+    SubscriptionsResponse, ZulipApiResponse, ZulipMessage, ZulipStream,
 };
 use crate::zulip::normalize;
 use anyhow::{Context, Result};
+use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
 use serde_json::json;
 use std::collections::HashSet;
+
+const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Async Zulip REST client using email/API-key basic authentication.
 #[derive(Clone)]
@@ -224,6 +227,49 @@ impl ZulipClient {
             .await?
             .into_data()?;
         Ok(data.id)
+    }
+
+    /// Fetch an authenticated image URL for terminal rendering.
+    pub async fn image_bytes(&self, absolute_url: &str) -> Result<ImageBytes> {
+        let response = self
+            .http
+            .get(absolute_url)
+            .basic_auth(&self.email, Some(&self.api_key))
+            .send()
+            .await
+            .with_context(|| format!("fetching image {absolute_url}"))?
+            .error_for_status()
+            .with_context(|| format!("fetching image {absolute_url}"))?;
+
+        if let Some(length) = response.content_length() {
+            if length > MAX_IMAGE_BYTES {
+                anyhow::bail!("image is too large ({length} bytes)");
+            }
+        }
+
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.split(';').next().unwrap_or(value).trim().to_string());
+        if let Some(content_type) = content_type.as_deref() {
+            if !content_type.starts_with("image/") {
+                anyhow::bail!("image URL returned non-image content type {content_type}");
+            }
+        }
+
+        let bytes = response
+            .bytes()
+            .await
+            .with_context(|| format!("reading image {absolute_url}"))?;
+        if bytes.len() as u64 > MAX_IMAGE_BYTES {
+            anyhow::bail!("image is too large ({} bytes)", bytes.len());
+        }
+
+        Ok(ImageBytes {
+            bytes: bytes.to_vec(),
+            content_type,
+        })
     }
 
     fn get(&self, path: &str) -> reqwest::RequestBuilder {

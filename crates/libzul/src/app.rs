@@ -2,9 +2,13 @@ use crate::auth::AuthStatus;
 use crate::cache::{send_hash, Cache, StreamActivity, SyncRecord};
 use crate::config::Settings;
 use crate::zulip::client::ZulipClient;
-use crate::zulip::models::{ZulipMessage, ZulipStream, ZulipTopic};
+use crate::zulip::images;
+use crate::zulip::models::{ImageAttachment, ImageBytes, ZulipMessage, ZulipStream, ZulipTopic};
 use anyhow::{Context, Result};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::path::PathBuf;
 
 /// Summary of a cache synchronization attempt.
 #[derive(Debug, Serialize)]
@@ -271,6 +275,50 @@ impl App {
         self.cache.search_messages(query)
     }
 
+    /// Return renderable image attachments referenced by a cached message.
+    pub fn image_attachments(&self, message: &ZulipMessage) -> Vec<ImageAttachment> {
+        images::attachments(message, self.settings.zulip.base_url.as_deref())
+    }
+
+    /// Fetch and cache image bytes for terminal rendering.
+    pub async fn fetch_image_bytes(&self, attachment: &ImageAttachment) -> Result<ImageBytes> {
+        Self::fetch_image_bytes_with_settings(
+            self.settings.clone(),
+            self.offline,
+            attachment.clone(),
+        )
+        .await
+    }
+
+    /// Fetch image bytes using owned settings, useful from background TUI tasks.
+    pub async fn fetch_image_bytes_with_settings(
+        settings: Settings,
+        offline: bool,
+        attachment: ImageAttachment,
+    ) -> Result<ImageBytes> {
+        let cache_path = image_cache_path(&settings, &attachment.cache_key());
+        if cache_path.exists() {
+            return Ok(ImageBytes {
+                bytes: fs::read(&cache_path)
+                    .with_context(|| format!("reading {}", cache_path.display()))?,
+                content_type: None,
+            });
+        }
+        if offline {
+            anyhow::bail!("offline mode cannot fetch uncached images");
+        }
+
+        let (base_url, email, api_key) = settings.require_auth()?;
+        let client = ZulipClient::new(base_url, email, api_key);
+        let image = client.image_bytes(&attachment.absolute_url).await?;
+        if let Some(parent) = cache_path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        fs::write(&cache_path, &image.bytes)
+            .with_context(|| format!("writing {}", cache_path.display()))?;
+        Ok(image)
+    }
+
     /// Return cached message counts per stream.
     pub fn stream_activity(&self) -> Result<Vec<StreamActivity>> {
         self.cache.stream_activity()
@@ -339,4 +387,27 @@ impl App {
         let (base_url, email, api_key) = self.settings.require_auth()?;
         Ok(ZulipClient::new(base_url, email, api_key))
     }
+}
+
+fn image_cache_path(settings: &Settings, key: &str) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(key.as_bytes());
+    let digest = hasher.finalize();
+    let filename = format!("{}.img", hex_lower(&digest));
+    settings
+        .paths
+        .cache_file
+        .parent()
+        .map(|parent| parent.join("images").join(filename.as_str()))
+        .unwrap_or_else(|| PathBuf::from("images").join(filename))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut value = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        value.push(HEX[(byte >> 4) as usize] as char);
+        value.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    value
 }

@@ -60,6 +60,20 @@ pub struct UiConfig {
     pub start_view: String,
     /// Selected theme name.
     pub theme: String,
+    /// Inline image behavior in the terminal UI.
+    pub images: ImageMode,
+}
+
+/// Inline image behavior for terminal UI implementations.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageMode {
+    /// Render images when the terminal advertises a supported protocol.
+    Auto,
+    /// Show image placeholders without fetching or rendering bytes.
+    Placeholder,
+    /// Hide image attachment placeholders and rendering entirely.
+    Off,
 }
 
 /// Optional color overrides for the terminal UI.
@@ -148,6 +162,7 @@ impl Default for UiConfig {
         Self {
             start_view: "streams".to_string(),
             theme: "zenburn".to_string(),
+            images: ImageMode::Auto,
         }
     }
 }
@@ -169,7 +184,7 @@ impl Settings {
             let body = fs::read_to_string(&paths.config_file)
                 .with_context(|| format!("reading {}", paths.config_file.display()))?;
             Self::from_file_settings(
-                toml::from_str(&body).context("parsing zq config TOML")?,
+                toml::from_str(&body).context("parsing zul config TOML")?,
                 paths,
             )
         } else {
@@ -207,7 +222,7 @@ impl Settings {
         if let Ok(value) = env::var("ZULIP_API_KEY") {
             self.zulip.api_key = Some(value);
         }
-        if let Ok(value) = env::var("ZQ_CACHE") {
+        if let Ok(value) = env::var("ZUL_CACHE") {
             self.paths.cache_file = PathBuf::from(value);
         }
     }
@@ -232,7 +247,7 @@ impl Settings {
         }
         if self.zulip.api_key.as_deref().unwrap_or_default().is_empty() {
             problems.push(
-                "missing Zulip API key; run zq auth login --api-key ... or set ZULIP_API_KEY"
+                "missing Zulip API key; run zul-cli auth login --api-key ... or set ZULIP_API_KEY"
                     .to_string(),
             );
         }
@@ -326,7 +341,7 @@ impl Settings {
 impl AppPaths {
     /// Discover default XDG paths for config, cache, and secrets.
     pub fn discover() -> Result<Self> {
-        let dirs = ProjectDirs::from("", "", "zq").context("unable to discover XDG paths")?;
+        let dirs = ProjectDirs::from("", "", "zul").context("unable to discover XDG paths")?;
         Ok(Self {
             config_file: dirs.config_dir().join("config.toml"),
             cache_file: dirs.cache_dir().join("cache.sqlite"),
@@ -409,6 +424,7 @@ mod tests {
             r##"
             [ui]
             theme = "cozy"
+            images = "placeholder"
 
             [themes.cozy]
             background = "#101820"
@@ -422,6 +438,7 @@ mod tests {
 
         assert_eq!(ui.start_view, "streams");
         assert_eq!(ui.theme, "cozy");
+        assert_eq!(ui.images, ImageMode::Placeholder);
         assert_eq!(themes["cozy"].background.as_deref(), Some("#101820"));
     }
 }
