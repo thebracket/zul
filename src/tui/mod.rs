@@ -1,7 +1,9 @@
-use crate::app::App;
+use crate::app::{App, PollResult};
+use crate::config::Settings;
 use crate::digest::{self, Digest};
 use crate::zulip::models::{ZulipMessage, ZulipStream, ZulipTopic};
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -15,7 +17,12 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use std::collections::BTreeMap;
 use std::io::{self, Stdout};
-use std::time::Duration;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::{Duration, Instant};
+
+const POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+type PollEvent = Result<PollResult, String>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -52,6 +59,9 @@ struct TuiState {
     input: String,
     draft: String,
     status: String,
+    last_poll_at: Option<DateTime<Utc>>,
+    last_poll_new: usize,
+    poll_error: Option<String>,
 }
 
 impl TuiState {
@@ -76,6 +86,9 @@ impl TuiState {
             input: String::new(),
             draft: String::new(),
             status: "cache ready".to_string(),
+            last_poll_at: None,
+            last_poll_new: 0,
+            poll_error: None,
         };
         state.reload_topics(app)?;
         state.reload_messages(app)?;
@@ -133,6 +146,52 @@ impl TuiState {
         Ok(())
     }
 
+    fn thread_at_end(&self) -> bool {
+        self.messages.is_empty() || self.message_idx >= self.messages.len().saturating_sub(1)
+    }
+
+    fn refresh_from_cache(&mut self, app: &App, follow_if_was_at_end: bool) -> Result<()> {
+        let selected_stream = self.selected_stream().map(ToString::to_string);
+        let selected_topic = self.selected_topic().map(ToString::to_string);
+        let selected_message_id = self
+            .messages
+            .get(self.message_idx)
+            .map(|message| message.id);
+
+        self.streams = app.streams()?;
+        self.stream_activity = app
+            .stream_activity()?
+            .into_iter()
+            .map(|activity| (activity.stream_name, activity.message_count))
+            .collect();
+
+        self.stream_idx = selected_stream
+            .as_ref()
+            .and_then(|name| self.streams.iter().position(|stream| &stream.name == name))
+            .unwrap_or_else(|| self.stream_idx.min(self.streams.len().saturating_sub(1)));
+
+        self.reload_topics(app)?;
+        self.topic_idx = selected_topic
+            .as_ref()
+            .and_then(|name| self.topics.iter().position(|topic| &topic.name == name))
+            .unwrap_or_else(|| self.topic_idx.min(self.topics.len().saturating_sub(1)));
+
+        self.reload_messages(app)?;
+        if follow_if_was_at_end {
+            self.message_idx = self.messages.len().saturating_sub(1);
+        } else if let Some(message_id) = selected_message_id {
+            self.message_idx = self
+                .messages
+                .iter()
+                .position(|message| message.id == message_id)
+                .unwrap_or_else(|| self.message_idx.min(self.messages.len().saturating_sub(1)));
+        } else {
+            self.message_idx = self.message_idx.min(self.messages.len().saturating_sub(1));
+        }
+
+        Ok(())
+    }
+
     fn focus_left(&mut self) {
         self.focus = match self.focus {
             Focus::Streams => Focus::Streams,
@@ -159,7 +218,19 @@ pub async fn run(app: App) -> Result<()> {
 
 async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: App) -> Result<()> {
     let mut state = TuiState::load(&app)?;
+    let (poll_tx, poll_rx) = mpsc::channel();
+    let mut next_poll_at = Instant::now() + POLL_INTERVAL;
+    let mut poll_inflight = false;
+
     loop {
+        drain_poll_events(&poll_rx, &mut poll_inflight, &mut state, &app)?;
+        if !app.offline() && !poll_inflight && Instant::now() >= next_poll_at {
+            state.status = "polling Zulip...".to_string();
+            spawn_poll(app.settings().clone(), app.offline(), poll_tx.clone());
+            poll_inflight = true;
+            next_poll_at = Instant::now() + POLL_INTERVAL;
+        }
+
         terminal.draw(|frame| draw(frame, &state, &app))?;
         if !event::poll(Duration::from_millis(150))? {
             continue;
@@ -198,7 +269,23 @@ async fn handle_key(key: KeyEvent, state: &mut TuiState, app: &App) -> Result<bo
                     let draft = state.draft.clone();
                     match app.reply(&stream, &topic, &draft, false, true).await {
                         Ok(_) => {
-                            state.status = "sent draft".to_string();
+                            let was_at_end = state.thread_at_end();
+                            match app.poll_new_messages().await {
+                                Ok(result) => {
+                                    state.refresh_from_cache(app, true)?;
+                                    state.last_poll_at = Some(Utc::now());
+                                    state.last_poll_new = result.new_messages;
+                                    state.poll_error = None;
+                                    state.status =
+                                        format!("sent draft; {} new messages", result.new_messages);
+                                }
+                                Err(err) => {
+                                    if was_at_end {
+                                        state.refresh_from_cache(app, true)?;
+                                    }
+                                    state.status = format!("sent draft; refresh failed: {err}");
+                                }
+                            }
                             state.draft.clear();
                             state.mode = Mode::Browser;
                         }
@@ -249,7 +336,8 @@ async fn handle_key(key: KeyEvent, state: &mut TuiState, app: &App) -> Result<bo
         }
         KeyCode::Char('R') => match app.sync(app.settings().cache.default_sync_hours).await {
             Ok(sync) => {
-                *state = TuiState::load(app)?;
+                let was_at_end = state.thread_at_end();
+                state.refresh_from_cache(app, was_at_end)?;
                 state.status = format!("synced {} messages", sync.messages);
             }
             Err(err) => state.status = format!("sync failed: {err}"),
@@ -278,6 +366,45 @@ async fn handle_key(key: KeyEvent, state: &mut TuiState, app: &App) -> Result<bo
         _ => {}
     }
     Ok(false)
+}
+
+fn drain_poll_events(
+    poll_rx: &Receiver<PollEvent>,
+    poll_inflight: &mut bool,
+    state: &mut TuiState,
+    app: &App,
+) -> Result<()> {
+    while let Ok(event) = poll_rx.try_recv() {
+        *poll_inflight = false;
+        match event {
+            Ok(result) => {
+                let was_at_end = state.thread_at_end();
+                state.refresh_from_cache(app, was_at_end)?;
+                state.last_poll_at = Some(Utc::now());
+                state.last_poll_new = result.new_messages;
+                state.poll_error = None;
+                if result.new_messages > 0 {
+                    state.status = format!("{} new messages", result.new_messages);
+                } else if state.status == "polling Zulip..." {
+                    state.status = "no new messages".to_string();
+                }
+            }
+            Err(err) => {
+                state.poll_error = Some(err.clone());
+                state.status = format!("poll failed: {err}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn spawn_poll(settings: Settings, offline: bool, poll_tx: Sender<PollEvent>) {
+    tokio::spawn(async move {
+        let result = App::poll_new_messages_with_settings(settings, offline)
+            .await
+            .map_err(|err| err.to_string());
+        let _ = poll_tx.send(result);
+    });
 }
 
 async fn handle_input_key(key: KeyEvent, state: &mut TuiState, app: &App) -> Result<bool> {
@@ -510,9 +637,22 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &TuiState, app: &App) {
         .flatten()
         .map(|sync| format!("last sync {}", sync.synced_at.format("%H:%M UTC")))
         .unwrap_or_else(|| "not synced".to_string());
+    let poll = if let Some(error) = &state.poll_error {
+        format!("poll error {error}")
+    } else if let Some(last_poll_at) = state.last_poll_at {
+        format!(
+            "poll {} +{}",
+            last_poll_at.format("%H:%M:%S UTC"),
+            state.last_poll_new
+        )
+    } else if app.offline() {
+        "poll off".to_string()
+    } else {
+        "poll pending".to_string()
+    };
     let text = format!(
-        "{} | {} | {} | {}{} | j/k h/l / r R : d o y q | {}",
-        account, realm, sync, offline, draft, state.status
+        "{} | {} | {} | {} | {}{} | j/k h/l / r R : d o y q | {}",
+        account, realm, sync, poll, offline, draft, state.status
     );
     frame.render_widget(
         Paragraph::new(text).style(Style::default().fg(Color::Black).bg(Color::Gray)),
@@ -738,6 +878,13 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::Cache;
+    use crate::config::{
+        AppPaths, CacheConfig, DigestConfig, SafetyConfig, Settings, UiConfig, ZulipConfig,
+    };
+    use chrono::Utc;
+    use serde_json::json;
+    use tempfile::TempDir;
 
     #[test]
     fn move_index_clamps() {
@@ -754,5 +901,95 @@ mod tests {
         assert_eq!(visible_start(50, 100, 10), 45);
         assert_eq!(visible_start(99, 100, 10), 90);
         assert_eq!(visible_start(2, 3, 10), 0);
+    }
+
+    #[test]
+    fn refresh_follows_when_thread_was_at_end() {
+        let fixture = TuiFixture::new(&[1, 2, 3]);
+        let app = App::open(fixture.settings.clone(), false).unwrap();
+        let mut state = TuiState::load(&app).unwrap();
+        state.message_idx = 2;
+
+        fixture.insert_messages(&[4]);
+        state.refresh_from_cache(&app, true).unwrap();
+
+        assert_eq!(state.messages[state.message_idx].id, 4);
+    }
+
+    #[test]
+    fn refresh_keeps_position_when_reading_older_messages() {
+        let fixture = TuiFixture::new(&[1, 2, 3]);
+        let app = App::open(fixture.settings.clone(), false).unwrap();
+        let mut state = TuiState::load(&app).unwrap();
+        state.message_idx = 0;
+
+        fixture.insert_messages(&[4]);
+        state.refresh_from_cache(&app, false).unwrap();
+
+        assert_eq!(state.messages[state.message_idx].id, 1);
+    }
+
+    struct TuiFixture {
+        _dir: TempDir,
+        settings: Settings,
+    }
+
+    impl TuiFixture {
+        fn new(message_ids: &[i64]) -> Self {
+            let dir = TempDir::new().unwrap();
+            let settings = Settings {
+                zulip: ZulipConfig::default(),
+                cache: CacheConfig::default(),
+                ui: UiConfig::default(),
+                safety: SafetyConfig::default(),
+                digest: DigestConfig::default(),
+                paths: AppPaths {
+                    config_file: dir.path().join("config.toml"),
+                    cache_file: dir.path().join("cache.sqlite"),
+                    secret_file: dir.path().join("api_key"),
+                },
+            };
+            let fixture = Self {
+                _dir: dir,
+                settings,
+            };
+            let cache = Cache::open(&fixture.settings.paths.cache_file).unwrap();
+            cache
+                .upsert_streams(&[ZulipStream {
+                    id: 1,
+                    name: "core".to_string(),
+                    description: None,
+                }])
+                .unwrap();
+            drop(cache);
+            fixture.insert_messages(message_ids);
+            fixture
+        }
+
+        fn insert_messages(&self, message_ids: &[i64]) {
+            let cache = Cache::open(&self.settings.paths.cache_file).unwrap();
+            let messages = message_ids
+                .iter()
+                .map(|id| test_message(*id))
+                .collect::<Vec<_>>();
+            cache.upsert_messages(&messages).unwrap();
+        }
+    }
+
+    fn test_message(id: i64) -> ZulipMessage {
+        ZulipMessage {
+            id,
+            stream_id: Some(1),
+            stream_name: "core".to_string(),
+            topic: "ops".to_string(),
+            sender_id: Some(2),
+            sender_name: "Ada".to_string(),
+            sender_email: Some("ada@example.com".to_string()),
+            timestamp: Utc::now(),
+            rendered_html: format!("<p>message {id}</p>"),
+            plain_text: format!("message {id}"),
+            permalink: None,
+            raw_json: json!({ "id": id }),
+        }
     }
 }

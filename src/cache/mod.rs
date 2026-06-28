@@ -277,6 +277,12 @@ impl Cache {
         Ok(messages)
     }
 
+    pub fn max_message_id(&self) -> Result<Option<i64>> {
+        self.conn
+            .query_row("SELECT MAX(id) FROM zulip_messages", [], |row| row.get(0))
+            .map_err(Into::into)
+    }
+
     pub fn search_messages(&self, query: &str) -> Result<Vec<ZulipMessage>> {
         let mut stmt = self.conn.prepare(
             "SELECT m.id, m.stream_id, m.stream_name, m.topic, m.sender_id, m.sender_name,
@@ -490,6 +496,7 @@ mod tests {
         assert_eq!(cache.streams().unwrap().len(), 1);
         assert_eq!(cache.topics("core team").unwrap()[0].name, "Release");
         assert_eq!(cache.search_messages("installer").unwrap()[0].id, 9);
+        assert_eq!(cache.max_message_id().unwrap(), Some(9));
     }
 
     #[test]

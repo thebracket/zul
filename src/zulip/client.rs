@@ -63,10 +63,11 @@ impl ZulipClient {
         let mut seen = HashSet::new();
 
         for _ in 0..25 {
-            let page = self.messages_page(&anchor, None).await?;
+            let page = self.messages_page(&anchor, None, 1000, 0).await?;
             if page.is_empty() {
                 break;
             }
+            let page_len = page.len();
 
             let mut oldest_id = i64::MAX;
             let mut saw_older_than_cutoff = false;
@@ -86,10 +87,43 @@ impl ZulipClient {
                 }
             }
 
-            if saw_older_than_cutoff || oldest_id == i64::MAX || !added_new {
+            if saw_older_than_cutoff || oldest_id == i64::MAX || !added_new || page_len < 1000 {
                 break;
             }
             anchor = oldest_id.to_string();
+        }
+
+        Ok(messages)
+    }
+
+    pub async fn messages_after(&self, anchor_id: i64) -> Result<Vec<ZulipMessage>> {
+        let mut anchor = anchor_id.to_string();
+        let mut messages = Vec::new();
+        let mut seen = HashSet::new();
+
+        for _ in 0..25 {
+            let page = self.messages_page(&anchor, None, 0, 1000).await?;
+            if page.is_empty() {
+                break;
+            }
+            let page_len = page.len();
+
+            let mut newest_id = anchor.parse::<i64>().unwrap_or(anchor_id);
+            let mut added_new = false;
+
+            for raw in page {
+                let message = normalize::message(raw).context("normalizing polled messages")?;
+                newest_id = newest_id.max(message.id);
+                if seen.insert(message.id) {
+                    added_new = true;
+                    messages.push(message);
+                }
+            }
+
+            if !added_new || newest_id.to_string() == anchor || page_len < 1000 {
+                break;
+            }
+            anchor = newest_id.to_string();
         }
 
         Ok(messages)
@@ -123,7 +157,7 @@ impl ZulipClient {
     ) -> Result<Vec<ZulipMessage>> {
         let narrow = serde_json::to_string(&narrow)?;
         let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours);
-        self.messages_page("newest", Some(&narrow))
+        self.messages_page("newest", Some(&narrow), 1000, 0)
             .await?
             .into_iter()
             .map(normalize::message)
@@ -136,13 +170,18 @@ impl ZulipClient {
         &self,
         anchor: &str,
         narrow: Option<&str>,
+        num_before: u16,
+        num_after: u16,
     ) -> Result<Vec<serde_json::Value>> {
+        let num_before = num_before.to_string();
+        let num_after = num_after.to_string();
         let mut request = self.get("/api/v1/messages").query(&[
             ("anchor", anchor),
-            ("num_before", "1000"),
-            ("num_after", "0"),
+            ("num_before", num_before.as_str()),
+            ("num_after", num_after.as_str()),
             ("apply_markdown", "true"),
             ("client_gravatar", "false"),
+            ("include_anchor", "false"),
         ]);
         if let Some(narrow) = narrow {
             request = request.query(&[("narrow", narrow)]);
@@ -188,5 +227,53 @@ impl ZulipClient {
         self.http
             .post(format!("{}{}", self.base_url, path))
             .basic_auth(&self.email, Some(&self.api_key))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    #[ignore = "requires binding a local mock server port"]
+    async fn messages_after_uses_forward_anchor_query() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/messages"))
+            .and(query_param("anchor", "10"))
+            .and(query_param("num_before", "0"))
+            .and(query_param("num_after", "1000"))
+            .and(query_param("include_anchor", "false"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": "success",
+                "msg": "",
+                "messages": [{
+                    "id": 11,
+                    "stream_id": 1,
+                    "display_recipient": "core",
+                    "subject": "ops",
+                    "sender_id": 2,
+                    "sender_full_name": "Ada",
+                    "sender_email": "ada@example.com",
+                    "timestamp": 1_700_000_000,
+                    "content": "<p>hello</p>"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = ZulipClient::new(
+            server.uri(),
+            "ada@example.com".to_string(),
+            "key".to_string(),
+        );
+        let messages = client.messages_after(10).await.unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, 11);
     }
 }

@@ -14,6 +14,13 @@ pub struct SyncResult {
     pub offline: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct PollResult {
+    pub new_messages: usize,
+    pub latest_message_id: Option<i64>,
+    pub offline: bool,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ReplyResult {
@@ -108,6 +115,101 @@ impl App {
             streams: streams.len(),
             messages: messages.len(),
             hours,
+            offline: false,
+        })
+    }
+
+    pub async fn poll_new_messages(&self) -> Result<PollResult> {
+        if self.offline {
+            return Ok(PollResult {
+                new_messages: 0,
+                latest_message_id: self.cache.max_message_id()?,
+                offline: true,
+            });
+        }
+        let client = self.client()?;
+        let previous_max = self.cache.max_message_id()?;
+        let messages = match previous_max {
+            Some(anchor_id) => client
+                .messages_after(anchor_id)
+                .await
+                .context("fetching Zulip messages after latest cached message")?,
+            None => {
+                let streams = client
+                    .subscriptions()
+                    .await
+                    .context("fetching Zulip streams for initial poll")?;
+                self.cache.upsert_streams(&streams)?;
+                client
+                    .recent_messages(self.settings.cache.default_sync_hours)
+                    .await
+                    .context("fetching initial Zulip messages")?
+            }
+        };
+        let new_messages = messages.len();
+        if !messages.is_empty() {
+            self.cache.upsert_messages(&messages)?;
+        }
+        self.cache.set_sync_state(
+            "recent",
+            "ok",
+            Some(&format!("poll: {new_messages} new messages")),
+        )?;
+        Ok(PollResult {
+            new_messages,
+            latest_message_id: self.cache.max_message_id()?,
+            offline: false,
+        })
+    }
+
+    pub async fn poll_new_messages_with_settings(
+        settings: Settings,
+        offline: bool,
+    ) -> Result<PollResult> {
+        if offline {
+            let cache = Cache::open(&settings.paths.cache_file)?;
+            return Ok(PollResult {
+                new_messages: 0,
+                latest_message_id: cache.max_message_id()?,
+                offline: true,
+            });
+        }
+
+        let previous_max = {
+            let cache = Cache::open(&settings.paths.cache_file)?;
+            cache.max_message_id()?
+        };
+
+        let (base_url, email, api_key) = settings.require_auth()?;
+        let client = ZulipClient::new(base_url, email, api_key);
+        let (streams, messages) = match previous_max {
+            Some(anchor_id) => (None, client.messages_after(anchor_id).await?),
+            None => {
+                let streams = client.subscriptions().await?;
+                let messages = client
+                    .recent_messages(settings.cache.default_sync_hours)
+                    .await?;
+                (Some(streams), messages)
+            }
+        };
+
+        let new_messages = messages.len();
+        let cache = Cache::open(&settings.paths.cache_file)?;
+        if let Some(streams) = streams {
+            cache.upsert_streams(&streams)?;
+        }
+        if !messages.is_empty() {
+            cache.upsert_messages(&messages)?;
+        }
+        cache.set_sync_state(
+            "recent",
+            "ok",
+            Some(&format!("poll: {new_messages} new messages")),
+        )?;
+
+        Ok(PollResult {
+            new_messages,
+            latest_message_id: cache.max_message_id()?,
             offline: false,
         })
     }
