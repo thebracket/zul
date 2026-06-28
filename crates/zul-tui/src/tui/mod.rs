@@ -461,15 +461,33 @@ fn detect_image_picker(settings: &Settings) -> Option<ImagePicker> {
     if settings.ui.images != ImageMode::Auto {
         return None;
     }
-    let Ok(picker) = Picker::from_query_stdio() else {
+    let Ok(mut picker) = Picker::from_query_stdio() else {
         return None;
     };
+    if terminal_env_prefers_iterm2_protocol(
+        std::env::var("TERM_PROGRAM").ok().as_deref(),
+        std::env::var("LC_TERMINAL").ok().as_deref(),
+        std::env::var("ITERM_SESSION_ID").ok().as_deref(),
+    ) {
+        picker.set_protocol_type(ProtocolType::Iterm2);
+    }
     (picker.protocol_type() != ProtocolType::Halfblocks).then_some(picker)
 }
 
 #[cfg(not(feature = "tui-images"))]
 fn detect_image_picker(_settings: &Settings) -> Option<ImagePicker> {
     None
+}
+
+#[cfg(feature = "tui-images")]
+fn terminal_env_prefers_iterm2_protocol(
+    term_program: Option<&str>,
+    lc_terminal: Option<&str>,
+    iterm_session_id: Option<&str>,
+) -> bool {
+    term_program.is_some_and(|value| value.contains("iTerm"))
+        || lc_terminal.is_some_and(|value| value.contains("iTerm"))
+        || iterm_session_id.is_some_and(|value| !value.is_empty())
 }
 
 #[cfg(feature = "tui-images")]
@@ -1650,6 +1668,37 @@ mod tests {
         let text = lines.iter().map(line_text).collect::<Vec<_>>();
 
         assert!(!text.iter().any(|line| line.contains("[image:")));
+    }
+
+    #[cfg(feature = "tui-images")]
+    #[test]
+    fn iterm_env_prefers_iterm2_protocol() {
+        assert!(terminal_env_prefers_iterm2_protocol(
+            Some("iTerm.app"),
+            None,
+            None
+        ));
+        assert!(terminal_env_prefers_iterm2_protocol(
+            None,
+            Some("iTerm2"),
+            None
+        ));
+        assert!(terminal_env_prefers_iterm2_protocol(
+            None,
+            None,
+            Some("w0t0p0")
+        ));
+    }
+
+    #[cfg(feature = "tui-images")]
+    #[test]
+    fn non_iterm_env_keeps_detected_protocol() {
+        assert!(!terminal_env_prefers_iterm2_protocol(
+            Some("ghostty"),
+            None,
+            None
+        ));
+        assert!(!terminal_env_prefers_iterm2_protocol(None, None, Some("")));
     }
 
     struct TuiFixture {
