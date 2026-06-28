@@ -329,8 +329,10 @@ async fn handle_key(key: KeyEvent, state: &mut TuiState, app: &App) -> Result<bo
                                     state.last_poll_at = Some(Utc::now());
                                     state.last_poll_new = result.new_messages;
                                     state.poll_error = None;
-                                    state.status =
-                                        format!("sent draft; {} new messages", result.new_messages);
+                                    state.status = format!(
+                                        "sent draft; {} new messages, {} refreshed",
+                                        result.new_messages, result.refreshed_messages
+                                    );
                                 }
                                 Err(err) => {
                                     if was_at_end {
@@ -438,6 +440,9 @@ fn drain_poll_events(
                 state.poll_error = None;
                 if result.new_messages > 0 {
                     state.status = format!("{} new messages", result.new_messages);
+                } else if result.refreshed_messages > 0 {
+                    state.status =
+                        format!("{} authored messages refreshed", result.refreshed_messages);
                 } else if state.status == "polling Zulip..." {
                     state.status = "no new messages".to_string();
                 }

@@ -71,7 +71,7 @@ impl ZulipClient {
         let mut seen = HashSet::new();
 
         for _ in 0..25 {
-            let page = self.messages_page(&anchor, None, 1000, 0).await?;
+            let page = self.messages_page(&anchor, None, 1000, 0, false).await?;
             if page.is_empty() {
                 break;
             }
@@ -111,7 +111,7 @@ impl ZulipClient {
         let mut seen = HashSet::new();
 
         for _ in 0..25 {
-            let page = self.messages_page(&anchor, None, 0, 1000).await?;
+            let page = self.messages_page(&anchor, None, 0, 1000, false).await?;
             if page.is_empty() {
                 break;
             }
@@ -136,6 +136,18 @@ impl ZulipClient {
         }
 
         Ok(messages)
+    }
+
+    /// Fetch one message by ID, refreshing mutable fields such as reactions.
+    pub async fn message_by_id(&self, message_id: i64) -> Result<Option<ZulipMessage>> {
+        let mut messages = self
+            .messages_page(&message_id.to_string(), None, 0, 0, true)
+            .await?
+            .into_iter()
+            .map(normalize::message)
+            .collect::<Result<Vec<_>>>()
+            .context("normalizing refreshed Zulip message")?;
+        Ok(messages.pop())
     }
 
     #[allow(dead_code)]
@@ -168,7 +180,7 @@ impl ZulipClient {
     ) -> Result<Vec<ZulipMessage>> {
         let narrow = serde_json::to_string(&narrow)?;
         let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours);
-        self.messages_page("newest", Some(&narrow), 1000, 0)
+        self.messages_page("newest", Some(&narrow), 1000, 0, false)
             .await?
             .into_iter()
             .map(normalize::message)
@@ -183,16 +195,18 @@ impl ZulipClient {
         narrow: Option<&str>,
         num_before: u16,
         num_after: u16,
+        include_anchor: bool,
     ) -> Result<Vec<serde_json::Value>> {
         let num_before = num_before.to_string();
         let num_after = num_after.to_string();
+        let include_anchor = if include_anchor { "true" } else { "false" };
         let mut request = self.get("/api/v1/messages").query(&[
             ("anchor", anchor),
             ("num_before", num_before.as_str()),
             ("num_after", num_after.as_str()),
             ("apply_markdown", "true"),
             ("client_gravatar", "false"),
-            ("include_anchor", "false"),
+            ("include_anchor", include_anchor),
         ]);
         if let Some(narrow) = narrow {
             request = request.query(&[("narrow", narrow)]);
@@ -330,5 +344,50 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].id, 11);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires binding a local mock server port"]
+    async fn message_by_id_includes_anchor() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/messages"))
+            .and(query_param("anchor", "10"))
+            .and(query_param("num_before", "0"))
+            .and(query_param("num_after", "0"))
+            .and(query_param("include_anchor", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": "success",
+                "msg": "",
+                "messages": [{
+                    "id": 10,
+                    "stream_id": 1,
+                    "display_recipient": "core",
+                    "subject": "ops",
+                    "sender_id": 2,
+                    "sender_full_name": "Ada",
+                    "sender_email": "ada@example.com",
+                    "timestamp": 1_700_000_000,
+                    "content": "<p>hello</p>",
+                    "reactions": [{
+                        "emoji_name": "thumbs_up",
+                        "emoji_code": "1f44d",
+                        "reaction_type": "unicode_emoji"
+                    }]
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = ZulipClient::new(
+            server.uri(),
+            "ada@example.com".to_string(),
+            "key".to_string(),
+        );
+        let message = client.message_by_id(10).await.unwrap().unwrap();
+
+        assert_eq!(message.id, 10);
+        assert_eq!(message.raw_json["reactions"][0]["emoji_name"], "thumbs_up");
     }
 }

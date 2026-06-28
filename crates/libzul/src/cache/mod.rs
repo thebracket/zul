@@ -301,6 +301,35 @@ impl Cache {
             .map_err(Into::into)
     }
 
+    /// Return cached authored message IDs ordered by least-recently refreshed.
+    pub fn authored_message_ids_for_refresh(
+        &self,
+        sender_email: &str,
+        limit: usize,
+    ) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id
+             FROM zulip_messages
+             WHERE sender_email = ?1
+             ORDER BY fetched_at ASC, timestamp DESC, id DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![sender_email, limit as i64], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Mark cached message IDs as refreshed without changing their content.
+    pub fn mark_messages_refreshed(&self, message_ids: &[i64]) -> Result<()> {
+        let fetched_at = Utc::now().timestamp();
+        for message_id in message_ids {
+            self.conn.execute(
+                "UPDATE zulip_messages SET fetched_at = ?1 WHERE id = ?2",
+                params![fetched_at, message_id],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Search cached messages with SQLite FTS.
     pub fn search_messages(&self, query: &str) -> Result<Vec<ZulipMessage>> {
         let mut stmt = self.conn.prepare(
@@ -537,8 +566,57 @@ mod tests {
     }
 
     #[test]
+    fn authored_refresh_queue_rotates_by_fetched_at() {
+        let cache = Cache::in_memory().unwrap();
+        cache
+            .upsert_messages(&[
+                test_message(1, "ada@example.com"),
+                test_message(2, "ada@example.com"),
+                test_message(3, "other@example.com"),
+            ])
+            .unwrap();
+        cache
+            .conn
+            .execute("UPDATE zulip_messages SET fetched_at = 100", [])
+            .unwrap();
+
+        assert_eq!(
+            cache
+                .authored_message_ids_for_refresh("ada@example.com", 10)
+                .unwrap(),
+            [2, 1]
+        );
+
+        cache.mark_messages_refreshed(&[2]).unwrap();
+
+        assert_eq!(
+            cache
+                .authored_message_ids_for_refresh("ada@example.com", 10)
+                .unwrap(),
+            [1, 2]
+        );
+    }
+
+    #[test]
     fn duplicate_hash_is_stable() {
         assert_eq!(send_hash("s", "t", "m"), send_hash("s", "t", "m"));
         assert_ne!(send_hash("s", "t", "m"), send_hash("s", "t", "m2"));
+    }
+
+    fn test_message(id: i64, sender_email: &str) -> ZulipMessage {
+        ZulipMessage {
+            id,
+            stream_id: Some(1),
+            stream_name: "core team".to_string(),
+            topic: "Release".to_string(),
+            sender_id: Some(2),
+            sender_name: "Ada".to_string(),
+            sender_email: Some(sender_email.to_string()),
+            timestamp: Utc.timestamp_opt(1_700_000_000 + id, 0).unwrap(),
+            rendered_html: format!("<p>message {id}</p>"),
+            plain_text: format!("message {id}"),
+            permalink: Some(format!("https://example/{id}")),
+            raw_json: json!({"id": id}),
+        }
     }
 }

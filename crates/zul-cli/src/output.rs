@@ -24,13 +24,13 @@ impl PrintMode {
         }
         if result.offline {
             println!(
-                "Offline cache: {} streams, {} messages in last {}h",
-                result.streams, result.messages, result.hours
+                "Offline cache: {} streams, {} messages in last {}h, {} refreshed authored messages",
+                result.streams, result.messages, result.hours, result.refreshed_messages
             );
         } else {
             println!(
-                "Synced {} streams and {} recent messages ({}h)",
-                result.streams, result.messages, result.hours
+                "Synced {} streams, {} recent messages ({}h), and {} refreshed authored messages",
+                result.streams, result.messages, result.hours, result.refreshed_messages
             );
         }
         Ok(())

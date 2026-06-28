@@ -10,6 +10,9 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
 
+const POLL_AUTHORED_REFRESH_BATCH: usize = 5;
+const SYNC_AUTHORED_REFRESH_BATCH: usize = 100;
+
 /// Summary of a cache synchronization attempt.
 #[derive(Debug, Serialize)]
 pub struct SyncResult {
@@ -17,6 +20,8 @@ pub struct SyncResult {
     pub streams: usize,
     /// Number of recent messages fetched or read from cache.
     pub messages: usize,
+    /// Number of cached authored messages refreshed for edits or reactions.
+    pub refreshed_messages: usize,
     /// Lookback window used for the sync.
     pub hours: i64,
     /// Whether the operation avoided the network.
@@ -28,6 +33,8 @@ pub struct SyncResult {
 pub struct PollResult {
     /// Number of new messages inserted into the cache.
     pub new_messages: usize,
+    /// Number of cached authored messages refreshed for edits or reactions.
+    pub refreshed_messages: usize,
     /// Highest message ID known after polling.
     pub latest_message_id: Option<i64>,
     /// Whether polling was skipped because the app is offline.
@@ -129,6 +136,7 @@ impl App {
             return Ok(SyncResult {
                 streams: self.streams()?.len(),
                 messages: self.recent_messages(hours)?.len(),
+                refreshed_messages: 0,
                 hours,
                 offline: true,
             });
@@ -144,10 +152,15 @@ impl App {
             .await
             .context("fetching Zulip messages")?;
         self.cache.upsert_messages(&messages)?;
+        let refreshed_messages = self
+            .refresh_cached_authored_messages(&client, SYNC_AUTHORED_REFRESH_BATCH)
+            .await
+            .context("refreshing cached authored messages")?;
         self.cache.set_sync_state("recent", "ok", None)?;
         Ok(SyncResult {
             streams: streams.len(),
             messages: messages.len(),
+            refreshed_messages,
             hours,
             offline: false,
         })
@@ -158,6 +171,7 @@ impl App {
         if self.offline {
             return Ok(PollResult {
                 new_messages: 0,
+                refreshed_messages: 0,
                 latest_message_id: self.cache.max_message_id()?,
                 offline: true,
             });
@@ -185,13 +199,20 @@ impl App {
         if !messages.is_empty() {
             self.cache.upsert_messages(&messages)?;
         }
+        let refreshed_messages = self
+            .refresh_cached_authored_messages(&client, POLL_AUTHORED_REFRESH_BATCH)
+            .await
+            .context("refreshing cached authored messages")?;
         self.cache.set_sync_state(
             "recent",
             "ok",
-            Some(&format!("poll: {new_messages} new messages")),
+            Some(&format!(
+                "poll: {new_messages} new messages, {refreshed_messages} refreshed messages"
+            )),
         )?;
         Ok(PollResult {
             new_messages,
+            refreshed_messages,
             latest_message_id: self.cache.max_message_id()?,
             offline: false,
         })
@@ -206,6 +227,7 @@ impl App {
             let cache = Cache::open(&settings.paths.cache_file)?;
             return Ok(PollResult {
                 new_messages: 0,
+                refreshed_messages: 0,
                 latest_message_id: cache.max_message_id()?,
                 offline: true,
             });
@@ -237,14 +259,35 @@ impl App {
         if !messages.is_empty() {
             cache.upsert_messages(&messages)?;
         }
+        let refresh_ids = settings
+            .zulip
+            .email
+            .as_deref()
+            .map(|email| cache.authored_message_ids_for_refresh(email, POLL_AUTHORED_REFRESH_BATCH))
+            .transpose()?
+            .unwrap_or_default();
+        drop(cache);
+
+        let (refreshed, missing) = fetch_messages_by_ids(&client, refresh_ids).await?;
+        let refreshed_messages = refreshed.len();
+        let cache = Cache::open(&settings.paths.cache_file)?;
+        if !refreshed.is_empty() {
+            cache.upsert_messages(&refreshed)?;
+        }
+        if !missing.is_empty() {
+            cache.mark_messages_refreshed(&missing)?;
+        }
         cache.set_sync_state(
             "recent",
             "ok",
-            Some(&format!("poll: {new_messages} new messages")),
+            Some(&format!(
+                "poll: {new_messages} new messages, {refreshed_messages} refreshed messages"
+            )),
         )?;
 
         Ok(PollResult {
             new_messages,
+            refreshed_messages,
             latest_message_id: cache.max_message_id()?,
             offline: false,
         })
@@ -383,10 +426,51 @@ impl App {
         })
     }
 
+    async fn refresh_cached_authored_messages(
+        &self,
+        client: &ZulipClient,
+        limit: usize,
+    ) -> Result<usize> {
+        let refresh_ids = self
+            .settings
+            .zulip
+            .email
+            .as_deref()
+            .map(|email| self.cache.authored_message_ids_for_refresh(email, limit))
+            .transpose()?
+            .unwrap_or_default();
+        let (refreshed, missing) = fetch_messages_by_ids(client, refresh_ids).await?;
+        let refreshed_count = refreshed.len();
+        if !refreshed.is_empty() {
+            self.cache.upsert_messages(&refreshed)?;
+        }
+        if !missing.is_empty() {
+            self.cache.mark_messages_refreshed(&missing)?;
+        }
+        Ok(refreshed_count)
+    }
+
     fn client(&self) -> Result<ZulipClient> {
         let (base_url, email, api_key) = self.settings.require_auth()?;
         Ok(ZulipClient::new(base_url, email, api_key))
     }
+}
+
+async fn fetch_messages_by_ids(
+    client: &ZulipClient,
+    ids: Vec<i64>,
+) -> Result<(Vec<ZulipMessage>, Vec<i64>)> {
+    let mut refreshed = Vec::new();
+    let mut missing = Vec::new();
+
+    for id in ids {
+        match client.message_by_id(id).await? {
+            Some(message) => refreshed.push(message),
+            None => missing.push(id),
+        }
+    }
+
+    Ok((refreshed, missing))
 }
 
 fn image_cache_path(settings: &Settings, key: &str) -> PathBuf {
