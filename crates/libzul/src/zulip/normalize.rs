@@ -2,6 +2,7 @@ use crate::zulip::models::{ApiSubscription, ZulipMessage, ZulipStream};
 use anyhow::{Context, Result};
 use chrono::{TimeZone, Utc};
 
+/// Convert a raw Zulip subscription into cached stream metadata.
 pub fn subscription(sub: ApiSubscription) -> ZulipStream {
     ZulipStream {
         id: sub.stream_id,
@@ -10,6 +11,7 @@ pub fn subscription(sub: ApiSubscription) -> ZulipStream {
     }
 }
 
+/// Convert a raw Zulip message JSON value into a normalized message.
 pub fn message(raw: serde_json::Value) -> Result<ZulipMessage> {
     let id = raw
         .get("id")
@@ -70,6 +72,7 @@ pub fn message(raw: serde_json::Value) -> Result<ZulipMessage> {
     })
 }
 
+/// Convert simple Zulip-rendered HTML into plain text for search and display.
 pub fn html_to_text(html: &str) -> String {
     let mut text = String::with_capacity(html.len());
     let mut in_tag = false;

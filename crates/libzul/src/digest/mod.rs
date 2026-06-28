@@ -3,37 +3,60 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
+/// Summary view built from a set of cached Zulip messages.
 #[derive(Debug, Clone, Serialize)]
 pub struct Digest {
+    /// Lookback window represented by the digest.
     pub hours: i64,
+    /// Total messages considered.
     pub total_messages: usize,
+    /// Most active stream/topic groups.
     pub topics: Vec<DigestTopic>,
+    /// Messages likely to require attention.
     pub likely_attention_items: Vec<DigestItem>,
+    /// Recent questions without a later reply in the same topic.
     pub unanswered_questions: Vec<DigestItem>,
+    /// Messages that mention configured aliases.
     pub mentions: Vec<DigestItem>,
 }
 
+/// Activity summary for a stream/topic pair.
 #[derive(Debug, Clone, Serialize)]
 pub struct DigestTopic {
+    /// Stream name.
     pub stream: String,
+    /// Topic name.
     pub topic: String,
+    /// Number of messages in the group.
     pub message_count: usize,
+    /// Timestamp of the newest message in the group.
     pub last_message_at: Option<DateTime<Utc>>,
+    /// Up to five message IDs sampled from the group.
     pub sample_message_ids: Vec<i64>,
 }
 
+/// Message highlighted by a digest rule.
 #[derive(Debug, Clone, Serialize)]
 pub struct DigestItem {
+    /// Zulip message ID.
     pub id: i64,
+    /// Stream name.
     pub stream: String,
+    /// Topic name.
     pub topic: String,
+    /// Sender display name.
     pub sender: String,
+    /// Message timestamp.
     pub timestamp: DateTime<Utc>,
+    /// Truncated plain-text message body.
     pub text: String,
+    /// Zulip permalink, if present in the API response.
     pub permalink: Option<String>,
+    /// Rule names that caused this item to be selected.
     pub reasons: Vec<String>,
 }
 
+/// Build a digest from cached messages and configured mention aliases.
 pub fn build_digest(messages: Vec<ZulipMessage>, hours: i64, aliases: &[String]) -> Digest {
     let mut grouped: BTreeMap<(String, String), Vec<&ZulipMessage>> = BTreeMap::new();
     for message in &messages {

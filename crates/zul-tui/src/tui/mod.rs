@@ -1,7 +1,3 @@
-use crate::app::{App, PollResult};
-use crate::config::{Settings, ThemeConfig};
-use crate::digest::{self, Digest};
-use crate::zulip::models::{ZulipMessage, ZulipStream, ZulipTopic};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -9,6 +5,10 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use libzul::app::{App, PollResult};
+use libzul::config::{Settings, ThemeConfig};
+use libzul::digest::{self, Digest};
+use libzul::zulip::models::{ZulipMessage, ZulipStream, ZulipTopic};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -1168,11 +1168,11 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::Cache;
-    use crate::config::{
+    use chrono::Utc;
+    use libzul::cache::Cache;
+    use libzul::config::{
         AppPaths, CacheConfig, DigestConfig, SafetyConfig, Settings, UiConfig, ZulipConfig,
     };
-    use chrono::Utc;
     use serde_json::json;
     use tempfile::TempDir;
 

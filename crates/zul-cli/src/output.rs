@@ -1,7 +1,7 @@
-use crate::app::{ReplyResult, SyncResult};
-use crate::digest::Digest;
-use crate::zulip::models::{ZulipMessage, ZulipStream, ZulipTopic};
 use anyhow::Result;
+use libzul::app::{ReplyResult, SyncResult};
+use libzul::digest::Digest;
+use libzul::zulip::models::{ZulipMessage, ZulipStream, ZulipTopic};
 use serde::Serialize;
 
 pub fn print_json<T: Serialize + ?Sized>(value: &T) -> Result<()> {

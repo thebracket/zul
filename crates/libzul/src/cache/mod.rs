@@ -105,25 +105,35 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 "#;
 
+/// Recorded synchronization status for a cache scope.
 #[derive(Debug, Clone, Serialize)]
 pub struct SyncRecord {
+    /// Sync scope name.
     pub scope: String,
+    /// Time the status was recorded.
     pub synced_at: DateTime<Utc>,
+    /// Short status string.
     pub status: String,
+    /// Optional detail text.
     pub detail: Option<String>,
 }
 
+/// Aggregate message count for a stream.
 #[derive(Debug, Clone, Serialize)]
 pub struct StreamActivity {
+    /// Stream name.
     pub stream_name: String,
+    /// Number of cached messages in the stream.
     pub message_count: i64,
 }
 
+/// SQLite-backed cache for Zulip streams, topics, messages, and send audit records.
 pub struct Cache {
     conn: Connection,
 }
 
 impl Cache {
+    /// Open a cache database at `path`, creating parent directories and applying migrations.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
@@ -136,6 +146,7 @@ impl Cache {
     }
 
     #[cfg(test)]
+    /// Open an in-memory cache for unit tests.
     pub fn in_memory() -> Result<Self> {
         let cache = Self {
             conn: Connection::open_in_memory()?,
@@ -153,6 +164,7 @@ impl Cache {
         Ok(())
     }
 
+    /// Insert or update cached stream metadata.
     pub fn upsert_streams(&self, streams: &[ZulipStream]) -> Result<()> {
         let now = Utc::now().timestamp();
         for stream in streams {
@@ -169,6 +181,7 @@ impl Cache {
         Ok(())
     }
 
+    /// Insert or update cached messages and rebuild topic summaries.
     pub fn upsert_messages(&self, messages: &[ZulipMessage]) -> Result<()> {
         let fetched_at = Utc::now().timestamp();
         for message in messages {
@@ -223,6 +236,7 @@ impl Cache {
         Ok(())
     }
 
+    /// List cached streams sorted by name.
     pub fn streams(&self) -> Result<Vec<ZulipStream>> {
         let mut stmt = self
             .conn
@@ -238,6 +252,7 @@ impl Cache {
         Ok(streams)
     }
 
+    /// List cached topics for a stream.
     pub fn topics(&self, stream: &str) -> Result<Vec<ZulipTopic>> {
         let mut stmt = self.conn.prepare(
             "SELECT stream_id, stream_name, name, message_count, last_message_at
@@ -250,6 +265,7 @@ impl Cache {
         Ok(topics)
     }
 
+    /// List cached messages for one stream/topic pair.
     pub fn messages_for_topic(&self, stream: &str, topic: &str) -> Result<Vec<ZulipMessage>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, stream_id, stream_name, topic, sender_id, sender_name, sender_email,
@@ -263,6 +279,7 @@ impl Cache {
         Ok(messages)
     }
 
+    /// List cached messages newer than `hours` ago.
     pub fn recent_messages(&self, hours: i64) -> Result<Vec<ZulipMessage>> {
         let cutoff = (Utc::now() - chrono::Duration::hours(hours)).timestamp();
         let mut stmt = self.conn.prepare(
@@ -277,12 +294,14 @@ impl Cache {
         Ok(messages)
     }
 
+    /// Return the highest cached Zulip message ID.
     pub fn max_message_id(&self) -> Result<Option<i64>> {
         self.conn
             .query_row("SELECT MAX(id) FROM zulip_messages", [], |row| row.get(0))
             .map_err(Into::into)
     }
 
+    /// Search cached messages with SQLite FTS.
     pub fn search_messages(&self, query: &str) -> Result<Vec<ZulipMessage>> {
         let mut stmt = self.conn.prepare(
             "SELECT m.id, m.stream_id, m.stream_name, m.topic, m.sender_id, m.sender_name,
@@ -303,6 +322,7 @@ impl Cache {
         }
     }
 
+    /// Return cached message counts grouped by stream.
     pub fn stream_activity(&self) -> Result<Vec<StreamActivity>> {
         let mut stmt = self
             .conn
@@ -332,6 +352,7 @@ impl Cache {
         Ok(messages)
     }
 
+    /// Record synchronization status for a scope.
     pub fn set_sync_state(&self, scope: &str, status: &str, detail: Option<&str>) -> Result<()> {
         self.conn.execute(
             "INSERT INTO sync_state (scope, synced_at, status, detail)
@@ -345,6 +366,7 @@ impl Cache {
         Ok(())
     }
 
+    /// Return synchronization status for a scope.
     pub fn sync_state(&self, scope: &str) -> Result<Option<SyncRecord>> {
         self.conn
             .query_row(
@@ -363,6 +385,7 @@ impl Cache {
             .map_err(Into::into)
     }
 
+    /// Return whether the send audit log already contains a content hash.
     pub fn has_sent_hash(&self, hash: &str) -> Result<bool> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM audit_log WHERE action = 'send_stream_message' AND content_hash = ?1 AND dry_run = 0",
@@ -372,10 +395,12 @@ impl Cache {
         Ok(count > 0)
     }
 
+    /// Record an attempted send and return its duplicate-protection hash.
     pub fn record_send_attempt(&self, stream: &str, topic: &str, content: &str) -> Result<String> {
         self.record_send(stream, topic, content, None, false)
     }
 
+    /// Attach a Zulip message ID to a previously recorded send attempt.
     pub fn complete_send_attempt(&self, hash: &str, zulip_message_id: i64) -> Result<()> {
         self.conn.execute(
             "UPDATE audit_log
@@ -391,6 +416,7 @@ impl Cache {
         Ok(())
     }
 
+    /// Record a send or dry-run entry and return its duplicate-protection hash.
     pub fn record_send(
         &self,
         stream: &str,
@@ -416,6 +442,7 @@ impl Cache {
     }
 }
 
+/// Build the duplicate-protection hash for a stream/topic/content tuple.
 pub fn send_hash(stream: &str, topic: &str, content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(stream.as_bytes());
@@ -423,7 +450,17 @@ pub fn send_hash(stream: &str, topic: &str, content: &str) -> String {
     hasher.update(topic.as_bytes());
     hasher.update([0]);
     hasher.update(content.as_bytes());
-    format!("{:x}", hasher.finalize())
+    hex_lower(&hasher.finalize())
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut value = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        value.push(HEX[(byte >> 4) as usize] as char);
+        value.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    value
 }
 
 fn topic_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ZulipTopic> {

@@ -1,9 +1,6 @@
-use crate::app::App;
-use crate::auth::{AuthLoginArgs, AuthStatus};
-use crate::config::Settings;
-use crate::digest;
 use crate::output::{print_json, PrintMode};
 use clap::{Args, Parser, Subcommand};
+use libzul::{digest, App, AuthLogin, AuthStatus, Settings};
 
 #[derive(Debug, Parser)]
 #[command(name = "zq", version, about = "Terminal-first Zulip client")]
@@ -36,6 +33,16 @@ enum Command {
 enum AuthCommand {
     Login(AuthLoginArgs),
     Status,
+}
+
+#[derive(Debug, Args)]
+struct AuthLoginArgs {
+    #[arg(long, env = "ZULIP_BASE_URL")]
+    base_url: String,
+    #[arg(long, env = "ZULIP_EMAIL")]
+    email: String,
+    #[arg(long, env = "ZULIP_API_KEY", hide_env_values = true)]
+    api_key: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -89,7 +96,11 @@ pub async fn run() -> anyhow::Result<()> {
     match cli.command {
         Command::Auth { command } => match command {
             AuthCommand::Login(args) => {
-                let saved = crate::auth::login(args)?;
+                let saved = libzul::login(AuthLogin {
+                    base_url: args.base_url,
+                    email: args.email,
+                    api_key: args.api_key,
+                })?;
                 if mode.json {
                     print_json(&saved)?;
                 } else {
@@ -166,7 +177,7 @@ pub async fn run() -> anyhow::Result<()> {
         }
         Command::Tui => {
             let app = App::open(settings, cli.offline)?;
-            crate::tui::run(app).await?;
+            zul_tui::run(app).await?;
         }
     }
 

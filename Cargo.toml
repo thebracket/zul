@@ -1,35 +1,40 @@
-[package]
-name = "zq"
+[workspace]
+resolver = "2"
+members = [
+    "crates/libzul",
+    "crates/zul-cli",
+    "crates/zul-tui",
+]
+default-members = [
+    "crates/libzul",
+    "crates/zul-cli",
+    "crates/zul-tui",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
-description = "Terminal-first Zulip CLI and TUI"
 license = "MIT"
 
-[[bin]]
-name = "zq"
-path = "src/main.rs"
-
-[dependencies]
+[workspace.dependencies]
 anyhow = "1.0"
+assert_cmd = "2.0"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
-crossterm = "0.28"
-directories = "5.0"
+crossterm = "0.29"
+directories = "6.0"
 dotenvy = "0.15"
-ratatui = "0.29"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-rusqlite = { version = "0.31", features = ["bundled", "chrono"] }
+libzul = { path = "crates/libzul" }
+predicates = "3.1"
+ratatui = "0.30"
+reqwest = { version = "0.13", default-features = false, features = ["form", "json", "query", "rustls"] }
+rusqlite = { version = "0.40", features = ["bundled", "chrono"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.10"
+sha2 = "0.11"
 tempfile = "3.10"
-thiserror = "1.0"
 tokio = { version = "1.39", features = ["macros", "rt-multi-thread"] }
-toml = "0.8"
-tracing = "0.1"
+toml = "1.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-[dev-dependencies]
-assert_cmd = "2.0"
-predicates = "3.1"
 wiremock = "0.6"
+zul-tui = { path = "crates/zul-tui" }

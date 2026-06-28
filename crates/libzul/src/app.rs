@@ -6,42 +6,67 @@ use crate::zulip::models::{ZulipMessage, ZulipStream, ZulipTopic};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
+/// Summary of a cache synchronization attempt.
 #[derive(Debug, Serialize)]
 pub struct SyncResult {
+    /// Number of streams known after the sync.
     pub streams: usize,
+    /// Number of recent messages fetched or read from cache.
     pub messages: usize,
+    /// Lookback window used for the sync.
     pub hours: i64,
+    /// Whether the operation avoided the network.
     pub offline: bool,
 }
 
+/// Result of polling Zulip for messages newer than the local cache.
 #[derive(Debug, Clone, Serialize)]
 pub struct PollResult {
+    /// Number of new messages inserted into the cache.
     pub new_messages: usize,
+    /// Highest message ID known after polling.
     pub latest_message_id: Option<i64>,
+    /// Whether polling was skipped because the app is offline.
     pub offline: bool,
 }
 
+/// Result of preparing or sending a Zulip reply.
 #[derive(Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ReplyResult {
+    /// Send was validated and recorded, but no network send occurred.
     DryRun {
+        /// Zulip realm URL.
         realm: String,
+        /// Zulip account email.
         account: String,
+        /// Destination stream name.
         stream: String,
+        /// Destination topic name.
         topic: String,
+        /// Message body that would be sent.
         message: String,
+        /// Hash used to prevent duplicate sends.
         content_hash: String,
     },
+    /// Message was sent to Zulip.
     Sent {
+        /// Zulip realm URL.
         realm: String,
+        /// Zulip account email.
         account: String,
+        /// Destination stream name.
         stream: String,
+        /// Destination topic name.
         topic: String,
+        /// Message ID returned by Zulip.
         zulip_message_id: i64,
+        /// Hash used to prevent duplicate sends.
         content_hash: String,
     },
 }
 
+/// High-level service for Zulip API access plus local cache queries.
 pub struct App {
     settings: Settings,
     cache: Cache,
@@ -49,6 +74,7 @@ pub struct App {
 }
 
 impl App {
+    /// Open the local cache and build an application service from settings.
     pub fn open(settings: Settings, offline: bool) -> Result<Self> {
         let cache = Cache::open(&settings.paths.cache_file)?;
         Ok(Self {
@@ -58,14 +84,17 @@ impl App {
         })
     }
 
+    /// Return the settings used by this application instance.
     pub fn settings(&self) -> &Settings {
         &self.settings
     }
 
+    /// Return whether this instance is in read-only offline mode.
     pub fn offline(&self) -> bool {
         self.offline
     }
 
+    /// Check whether local credentials are present and valid.
     pub async fn auth_status(&self) -> AuthStatus {
         let problems = self.settings.auth_problems();
         if problems.is_empty() {
@@ -90,6 +119,7 @@ impl App {
         }
     }
 
+    /// Fetch streams and recent messages into the local cache.
     pub async fn sync(&self, hours: i64) -> Result<SyncResult> {
         if self.offline {
             return Ok(SyncResult {
@@ -119,6 +149,7 @@ impl App {
         })
     }
 
+    /// Poll for messages newer than the highest cached message ID.
     pub async fn poll_new_messages(&self) -> Result<PollResult> {
         if self.offline {
             return Ok(PollResult {
@@ -162,6 +193,7 @@ impl App {
         })
     }
 
+    /// Poll using owned settings, useful from background threads.
     pub async fn poll_new_messages_with_settings(
         settings: Settings,
         offline: bool,
@@ -214,34 +246,42 @@ impl App {
         })
     }
 
+    /// List cached streams.
     pub fn streams(&self) -> Result<Vec<ZulipStream>> {
         self.cache.streams()
     }
 
+    /// List cached topics for a stream.
     pub fn topics(&self, stream: &str) -> Result<Vec<ZulipTopic>> {
         self.cache.topics(stream)
     }
 
+    /// List cached messages for a stream topic.
     pub fn topic(&self, stream: &str, topic: &str) -> Result<Vec<ZulipMessage>> {
         self.cache.messages_for_topic(stream, topic)
     }
 
+    /// List cached messages newer than the requested lookback window.
     pub fn recent_messages(&self, hours: i64) -> Result<Vec<ZulipMessage>> {
         self.cache.recent_messages(hours)
     }
 
+    /// Search cached messages using SQLite FTS, with a LIKE fallback.
     pub fn search(&self, query: &str) -> Result<Vec<ZulipMessage>> {
         self.cache.search_messages(query)
     }
 
+    /// Return cached message counts per stream.
     pub fn stream_activity(&self) -> Result<Vec<StreamActivity>> {
         self.cache.stream_activity()
     }
 
+    /// Return the last recorded recent-sync state.
     pub fn sync_state(&self) -> Result<Option<SyncRecord>> {
         self.cache.sync_state("recent")
     }
 
+    /// Send or dry-run a stream reply with duplicate-send protection.
     pub async fn reply(
         &self,
         stream: &str,

@@ -7,76 +7,119 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
+/// Complete runtime settings after config files, secrets, and environment are merged.
 #[derive(Debug, Clone, Serialize)]
 pub struct Settings {
+    /// Zulip realm and account settings.
     pub zulip: ZulipConfig,
+    /// Cache and sync behavior.
     pub cache: CacheConfig,
+    /// Terminal UI preferences.
     pub ui: UiConfig,
+    /// Safety defaults for potentially mutating actions.
     pub safety: SafetyConfig,
+    /// Digest construction preferences.
     pub digest: DigestConfig,
     #[serde(default)]
+    /// Named TUI themes keyed by theme name.
     pub themes: BTreeMap<String, ThemeConfig>,
     #[serde(skip)]
+    /// Resolved config, cache, and secret paths.
     pub paths: AppPaths,
 }
 
+/// Zulip realm and API authentication settings.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ZulipConfig {
+    /// Base URL of the Zulip realm.
     pub base_url: Option<String>,
+    /// Email address for Zulip API authentication.
     pub email: Option<String>,
     #[serde(skip_serializing, default)]
+    /// API key loaded from environment or the local secret file.
     pub api_key: Option<String>,
 }
 
+/// Local cache configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheConfig {
+    /// Intended cache time-to-live in minutes.
     pub ttl_minutes: i64,
+    /// Default recent-message sync window.
     pub default_sync_hours: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Optional override path for the SQLite cache.
     pub path: Option<PathBuf>,
 }
 
+/// Terminal UI configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
+    /// Initial view name for UI implementations.
     pub start_view: String,
+    /// Selected theme name.
     pub theme: String,
 }
 
+/// Optional color overrides for the terminal UI.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ThemeConfig {
+    /// Main background color.
     pub background: Option<String>,
+    /// Main foreground text color.
     pub text: Option<String>,
+    /// Pane border color.
     pub pane_border: Option<String>,
+    /// Active pane title color.
     pub active_title: Option<String>,
+    /// Inactive pane title color.
     pub inactive_title: Option<String>,
+    /// Active selection foreground color.
     pub active_selection_fg: Option<String>,
+    /// Active selection background color.
     pub active_selection_bg: Option<String>,
+    /// Inactive selection foreground color.
     pub inactive_selection_fg: Option<String>,
+    /// Inactive selection background color.
     pub inactive_selection_bg: Option<String>,
+    /// Message ID color.
     pub message_id: Option<String>,
+    /// Sender-name color.
     pub sender: Option<String>,
+    /// Status bar foreground color.
     pub status_fg: Option<String>,
+    /// Status bar background color.
     pub status_bg: Option<String>,
+    /// Modal and overlay text color.
     pub modal_text: Option<String>,
 }
 
+/// Safety configuration for write operations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SafetyConfig {
+    /// Whether commands should avoid writes unless explicitly enabled.
     pub read_only_by_default: bool,
+    /// Whether sends require an explicit confirmation flag.
     pub require_confirmation_for_sends: bool,
 }
 
+/// Digest configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DigestConfig {
     #[serde(default)]
+    /// Names or phrases that should count as mentions of the user.
     pub aliases: Vec<String>,
 }
 
+/// Filesystem paths used by the application.
 #[derive(Debug, Clone, Serialize)]
 pub struct AppPaths {
+    /// Path to the TOML config file.
     pub config_file: PathBuf,
+    /// Path to the SQLite cache file.
     pub cache_file: PathBuf,
+    /// Path to the API key secret file.
     pub secret_file: PathBuf,
 }
 
@@ -119,6 +162,7 @@ impl Default for SafetyConfig {
 }
 
 impl Settings {
+    /// Load settings from XDG paths, secret files, and environment variables.
     pub fn load() -> Result<Self> {
         let paths = AppPaths::discover()?;
         let mut settings = if paths.config_file.exists() {
@@ -168,6 +212,7 @@ impl Settings {
         }
     }
 
+    /// Return human-readable problems with the current auth configuration.
     pub fn auth_problems(&self) -> Vec<String> {
         let mut problems = Vec::new();
         if self
@@ -194,6 +239,7 @@ impl Settings {
         problems
     }
 
+    /// Return required auth values or an error describing missing settings.
     pub fn require_auth(&self) -> Result<(String, String, String)> {
         let problems = self.auth_problems();
         if !problems.is_empty() {
@@ -210,6 +256,7 @@ impl Settings {
         ))
     }
 
+    /// Save non-secret settings to the config file.
     pub fn save_without_secret(&self) -> Result<()> {
         if let Some(parent) = self.paths.config_file.parent() {
             fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
@@ -250,6 +297,7 @@ impl Settings {
         Ok(())
     }
 
+    /// Save the Zulip API key to the local secret file.
     pub fn save_api_key(&self, api_key: &str) -> Result<()> {
         if let Some(parent) = self.paths.secret_file.parent() {
             fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
@@ -276,6 +324,7 @@ impl Settings {
 }
 
 impl AppPaths {
+    /// Discover default XDG paths for config, cache, and secrets.
     pub fn discover() -> Result<Self> {
         let dirs = ProjectDirs::from("", "", "zq").context("unable to discover XDG paths")?;
         Ok(Self {

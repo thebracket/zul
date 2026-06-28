@@ -8,6 +8,7 @@ use reqwest::Client;
 use serde_json::json;
 use std::collections::HashSet;
 
+/// Async Zulip REST client using email/API-key basic authentication.
 #[derive(Clone)]
 pub struct ZulipClient {
     http: Client,
@@ -17,6 +18,7 @@ pub struct ZulipClient {
 }
 
 impl ZulipClient {
+    /// Create a client for a Zulip realm and account.
     pub fn new(base_url: String, email: String, api_key: String) -> Self {
         Self {
             http: Client::new(),
@@ -27,6 +29,7 @@ impl ZulipClient {
     }
 
     #[allow(dead_code)]
+    /// Fetch the current Zulip user.
     pub async fn current_user(&self) -> Result<CurrentUser> {
         let data: CurrentUserResponse = self
             .get("/api/v1/users/me")
@@ -41,6 +44,7 @@ impl ZulipClient {
         })
     }
 
+    /// Fetch streams subscribed by the current user.
     pub async fn subscriptions(&self) -> Result<Vec<ZulipStream>> {
         let data = self
             .get("/api/v1/users/me/subscriptions")
@@ -56,6 +60,7 @@ impl ZulipClient {
             .collect())
     }
 
+    /// Fetch recent messages newer than the requested lookback window.
     pub async fn recent_messages(&self, hours: i64) -> Result<Vec<ZulipMessage>> {
         let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours);
         let mut anchor = "newest".to_string();
@@ -96,6 +101,7 @@ impl ZulipClient {
         Ok(messages)
     }
 
+    /// Fetch messages newer than a known Zulip message ID.
     pub async fn messages_after(&self, anchor_id: i64) -> Result<Vec<ZulipMessage>> {
         let mut anchor = anchor_id.to_string();
         let mut messages = Vec::new();
@@ -130,6 +136,7 @@ impl ZulipClient {
     }
 
     #[allow(dead_code)]
+    /// Fetch recent messages narrowed to a stream and optional topic.
     pub async fn stream_messages(
         &self,
         stream: &str,
@@ -144,6 +151,7 @@ impl ZulipClient {
     }
 
     #[allow(dead_code)]
+    /// Search recent Zulip messages through the Zulip API.
     pub async fn search(&self, query: &str, hours: i64) -> Result<Vec<ZulipMessage>> {
         self.narrow_messages(vec![json!({"operator":"search","operand":query})], hours)
             .await
@@ -195,6 +203,7 @@ impl ZulipClient {
         Ok(data.messages)
     }
 
+    /// Send a stream message and return the created Zulip message ID.
     pub async fn send_stream_message(
         &self,
         stream: &str,
