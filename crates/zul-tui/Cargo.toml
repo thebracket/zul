@@ -18,6 +18,7 @@ anyhow.workspace = true
 chrono.workspace = true
 crossterm.workspace = true
 ego-tree = "0.10"
+emojis = "0.8.2"
 image = { workspace = true, optional = true }
 dotenvy.workspace = true
 libzul.workspace = true
@@ -26,6 +27,8 @@ ratatui-image = { workspace = true, optional = true }
 scraper.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
+unicode-segmentation = "1.13"
+unicode-width = "0.2"
 
 [dev-dependencies]
 serde_json.workspace = true

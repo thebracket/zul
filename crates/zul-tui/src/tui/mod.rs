@@ -31,6 +31,8 @@ use std::io::Cursor;
 use std::io::{self, Stdout};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const IMAGE_ROWS: u16 = 8;
@@ -1399,7 +1401,7 @@ fn html_segments(html: &str, style: Style) -> Vec<StyledSegment> {
 
 fn collect_html_segments(node: NodeRef<'_, Node>, style: Style, segments: &mut Vec<StyledSegment>) {
     match node.value() {
-        Node::Text(text) => push_segment(segments, text.to_string(), style),
+        Node::Text(text) => push_text_segments(segments, text, style),
         Node::Element(_) => {
             let Some(element) = ElementRef::wrap(node) else {
                 return;
@@ -1425,6 +1427,32 @@ fn collect_html_segments(node: NodeRef<'_, Node>, style: Style, segments: &mut V
             }
         }
         _ => {}
+    }
+}
+
+fn push_text_segments(segments: &mut Vec<StyledSegment>, text: &str, style: Style) {
+    let mut emit_from = 0;
+    let mut search_from = 0;
+    while let Some(relative_start) = text[search_from..].find(':') {
+        let start = search_from + relative_start;
+        let Some(relative_end) = text[start + 1..].find(':') else {
+            break;
+        };
+        let end = start + 1 + relative_end;
+        let candidate = &text[start..=end];
+        let Some(emoji) = emoji_from_shortcode(candidate) else {
+            search_from = end + 1;
+            continue;
+        };
+        if emit_from < start {
+            push_segment(segments, text[emit_from..start].to_string(), style);
+        }
+        push_segment(segments, emoji, style);
+        emit_from = end + 1;
+        search_from = emit_from;
+    }
+    if emit_from < text.len() {
+        push_segment(segments, text[emit_from..].to_string(), style);
     }
 }
 
@@ -1518,19 +1546,8 @@ fn emoji_from_code(code: &str) -> Option<String> {
 }
 
 fn emoji_from_shortcode(value: &str) -> Option<String> {
-    let normalized = value
-        .trim()
-        .trim_matches(':')
-        .trim_end_matches(" emoji")
-        .replace(' ', "_")
-        .to_ascii_lowercase();
-    match normalized.as_str() {
-        "sunglasses" => Some("😎".to_string()),
-        "+1" | "thumbs_up" | "thumbsup" => Some("👍".to_string()),
-        "heart" => Some("❤️".to_string()),
-        "smile" | "smiley" => Some("😄".to_string()),
-        _ => None,
-    }
+    let normalized = normalize_shortcode(value);
+    emojis::get_by_shortcode(shortcode_alias(&normalized)).map(|emoji| emoji.as_str().to_string())
 }
 
 fn looks_like_shortcode(value: &str) -> bool {
@@ -1538,13 +1555,27 @@ fn looks_like_shortcode(value: &str) -> bool {
 }
 
 fn format_shortcode(value: &str) -> String {
-    let name = value
+    let name = normalize_shortcode(value);
+    format!(":{name}:")
+}
+
+fn normalize_shortcode(value: &str) -> String {
+    value
         .trim()
         .trim_matches(':')
         .trim_end_matches(" emoji")
         .trim()
-        .replace(' ', "_");
-    format!(":{name}:")
+        .replace(' ', "_")
+        .to_ascii_lowercase()
+}
+
+fn shortcode_alias(value: &str) -> &str {
+    match value {
+        "thumbs_up" => "+1",
+        "thumbs_down" => "-1",
+        "slight_smile" => "slightly_smiling_face",
+        _ => value,
+    }
 }
 
 fn wrap_styled_segments(
@@ -1656,15 +1687,22 @@ fn push_long_styled_word(
 ) {
     let mut chunk = String::new();
     let mut chunk_width = 0;
-    for ch in word.chars() {
-        if chunk_width == width {
+    for grapheme in word.graphemes(true) {
+        let grapheme_width = display_width(grapheme);
+        if chunk_width > 0 && chunk_width + grapheme_width > width {
             spans.push(Span::styled(std::mem::take(&mut chunk), style));
             lines.push(Line::from(std::mem::take(spans)));
             *line_width = 0;
             chunk_width = 0;
         }
-        chunk.push(ch);
-        chunk_width += 1;
+        if chunk_width == 0 && grapheme_width > width {
+            spans.push(Span::styled(grapheme.to_string(), style));
+            lines.push(Line::from(std::mem::take(spans)));
+            *line_width = 0;
+            continue;
+        }
+        chunk.push_str(grapheme);
+        chunk_width += grapheme_width;
     }
     if !chunk.is_empty() {
         spans.push(Span::styled(chunk, style));
@@ -1673,7 +1711,7 @@ fn push_long_styled_word(
 }
 
 fn display_width(value: &str) -> usize {
-    value.chars().count()
+    UnicodeWidthStr::width(value)
 }
 
 fn reaction_line(message: &ZulipMessage, style: Style) -> Option<Line<'static>> {
@@ -2008,6 +2046,19 @@ mod tests {
     }
 
     #[test]
+    fn literal_shortcodes_expand_using_emoji_dataset() {
+        let message = test_message_with_html(
+            1,
+            r#"<p>launch :rocket: :sunglasses: :not_real:</p>"#,
+            "ignored",
+        );
+
+        let lines = message_body_lines(&message, 80, Style::default());
+
+        assert_eq!(line_text(&lines[0]), "launch 🚀 😎 :not_real:");
+    }
+
+    #[test]
     fn styled_html_wrapping_preserves_span_styles() {
         let message =
             test_message_with_html(1, r#"<p>one two <strong>three</strong></p>"#, "ignored");
@@ -2021,6 +2072,40 @@ mod tests {
         assert!(lines[1].spans.iter().any(|span| {
             span.content.as_ref() == "three" && span.style.add_modifier.contains(Modifier::BOLD)
         }));
+    }
+
+    #[test]
+    fn emoji_width_uses_terminal_cell_width() {
+        assert_eq!(display_width("a"), 1);
+        assert_eq!(display_width("😎"), 2);
+        assert_eq!(display_width("a😎"), 3);
+    }
+
+    #[test]
+    fn wrapping_keeps_multi_codepoint_emoji_graphemes_intact() {
+        let segments = [StyledSegment {
+            text: "❤️x".to_string(),
+            style: Style::default(),
+        }];
+
+        let lines = wrap_styled_segments(&segments, 1, Style::default());
+
+        assert_eq!(lines.iter().map(line_text).collect::<Vec<_>>(), ["❤️", "x"]);
+    }
+
+    #[test]
+    fn wrapping_counts_zwj_emoji_as_single_wide_grapheme() {
+        let segments = [StyledSegment {
+            text: "a👨‍💻b".to_string(),
+            style: Style::default(),
+        }];
+
+        let lines = wrap_styled_segments(&segments, 3, Style::default());
+
+        assert_eq!(
+            lines.iter().map(line_text).collect::<Vec<_>>(),
+            ["a👨‍💻", "b"]
+        );
     }
 
     #[test]
