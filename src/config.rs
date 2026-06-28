@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -13,6 +14,8 @@ pub struct Settings {
     pub ui: UiConfig,
     pub safety: SafetyConfig,
     pub digest: DigestConfig,
+    #[serde(default)]
+    pub themes: BTreeMap<String, ThemeConfig>,
     #[serde(skip)]
     pub paths: AppPaths,
 }
@@ -34,8 +37,28 @@ pub struct CacheConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct UiConfig {
     pub start_view: String,
+    pub theme: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ThemeConfig {
+    pub background: Option<String>,
+    pub text: Option<String>,
+    pub pane_border: Option<String>,
+    pub active_title: Option<String>,
+    pub inactive_title: Option<String>,
+    pub active_selection_fg: Option<String>,
+    pub active_selection_bg: Option<String>,
+    pub inactive_selection_fg: Option<String>,
+    pub inactive_selection_bg: Option<String>,
+    pub message_id: Option<String>,
+    pub sender: Option<String>,
+    pub status_fg: Option<String>,
+    pub status_bg: Option<String>,
+    pub modal_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +87,7 @@ struct FileSettings {
     ui: Option<UiConfig>,
     safety: Option<SafetyConfig>,
     digest: Option<DigestConfig>,
+    themes: Option<BTreeMap<String, ThemeConfig>>,
 }
 
 impl Default for CacheConfig {
@@ -80,6 +104,7 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             start_view: "streams".to_string(),
+            theme: "zenburn".to_string(),
         }
     }
 }
@@ -123,6 +148,7 @@ impl Settings {
             ui: file.ui.unwrap_or_default(),
             safety: file.safety.unwrap_or_default(),
             digest: file.digest.unwrap_or_default(),
+            themes: file.themes.unwrap_or_default(),
             paths,
         }
     }
@@ -198,6 +224,7 @@ impl Settings {
             ui: self.ui.clone(),
             safety: self.safety.clone(),
             digest: self.digest.clone(),
+            themes: self.themes.clone(),
             paths: self.paths.clone(),
         };
         let mut value = toml::Value::try_from(&serializable)?;
@@ -325,5 +352,27 @@ mod tests {
         loaded.load_secret_file().unwrap();
 
         assert_eq!(loaded.zulip.api_key.as_deref(), Some("local-secret"));
+    }
+
+    #[test]
+    fn parses_ui_theme_and_custom_theme_from_toml() {
+        let file: FileSettings = toml::from_str(
+            r##"
+            [ui]
+            theme = "cozy"
+
+            [themes.cozy]
+            background = "#101820"
+            sender = "#BFEBBF"
+            "##,
+        )
+        .unwrap();
+
+        let ui = file.ui.unwrap();
+        let themes = file.themes.unwrap();
+
+        assert_eq!(ui.start_view, "streams");
+        assert_eq!(ui.theme, "cozy");
+        assert_eq!(themes["cozy"].background.as_deref(), Some("#101820"));
     }
 }

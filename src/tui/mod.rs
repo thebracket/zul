@@ -1,8 +1,8 @@
 use crate::app::{App, PollResult};
-use crate::config::Settings;
+use crate::config::{Settings, ThemeConfig};
 use crate::digest::{self, Digest};
 use crate::zulip::models::{ZulipMessage, ZulipStream, ZulipTopic};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
@@ -92,6 +92,7 @@ impl TuiState {
         };
         state.reload_topics(app)?;
         state.reload_messages(app)?;
+        state.select_latest_message();
         Ok(state)
     }
 
@@ -125,6 +126,10 @@ impl TuiState {
         Ok(())
     }
 
+    fn select_latest_message(&mut self) {
+        self.message_idx = self.messages.len().saturating_sub(1);
+    }
+
     fn move_selection(&mut self, delta: isize, app: &App) -> Result<()> {
         match self.focus {
             Focus::Streams => {
@@ -133,11 +138,13 @@ impl TuiState {
                 self.message_idx = 0;
                 self.reload_topics(app)?;
                 self.reload_messages(app)?;
+                self.select_latest_message();
             }
             Focus::Topics => {
                 self.topic_idx = move_index(self.topic_idx, self.topics.len(), delta);
                 self.message_idx = 0;
                 self.reload_messages(app)?;
+                self.select_latest_message();
             }
             Focus::Thread => {
                 self.message_idx = move_index(self.message_idx, self.messages.len(), delta);
@@ -210,13 +217,18 @@ impl TuiState {
 }
 
 pub async fn run(app: App) -> Result<()> {
+    let theme = TuiTheme::resolve(app.settings())?;
     let mut terminal = setup_terminal()?;
-    let result = run_loop(&mut terminal, app).await;
+    let result = run_loop(&mut terminal, app, theme).await;
     restore_terminal(&mut terminal)?;
     result
 }
 
-async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: App) -> Result<()> {
+async fn run_loop(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    app: App,
+    theme: TuiTheme,
+) -> Result<()> {
     let mut state = TuiState::load(&app)?;
     let (poll_tx, poll_rx) = mpsc::channel();
     let mut next_poll_at = Instant::now() + POLL_INTERVAL;
@@ -231,7 +243,7 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: App) -
             next_poll_at = Instant::now() + POLL_INTERVAL;
         }
 
-        terminal.draw(|frame| draw(frame, &state, &app))?;
+        terminal.draw(|frame| draw(frame, &state, &app, &theme))?;
         if !event::poll(Duration::from_millis(150))? {
             continue;
         }
@@ -511,38 +523,35 @@ fn handle_scrollable_mode_key(key: KeyEvent, state: &mut TuiState) -> Result<boo
     Ok(false)
 }
 
-fn draw(frame: &mut Frame<'_>, state: &TuiState, app: &App) {
+fn draw(frame: &mut Frame<'_>, state: &TuiState, app: &App, theme: &TuiTheme) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(5), Constraint::Length(1)])
         .split(frame.area());
     let panes = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(24),
-            Constraint::Percentage(28),
-            Constraint::Percentage(48),
-        ])
+        .constraints(pane_constraints(state.focus))
         .split(outer[0]);
 
-    draw_streams(frame, panes[0], state);
-    draw_topics(frame, panes[1], state);
-    draw_thread(frame, panes[2], state);
-    draw_status(frame, outer[1], state, app);
+    draw_streams(frame, panes[0], state, theme);
+    draw_topics(frame, panes[1], state, theme);
+    draw_thread(frame, panes[2], state, theme);
+    draw_status(frame, outer[1], state, app, theme);
 
     match state.mode {
         Mode::SearchInput | Mode::Command | Mode::Composer | Mode::ConfirmSend | Mode::Auth => {
-            draw_overlay(frame, state, app);
+            draw_overlay(frame, state, app, theme);
         }
-        Mode::SearchResults => draw_search_results(frame, state),
-        Mode::Digest => draw_digest(frame, state),
+        Mode::SearchResults => draw_search_results(frame, state, theme),
+        Mode::Digest => draw_digest(frame, state, theme),
         Mode::Browser => {}
     }
 }
 
-fn draw_streams(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+fn draw_streams(frame: &mut Frame<'_>, area: Rect, state: &TuiState, theme: &TuiTheme) {
     let content_height = list_content_height(area);
     let start = visible_start(state.stream_idx, state.streams.len(), content_height);
+    let active = state.focus == Focus::Streams;
     let items = state
         .streams
         .iter()
@@ -557,19 +566,24 @@ fn draw_streams(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                 .unwrap_or(0);
             selected_item(
                 idx == state.stream_idx,
+                active,
+                theme,
                 &format!("{count:>4}  {}", stream.name),
             )
         })
         .collect::<Vec<_>>();
     frame.render_widget(
-        List::new(items).block(block("Streams", state.focus == Focus::Streams)),
+        List::new(items)
+            .style(Style::default().fg(theme.text).bg(theme.background))
+            .block(block("Streams", active, theme)),
         area,
     );
 }
 
-fn draw_topics(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+fn draw_topics(frame: &mut Frame<'_>, area: Rect, state: &TuiState, theme: &TuiTheme) {
     let content_height = list_content_height(area);
     let start = visible_start(state.topic_idx, state.topics.len(), content_height);
+    let active = state.focus == Focus::Topics;
     let items = state
         .topics
         .iter()
@@ -579,44 +593,41 @@ fn draw_topics(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         .map(|(idx, topic)| {
             selected_item(
                 idx == state.topic_idx,
+                active,
+                theme,
                 &format!("{}  {}", topic.message_count, topic.name),
             )
         })
         .collect::<Vec<_>>();
     frame.render_widget(
-        List::new(items).block(block("Topics", state.focus == Focus::Topics)),
+        List::new(items)
+            .style(Style::default().fg(theme.text).bg(theme.background))
+            .block(block("Topics", active, theme)),
         area,
     );
 }
 
-fn draw_thread(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+fn draw_thread(frame: &mut Frame<'_>, area: Rect, state: &TuiState, theme: &TuiTheme) {
     let content_height = list_content_height(area);
-    let start = visible_start(state.message_idx, state.messages.len(), content_height);
-    let items = state
-        .messages
-        .iter()
-        .enumerate()
+    let active = state.focus == Focus::Thread;
+    let width = area.width.saturating_sub(4).max(1) as usize;
+    let all_lines = thread_lines(&state.messages, state.message_idx, width, active, theme);
+    let selected_line = selected_message_line_start(&state.messages, state.message_idx, width);
+    let start = visible_line_start(selected_line, all_lines.len(), content_height);
+    let lines = all_lines
+        .into_iter()
         .skip(start)
         .take(content_height)
-        .map(|(idx, message)| {
-            selected_item(
-                idx == state.message_idx,
-                &format!(
-                    "[{}] {}: {}",
-                    message.id,
-                    message.sender_name,
-                    message.plain_text.replace('\n', " ")
-                ),
-            )
-        })
         .collect::<Vec<_>>();
     frame.render_widget(
-        List::new(items).block(block("Thread", state.focus == Focus::Thread)),
+        Paragraph::new(lines)
+            .style(Style::default().fg(theme.text).bg(theme.background))
+            .block(block("Thread", active, theme)),
         area,
     );
 }
 
-fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &TuiState, app: &App) {
+fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &TuiState, app: &App, theme: &TuiTheme) {
     let account = app
         .settings()
         .zulip
@@ -655,12 +666,12 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &TuiState, app: &App) {
         account, realm, sync, poll, offline, draft, state.status
     );
     frame.render_widget(
-        Paragraph::new(text).style(Style::default().fg(Color::Black).bg(Color::Gray)),
+        Paragraph::new(text).style(Style::default().fg(theme.status_fg).bg(theme.status_bg)),
         area,
     );
 }
 
-fn draw_overlay(frame: &mut Frame<'_>, state: &TuiState, app: &App) {
+fn draw_overlay(frame: &mut Frame<'_>, state: &TuiState, app: &App, theme: &TuiTheme) {
     let area = centered_rect(70, 55, frame.area());
     frame.render_widget(Clear, area);
     let text = match state.mode {
@@ -713,14 +724,15 @@ fn draw_overlay(frame: &mut Frame<'_>, state: &TuiState, app: &App) {
     };
     frame.render_widget(
         Paragraph::new(text)
-            .block(Block::default().title("zq").borders(Borders::ALL))
+            .style(Style::default().fg(theme.modal_text).bg(theme.background))
+            .block(block("zq", true, theme))
             .scroll((state.popup_scroll as u16, 0))
             .wrap(Wrap { trim: false }),
         area,
     );
 }
 
-fn draw_search_results(frame: &mut Frame<'_>, state: &TuiState) {
+fn draw_search_results(frame: &mut Frame<'_>, state: &TuiState, theme: &TuiTheme) {
     let area = centered_rect(86, 76, frame.area());
     frame.render_widget(Clear, area);
     let content_height = list_content_height(area);
@@ -733,27 +745,34 @@ fn draw_search_results(frame: &mut Frame<'_>, state: &TuiState) {
         .skip(start)
         .take(content_height)
         .map(|message| {
-            ListItem::new(format!(
-                "[{}] #{} > {} | {}: {}",
-                message.id,
-                message.stream_name,
-                message.topic,
-                message.sender_name,
-                message.plain_text
-            ))
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("[{}] ", message.id),
+                    Style::default().fg(theme.message_id),
+                ),
+                Span::styled(
+                    format!("#{} > {} | ", message.stream_name, message.topic),
+                    Style::default().fg(theme.inactive_title),
+                ),
+                Span::styled(
+                    format!("{}: ", message.sender_name),
+                    Style::default()
+                        .fg(theme.sender)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(message.plain_text.clone(), Style::default().fg(theme.text)),
+            ]))
         })
         .collect::<Vec<_>>();
     frame.render_widget(
-        List::new(items).block(
-            Block::default()
-                .title("Search results")
-                .borders(Borders::ALL),
-        ),
+        List::new(items)
+            .style(Style::default().fg(theme.text).bg(theme.background))
+            .block(block("Search results", true, theme)),
         area,
     );
 }
 
-fn draw_digest(frame: &mut Frame<'_>, state: &TuiState) {
+fn draw_digest(frame: &mut Frame<'_>, state: &TuiState, theme: &TuiTheme) {
     let area = centered_rect(86, 76, frame.area());
     frame.render_widget(Clear, area);
     let mut lines = Vec::new();
@@ -789,36 +808,307 @@ fn draw_digest(frame: &mut Frame<'_>, state: &TuiState) {
     }
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().title("Digest").borders(Borders::ALL))
+            .style(Style::default().fg(theme.modal_text).bg(theme.background))
+            .block(block("Digest", true, theme))
             .scroll((state.popup_scroll as u16, 0))
             .wrap(Wrap { trim: false }),
         area,
     );
 }
 
-fn selected_item(selected: bool, text: &str) -> ListItem<'static> {
+fn selected_item(selected: bool, active: bool, theme: &TuiTheme, text: &str) -> ListItem<'static> {
     if selected {
+        let (fg, bg) = if active {
+            (theme.active_selection_fg, theme.active_selection_bg)
+        } else {
+            (theme.inactive_selection_fg, theme.inactive_selection_bg)
+        };
         ListItem::new(Line::from(vec![Span::styled(
             text.to_string(),
-            Style::default().fg(Color::Black).bg(Color::Cyan),
+            Style::default().fg(fg).bg(bg),
         )]))
     } else {
-        ListItem::new(text.to_string())
+        ListItem::new(Line::from(Span::styled(
+            text.to_string(),
+            Style::default().fg(theme.text).bg(theme.background),
+        )))
     }
 }
 
-fn block(title: &str, focused: bool) -> Block<'_> {
+fn block<'a>(title: &'a str, focused: bool, theme: &TuiTheme) -> Block<'a> {
     let style = if focused {
         Style::default()
-            .fg(Color::Cyan)
+            .fg(theme.active_title)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default()
+        Style::default().fg(theme.inactive_title)
     };
     Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(style)
+        .border_style(Style::default().fg(theme.pane_border))
+        .title_style(style)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TuiTheme {
+    background: Color,
+    text: Color,
+    pane_border: Color,
+    active_title: Color,
+    inactive_title: Color,
+    active_selection_fg: Color,
+    active_selection_bg: Color,
+    inactive_selection_fg: Color,
+    inactive_selection_bg: Color,
+    message_id: Color,
+    sender: Color,
+    status_fg: Color,
+    status_bg: Color,
+    modal_text: Color,
+}
+
+impl TuiTheme {
+    fn resolve(settings: &Settings) -> Result<Self> {
+        let name = settings.ui.theme.trim();
+        let theme_name = if name.is_empty() { "zenburn" } else { name };
+        let mut theme = if theme_name.eq_ignore_ascii_case("zenburn") {
+            Self::zenburn()
+        } else if settings.themes.contains_key(theme_name) {
+            Self::zenburn()
+        } else {
+            anyhow::bail!("unknown TUI theme '{theme_name}'");
+        };
+
+        if let Some(config) = settings.themes.get(theme_name).or_else(|| {
+            if theme_name.eq_ignore_ascii_case("zenburn") {
+                settings.themes.get("zenburn")
+            } else {
+                None
+            }
+        }) {
+            theme.apply_config(config)?;
+        }
+
+        Ok(theme)
+    }
+
+    fn zenburn() -> Self {
+        Self {
+            background: rgb(0x3f, 0x3f, 0x3f),
+            text: rgb(0xdc, 0xdc, 0xcc),
+            pane_border: rgb(0x6f, 0x6f, 0x6f),
+            active_title: rgb(0xf0, 0xdf, 0xaf),
+            inactive_title: rgb(0x7f, 0x9f, 0x7f),
+            active_selection_fg: rgb(0x3f, 0x3f, 0x3f),
+            active_selection_bg: rgb(0xf0, 0xdf, 0xaf),
+            inactive_selection_fg: rgb(0xdc, 0xdc, 0xcc),
+            inactive_selection_bg: rgb(0x4f, 0x4f, 0x4f),
+            message_id: rgb(0x8c, 0xd0, 0xd3),
+            sender: rgb(0xbf, 0xeb, 0xbf),
+            status_fg: rgb(0x3f, 0x3f, 0x3f),
+            status_bg: rgb(0xd0, 0xbf, 0x8f),
+            modal_text: rgb(0xdc, 0xdc, 0xcc),
+        }
+    }
+
+    fn apply_config(&mut self, config: &ThemeConfig) -> Result<()> {
+        apply_color(&mut self.background, "background", &config.background)?;
+        apply_color(&mut self.text, "text", &config.text)?;
+        apply_color(&mut self.pane_border, "pane_border", &config.pane_border)?;
+        apply_color(&mut self.active_title, "active_title", &config.active_title)?;
+        apply_color(
+            &mut self.inactive_title,
+            "inactive_title",
+            &config.inactive_title,
+        )?;
+        apply_color(
+            &mut self.active_selection_fg,
+            "active_selection_fg",
+            &config.active_selection_fg,
+        )?;
+        apply_color(
+            &mut self.active_selection_bg,
+            "active_selection_bg",
+            &config.active_selection_bg,
+        )?;
+        apply_color(
+            &mut self.inactive_selection_fg,
+            "inactive_selection_fg",
+            &config.inactive_selection_fg,
+        )?;
+        apply_color(
+            &mut self.inactive_selection_bg,
+            "inactive_selection_bg",
+            &config.inactive_selection_bg,
+        )?;
+        apply_color(&mut self.message_id, "message_id", &config.message_id)?;
+        apply_color(&mut self.sender, "sender", &config.sender)?;
+        apply_color(&mut self.status_fg, "status_fg", &config.status_fg)?;
+        apply_color(&mut self.status_bg, "status_bg", &config.status_bg)?;
+        apply_color(&mut self.modal_text, "modal_text", &config.modal_text)?;
+        Ok(())
+    }
+}
+
+fn apply_color(target: &mut Color, field: &str, value: &Option<String>) -> Result<()> {
+    if let Some(value) = value {
+        *target = parse_hex_color(value).with_context(|| format!("invalid theme color {field}"))?;
+    }
+    Ok(())
+}
+
+fn parse_hex_color(value: &str) -> Result<Color> {
+    let value = value.trim().trim_start_matches('#');
+    if value.len() != 6 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        anyhow::bail!("expected #RRGGBB");
+    }
+    let red = u8::from_str_radix(&value[0..2], 16)?;
+    let green = u8::from_str_radix(&value[2..4], 16)?;
+    let blue = u8::from_str_radix(&value[4..6], 16)?;
+    Ok(rgb(red, green, blue))
+}
+
+const fn rgb(red: u8, green: u8, blue: u8) -> Color {
+    Color::Rgb(red, green, blue)
+}
+
+fn pane_constraints(focus: Focus) -> [Constraint; 3] {
+    let [streams, topics, thread] = pane_percentages(focus);
+    [
+        Constraint::Percentage(streams),
+        Constraint::Percentage(topics),
+        Constraint::Percentage(thread),
+    ]
+}
+
+fn pane_percentages(focus: Focus) -> [u16; 3] {
+    match focus {
+        Focus::Streams => [40, 30, 30],
+        Focus::Topics => [20, 45, 35],
+        Focus::Thread => [14, 18, 68],
+    }
+}
+
+fn thread_lines<'a>(
+    messages: &'a [ZulipMessage],
+    selected_idx: usize,
+    width: usize,
+    active: bool,
+    theme: &TuiTheme,
+) -> Vec<Line<'a>> {
+    let mut lines = Vec::new();
+    for (idx, message) in messages.iter().enumerate() {
+        let selected = idx == selected_idx;
+        let selection_style = selection_style(selected, active, theme);
+        let header_style = selection_style.unwrap_or_else(|| Style::default().bg(theme.background));
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("[{}]", message.id),
+                header_style.fg(theme.message_id),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                message.sender_name.clone(),
+                header_style.fg(theme.sender).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+
+        for wrapped in wrap_text(&message.plain_text, width) {
+            let style = selection_style
+                .unwrap_or_else(|| Style::default().fg(theme.text).bg(theme.background));
+            lines.push(Line::from(Span::styled(wrapped, style)));
+        }
+        lines.push(Line::from(Span::styled(
+            "",
+            selection_style.unwrap_or_else(|| Style::default().bg(theme.background)),
+        )));
+    }
+
+    lines
+}
+
+fn selection_style(selected: bool, active: bool, theme: &TuiTheme) -> Option<Style> {
+    if !selected {
+        return None;
+    }
+    let (fg, bg) = if active {
+        (theme.active_selection_fg, theme.active_selection_bg)
+    } else {
+        (theme.inactive_selection_fg, theme.inactive_selection_bg)
+    };
+    Some(Style::default().fg(fg).bg(bg))
+}
+
+fn selected_message_line_start(
+    messages: &[ZulipMessage],
+    selected_idx: usize,
+    width: usize,
+) -> usize {
+    messages
+        .iter()
+        .take(selected_idx)
+        .map(|message| message_line_height(message, width))
+        .sum()
+}
+
+fn message_line_height(message: &ZulipMessage, width: usize) -> usize {
+    1 + wrap_text(&message.plain_text, width).len() + 1
+}
+
+fn visible_line_start(selected_line: usize, total_lines: usize, height: usize) -> usize {
+    if total_lines <= height || height == 0 {
+        return 0;
+    }
+    let half = height / 2;
+    selected_line.saturating_sub(half).min(total_lines - height)
+}
+
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+
+    for source_line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let mut current = String::new();
+        for word in source_line.split_whitespace() {
+            if current.is_empty() {
+                push_wrapped_word(&mut lines, &mut current, word, width);
+            } else if current.len() + 1 + word.len() <= width {
+                current.push(' ');
+                current.push_str(word);
+            } else {
+                lines.push(current);
+                current = String::new();
+                push_wrapped_word(&mut lines, &mut current, word, width);
+            }
+        }
+        if !current.is_empty() {
+            lines.push(current);
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+
+    lines
+}
+
+fn push_wrapped_word(lines: &mut Vec<String>, current: &mut String, word: &str, width: usize) {
+    if word.len() <= width {
+        current.push_str(word);
+        return;
+    }
+
+    let mut chunk = String::new();
+    for ch in word.chars() {
+        if chunk.len() + ch.len_utf8() > width {
+            lines.push(chunk);
+            chunk = String::new();
+        }
+        chunk.push(ch);
+    }
+    *current = chunk;
 }
 
 fn move_index(current: usize, len: usize, delta: isize) -> usize {
@@ -904,6 +1194,82 @@ mod tests {
     }
 
     #[test]
+    fn default_theme_is_zenburn() {
+        let settings = test_settings(TempDir::new().unwrap().path());
+        let theme = TuiTheme::resolve(&settings).unwrap();
+
+        assert_eq!(theme.background, rgb(0x3f, 0x3f, 0x3f));
+        assert_eq!(theme.active_title, rgb(0xf0, 0xdf, 0xaf));
+    }
+
+    #[test]
+    fn custom_theme_overrides_builtin_fields() {
+        let mut settings = test_settings(TempDir::new().unwrap().path());
+        settings.ui.theme = "cozy".to_string();
+        settings.themes.insert(
+            "cozy".to_string(),
+            ThemeConfig {
+                background: Some("#101820".to_string()),
+                active_title: Some("f2aa4c".to_string()),
+                ..ThemeConfig::default()
+            },
+        );
+
+        let theme = TuiTheme::resolve(&settings).unwrap();
+
+        assert_eq!(theme.background, rgb(0x10, 0x18, 0x20));
+        assert_eq!(theme.active_title, rgb(0xf2, 0xaa, 0x4c));
+        assert_eq!(theme.text, TuiTheme::zenburn().text);
+    }
+
+    #[test]
+    fn invalid_theme_color_reports_field() {
+        let mut settings = test_settings(TempDir::new().unwrap().path());
+        settings.ui.theme = "bad".to_string();
+        settings.themes.insert(
+            "bad".to_string(),
+            ThemeConfig {
+                sender: Some("not-a-color".to_string()),
+                ..ThemeConfig::default()
+            },
+        );
+
+        let error = TuiTheme::resolve(&settings).unwrap_err().to_string();
+
+        assert!(error.contains("sender"));
+    }
+
+    #[test]
+    fn unknown_theme_name_errors() {
+        let mut settings = test_settings(TempDir::new().unwrap().path());
+        settings.ui.theme = "missing".to_string();
+
+        let error = TuiTheme::resolve(&settings).unwrap_err().to_string();
+
+        assert!(error.contains("unknown TUI theme"));
+    }
+
+    #[test]
+    fn focus_weighted_layout_ratios_are_stable() {
+        assert_eq!(pane_percentages(Focus::Streams), [40, 30, 30]);
+        assert_eq!(pane_percentages(Focus::Topics), [20, 45, 35]);
+        assert_eq!(pane_percentages(Focus::Thread), [14, 18, 68]);
+    }
+
+    #[test]
+    fn wrapped_thread_viewport_uses_message_heights() {
+        let messages = vec![
+            test_message_with_text(1, "short"),
+            test_message_with_text(2, "one two three four five six seven eight"),
+            test_message_with_text(3, "tail"),
+        ];
+
+        assert_eq!(selected_message_line_start(&messages, 0, 10), 0);
+        assert!(selected_message_line_start(&messages, 2, 10) > 6);
+        assert!(visible_line_start(selected_message_line_start(&messages, 2, 10), 12, 5) > 0);
+    }
+
+    #[test]
     fn refresh_follows_when_thread_was_at_end() {
         let fixture = TuiFixture::new(&[1, 2, 3]);
         let app = App::open(fixture.settings.clone(), false).unwrap();
@@ -914,6 +1280,15 @@ mod tests {
         state.refresh_from_cache(&app, true).unwrap();
 
         assert_eq!(state.messages[state.message_idx].id, 4);
+    }
+
+    #[test]
+    fn thread_opens_at_newest_message() {
+        let fixture = TuiFixture::new(&[1, 2, 3]);
+        let app = App::open(fixture.settings.clone(), false).unwrap();
+        let state = TuiState::load(&app).unwrap();
+
+        assert_eq!(state.messages[state.message_idx].id, 3);
     }
 
     #[test]
@@ -943,6 +1318,7 @@ mod tests {
                 ui: UiConfig::default(),
                 safety: SafetyConfig::default(),
                 digest: DigestConfig::default(),
+                themes: BTreeMap::new(),
                 paths: AppPaths {
                     config_file: dir.path().join("config.toml"),
                     cache_file: dir.path().join("cache.sqlite"),
@@ -977,6 +1353,10 @@ mod tests {
     }
 
     fn test_message(id: i64) -> ZulipMessage {
+        test_message_with_text(id, &format!("message {id}"))
+    }
+
+    fn test_message_with_text(id: i64, text: &str) -> ZulipMessage {
         ZulipMessage {
             id,
             stream_id: Some(1),
@@ -986,10 +1366,26 @@ mod tests {
             sender_name: "Ada".to_string(),
             sender_email: Some("ada@example.com".to_string()),
             timestamp: Utc::now(),
-            rendered_html: format!("<p>message {id}</p>"),
-            plain_text: format!("message {id}"),
+            rendered_html: format!("<p>{text}</p>"),
+            plain_text: text.to_string(),
             permalink: None,
             raw_json: json!({ "id": id }),
+        }
+    }
+
+    fn test_settings(path: &std::path::Path) -> Settings {
+        Settings {
+            zulip: ZulipConfig::default(),
+            cache: CacheConfig::default(),
+            ui: UiConfig::default(),
+            safety: SafetyConfig::default(),
+            digest: DigestConfig::default(),
+            themes: BTreeMap::new(),
+            paths: AppPaths {
+                config_file: path.join("config.toml"),
+                cache_file: path.join("cache.sqlite"),
+                secret_file: path.join("api_key"),
+            },
         }
     }
 }
