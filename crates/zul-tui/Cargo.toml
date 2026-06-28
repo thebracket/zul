@@ -17,11 +17,13 @@ path = "src/main.rs"
 anyhow.workspace = true
 chrono.workspace = true
 crossterm.workspace = true
+ego-tree = "0.10"
 image = { workspace = true, optional = true }
 dotenvy.workspace = true
 libzul.workspace = true
 ratatui.workspace = true
 ratatui-image = { workspace = true, optional = true }
+scraper.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
 

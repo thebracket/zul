@@ -5,6 +5,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use ego_tree::NodeRef;
 #[cfg(feature = "tui-images")]
 use image::ImageReader;
 use libzul::app::{App, PollResult};
@@ -23,6 +24,7 @@ use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
 #[cfg(feature = "tui-images")]
 use ratatui_image::{Resize, StatefulImage};
+use scraper::{ElementRef, Html, Node};
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "tui-images")]
 use std::io::Cursor;
@@ -911,7 +913,7 @@ fn selected_image_label_line_start(
         return None;
     }
     let preceding = selected_message_line_start(messages, selected_idx, width, app);
-    Some(preceding + 1 + wrap_text(&message.plain_text, width).len())
+    Some(preceding + 1 + message_body_line_count(message, width) + reaction_line_count(message))
 }
 
 fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &TuiState, app: &App, theme: &TuiTheme) {
@@ -1277,15 +1279,32 @@ fn pane_percentages(focus: Focus) -> [u16; 3] {
     }
 }
 
-fn thread_lines<'a>(
-    messages: &'a [ZulipMessage],
+#[derive(Clone)]
+struct StyledSegment {
+    text: String,
+    style: Style,
+}
+
+struct StyledWord {
+    text: String,
+    style: Style,
+    space_before: bool,
+}
+
+struct ReactionSummary {
+    display: String,
+    count: usize,
+}
+
+fn thread_lines(
+    messages: &[ZulipMessage],
     selected_idx: usize,
     width: usize,
     active: bool,
     theme: &TuiTheme,
     app: &App,
     image_slot_rows: u16,
-) -> Vec<Line<'a>> {
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for (idx, message) in messages.iter().enumerate() {
         let selected = idx == selected_idx;
@@ -1303,11 +1322,21 @@ fn thread_lines<'a>(
             ),
         ]));
 
-        for wrapped in wrap_text(&message.plain_text, width) {
-            let style = selection_style
-                .unwrap_or_else(|| Style::default().fg(theme.text).bg(theme.background));
-            lines.push(Line::from(Span::styled(wrapped, style)));
+        let body_style =
+            selection_style.unwrap_or_else(|| Style::default().fg(theme.text).bg(theme.background));
+        for line in message_body_lines(message, width, body_style) {
+            lines.push(line);
         }
+
+        let reaction_style = selection_style.unwrap_or_else(|| {
+            Style::default()
+                .fg(theme.inactive_title)
+                .bg(theme.background)
+        });
+        if let Some(line) = reaction_line(message, reaction_style) {
+            lines.push(line);
+        }
+
         if app.settings().ui.images != ImageMode::Off {
             let attachments = app.image_attachments(message);
             for (image_idx, attachment) in attachments.iter().enumerate() {
@@ -1338,6 +1367,382 @@ fn thread_lines<'a>(
     }
 
     lines
+}
+
+fn message_body_lines(message: &ZulipMessage, width: usize, style: Style) -> Vec<Line<'static>> {
+    let mut segments = html_segments(&message.rendered_html, style);
+    if segments
+        .iter()
+        .all(|segment| segment.text.trim().is_empty())
+    {
+        segments = vec![StyledSegment {
+            text: message.plain_text.clone(),
+            style,
+        }];
+    }
+    wrap_styled_segments(&segments, width, style)
+}
+
+fn message_body_line_count(message: &ZulipMessage, width: usize) -> usize {
+    message_body_lines(message, width, Style::default()).len()
+}
+
+fn html_segments(html: &str, style: Style) -> Vec<StyledSegment> {
+    let fragment = Html::parse_fragment(html);
+    let root = fragment.root_element();
+    let mut segments = Vec::new();
+    for child in root.children() {
+        collect_html_segments(child, style, &mut segments);
+    }
+    segments
+}
+
+fn collect_html_segments(node: NodeRef<'_, Node>, style: Style, segments: &mut Vec<StyledSegment>) {
+    match node.value() {
+        Node::Text(text) => push_segment(segments, text.to_string(), style),
+        Node::Element(_) => {
+            let Some(element) = ElementRef::wrap(node) else {
+                return;
+            };
+            let name = element.value().name();
+            if name == "br" {
+                push_segment(segments, " ".to_string(), style);
+                return;
+            }
+            if is_html_spacing_tag(name) {
+                push_segment(segments, " ".to_string(), style);
+            }
+            if let Some(emoji) = emoji_text(element) {
+                push_segment(segments, emoji, style);
+            } else {
+                let child_style = html_child_style(style, name);
+                for child in element.children() {
+                    collect_html_segments(child, child_style, segments);
+                }
+            }
+            if is_html_spacing_tag(name) {
+                push_segment(segments, " ".to_string(), style);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn push_segment(segments: &mut Vec<StyledSegment>, text: String, style: Style) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(previous) = segments.last_mut() {
+        if previous.style == style {
+            previous.text.push_str(&text);
+            return;
+        }
+    }
+    segments.push(StyledSegment { text, style });
+}
+
+fn html_child_style(style: Style, tag: &str) -> Style {
+    match tag {
+        "b" | "strong" => style.add_modifier(Modifier::BOLD),
+        "em" | "i" => style.add_modifier(Modifier::ITALIC),
+        "code" | "pre" => style.add_modifier(Modifier::DIM),
+        _ => style,
+    }
+}
+
+fn is_html_spacing_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "p" | "div" | "li" | "ul" | "ol" | "blockquote" | "pre" | "tr" | "td" | "th"
+    )
+}
+
+fn emoji_text(element: ElementRef<'_>) -> Option<String> {
+    if !is_emoji_element(element) {
+        return None;
+    }
+    if let Some(emoji) = element.attr("class").and_then(emoji_from_class) {
+        return Some(emoji);
+    }
+    let text = element.text().collect::<String>().trim().to_string();
+    if let Some(emoji) = emoji_from_shortcode(&text) {
+        return Some(emoji);
+    }
+    if !text.is_empty() && !looks_like_shortcode(&text) {
+        return Some(text);
+    }
+    for attr in ["alt", "title", "aria-label", "data-emoji-name"] {
+        if let Some(value) = element
+            .attr(attr)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if let Some(emoji) = emoji_from_shortcode(value) {
+                return Some(emoji);
+            }
+            return Some(format_shortcode(value));
+        }
+    }
+    (!text.is_empty()).then_some(text)
+}
+
+fn is_emoji_element(element: ElementRef<'_>) -> bool {
+    element
+        .attr("class")
+        .is_some_and(|classes| classes.split_whitespace().any(is_emoji_class))
+        || element.attr("data-emoji-name").is_some()
+        || (element.value().name() == "img"
+            && element
+                .attr("alt")
+                .is_some_and(|alt| looks_like_shortcode(alt.trim())))
+}
+
+fn is_emoji_class(class: &str) -> bool {
+    class == "emoji" || class.starts_with("emoji-")
+}
+
+fn emoji_from_class(classes: &str) -> Option<String> {
+    classes
+        .split_whitespace()
+        .filter_map(|class| class.strip_prefix("emoji-"))
+        .find_map(emoji_from_code)
+}
+
+fn emoji_from_code(code: &str) -> Option<String> {
+    let mut emoji = String::new();
+    for part in code.split('-') {
+        let value = u32::from_str_radix(part, 16).ok()?;
+        emoji.push(char::from_u32(value)?);
+    }
+    (!emoji.is_empty()).then_some(emoji)
+}
+
+fn emoji_from_shortcode(value: &str) -> Option<String> {
+    let normalized = value
+        .trim()
+        .trim_matches(':')
+        .trim_end_matches(" emoji")
+        .replace(' ', "_")
+        .to_ascii_lowercase();
+    match normalized.as_str() {
+        "sunglasses" => Some("😎".to_string()),
+        "+1" | "thumbs_up" | "thumbsup" => Some("👍".to_string()),
+        "heart" => Some("❤️".to_string()),
+        "smile" | "smiley" => Some("😄".to_string()),
+        _ => None,
+    }
+}
+
+fn looks_like_shortcode(value: &str) -> bool {
+    value.len() > 2 && value.starts_with(':') && value.ends_with(':')
+}
+
+fn format_shortcode(value: &str) -> String {
+    let name = value
+        .trim()
+        .trim_matches(':')
+        .trim_end_matches(" emoji")
+        .trim()
+        .replace(' ', "_");
+    format!(":{name}:")
+}
+
+fn wrap_styled_segments(
+    segments: &[StyledSegment],
+    width: usize,
+    empty_style: Style,
+) -> Vec<Line<'static>> {
+    let words = styled_words(segments);
+    if words.is_empty() {
+        return vec![Line::from(Span::styled(String::new(), empty_style))];
+    }
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut spans = Vec::new();
+    let mut line_width = 0;
+
+    for word in words {
+        push_styled_word(
+            word,
+            width,
+            &mut lines,
+            &mut spans,
+            &mut line_width,
+            empty_style,
+        );
+    }
+
+    if !spans.is_empty() {
+        lines.push(Line::from(spans));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(String::new(), empty_style)));
+    }
+    lines
+}
+
+fn styled_words(segments: &[StyledSegment]) -> Vec<StyledWord> {
+    let mut words = Vec::new();
+    let mut pending_space = false;
+    for segment in segments {
+        let mut current = String::new();
+        let mut current_space_before = false;
+        for ch in segment.text.chars() {
+            if ch.is_whitespace() {
+                if !current.is_empty() {
+                    words.push(StyledWord {
+                        text: std::mem::take(&mut current),
+                        style: segment.style,
+                        space_before: current_space_before,
+                    });
+                }
+                pending_space = true;
+                current_space_before = false;
+            } else {
+                if current.is_empty() {
+                    current_space_before = pending_space && !words.is_empty();
+                    pending_space = false;
+                }
+                current.push(ch);
+            }
+        }
+        if !current.is_empty() {
+            words.push(StyledWord {
+                text: current,
+                style: segment.style,
+                space_before: current_space_before,
+            });
+        }
+    }
+    words
+}
+
+fn push_styled_word(
+    word: StyledWord,
+    width: usize,
+    lines: &mut Vec<Line<'static>>,
+    spans: &mut Vec<Span<'static>>,
+    line_width: &mut usize,
+    empty_style: Style,
+) {
+    let word_width = display_width(&word.text);
+    let space_width = usize::from(*line_width > 0 && word.space_before);
+    if *line_width > 0 && *line_width + space_width + word_width > width {
+        lines.push(Line::from(std::mem::take(spans)));
+        *line_width = 0;
+    }
+    if *line_width > 0 && word.space_before {
+        spans.push(Span::styled(" ".to_string(), word.style));
+        *line_width += 1;
+    }
+    if word_width <= width {
+        spans.push(Span::styled(word.text, word.style));
+        *line_width += word_width;
+    } else {
+        push_long_styled_word(word.text, word.style, width, lines, spans, line_width);
+    }
+    if spans.is_empty() && *line_width == 0 {
+        spans.push(Span::styled(String::new(), empty_style));
+    }
+}
+
+fn push_long_styled_word(
+    word: String,
+    style: Style,
+    width: usize,
+    lines: &mut Vec<Line<'static>>,
+    spans: &mut Vec<Span<'static>>,
+    line_width: &mut usize,
+) {
+    let mut chunk = String::new();
+    let mut chunk_width = 0;
+    for ch in word.chars() {
+        if chunk_width == width {
+            spans.push(Span::styled(std::mem::take(&mut chunk), style));
+            lines.push(Line::from(std::mem::take(spans)));
+            *line_width = 0;
+            chunk_width = 0;
+        }
+        chunk.push(ch);
+        chunk_width += 1;
+    }
+    if !chunk.is_empty() {
+        spans.push(Span::styled(chunk, style));
+        *line_width += chunk_width;
+    }
+}
+
+fn display_width(value: &str) -> usize {
+    value.chars().count()
+}
+
+fn reaction_line(message: &ZulipMessage, style: Style) -> Option<Line<'static>> {
+    let summaries = reaction_summaries(message);
+    if summaries.is_empty() {
+        return None;
+    }
+    let mut spans = Vec::new();
+    for (idx, summary) in summaries.iter().enumerate() {
+        if idx > 0 {
+            spans.push(Span::styled("  ".to_string(), style));
+        }
+        spans.push(Span::styled(
+            format!("{} {}", summary.display, summary.count),
+            style,
+        ));
+    }
+    Some(Line::from(spans))
+}
+
+fn reaction_line_count(message: &ZulipMessage) -> usize {
+    usize::from(!reaction_summaries(message).is_empty())
+}
+
+fn reaction_summaries(message: &ZulipMessage) -> Vec<ReactionSummary> {
+    let Some(reactions) = message
+        .raw_json
+        .get("reactions")
+        .and_then(|value| value.as_array())
+    else {
+        return Vec::new();
+    };
+    let mut summaries: Vec<(String, ReactionSummary)> = Vec::new();
+    for reaction in reactions {
+        let emoji_name = reaction
+            .get("emoji_name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("emoji");
+        let emoji_code = reaction
+            .get("emoji_code")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let reaction_type = reaction
+            .get("reaction_type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let key = format!("{reaction_type}:{emoji_code}:{emoji_name}");
+        if let Some((_, summary)) = summaries.iter_mut().find(|(existing, _)| existing == &key) {
+            summary.count += 1;
+            continue;
+        }
+        summaries.push((
+            key,
+            ReactionSummary {
+                display: reaction_display(reaction_type, emoji_code, emoji_name),
+                count: 1,
+            },
+        ));
+    }
+    summaries.into_iter().map(|(_, summary)| summary).collect()
+}
+
+fn reaction_display(reaction_type: &str, emoji_code: &str, emoji_name: &str) -> String {
+    if reaction_type == "unicode_emoji" {
+        if let Some(emoji) = emoji_from_code(emoji_code) {
+            return emoji;
+        }
+    }
+    emoji_from_shortcode(emoji_name).unwrap_or_else(|| format_shortcode(emoji_name))
 }
 
 fn selection_style(selected: bool, active: bool, theme: &TuiTheme) -> Option<Style> {
@@ -1376,7 +1781,7 @@ fn message_line_height(
     } else {
         app.image_attachments(message).len() + image_slot_rows as usize
     };
-    1 + wrap_text(&message.plain_text, width).len() + attachment_rows + 1
+    1 + message_body_line_count(message, width) + reaction_line_count(message) + attachment_rows + 1
 }
 
 fn visible_line_start(selected_line: usize, total_lines: usize, height: usize) -> usize {
@@ -1385,53 +1790,6 @@ fn visible_line_start(selected_line: usize, total_lines: usize, height: usize) -
     }
     let half = height / 2;
     selected_line.saturating_sub(half).min(total_lines - height)
-}
-
-fn wrap_text(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut lines = Vec::new();
-
-    for source_line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        let mut current = String::new();
-        for word in source_line.split_whitespace() {
-            if current.is_empty() {
-                push_wrapped_word(&mut lines, &mut current, word, width);
-            } else if current.len() + 1 + word.len() <= width {
-                current.push(' ');
-                current.push_str(word);
-            } else {
-                lines.push(current);
-                current = String::new();
-                push_wrapped_word(&mut lines, &mut current, word, width);
-            }
-        }
-        if !current.is_empty() {
-            lines.push(current);
-        }
-    }
-
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-
-    lines
-}
-
-fn push_wrapped_word(lines: &mut Vec<String>, current: &mut String, word: &str, width: usize) {
-    if word.len() <= width {
-        current.push_str(word);
-        return;
-    }
-
-    let mut chunk = String::new();
-    for ch in word.chars() {
-        if chunk.len() + ch.len_utf8() > width {
-            lines.push(chunk);
-            chunk = String::new();
-        }
-        chunk.push(ch);
-    }
-    *current = chunk;
 }
 
 fn move_index(current: usize, len: usize, delta: isize) -> usize {
@@ -1627,6 +1985,78 @@ mod tests {
         state.refresh_from_cache(&app, false).unwrap();
 
         assert_eq!(state.messages[state.message_idx].id, 1);
+    }
+
+    #[test]
+    fn thread_lines_render_html_emoji_and_bold_spans() {
+        let settings = test_settings(TempDir::new().unwrap().path());
+        let app = App::open(settings, false).unwrap();
+        let messages = vec![test_message_with_html(
+            1,
+            r#"<p>Awesome <span class="emoji emoji-1f60e" title="sunglasses">:sunglasses:</span> <strong>bold</strong></p>"#,
+            "ignored",
+        )];
+        let theme = TuiTheme::zenburn();
+
+        let lines = thread_lines(&messages, 0, 80, true, &theme, &app, 0);
+        let body = &lines[1];
+
+        assert_eq!(line_text(body), "Awesome 😎 bold");
+        assert!(body.spans.iter().any(|span| {
+            span.content.as_ref() == "bold" && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+    }
+
+    #[test]
+    fn styled_html_wrapping_preserves_span_styles() {
+        let message =
+            test_message_with_html(1, r#"<p>one two <strong>three</strong></p>"#, "ignored");
+
+        let lines = message_body_lines(&message, 8, Style::default());
+
+        assert_eq!(
+            lines.iter().map(line_text).collect::<Vec<_>>(),
+            ["one two", "three"]
+        );
+        assert!(lines[1].spans.iter().any(|span| {
+            span.content.as_ref() == "three" && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+    }
+
+    #[test]
+    fn thread_lines_show_aggregated_reactions_under_message() {
+        let settings = test_settings(TempDir::new().unwrap().path());
+        let app = App::open(settings, false).unwrap();
+        let mut message = test_message_with_text(1, "hello");
+        message.raw_json = json!({
+            "id": 1,
+            "reactions": [
+                {"emoji_name": "thumbs_up", "emoji_code": "1f44d", "reaction_type": "unicode_emoji"},
+                {"emoji_name": "thumbs_up", "emoji_code": "1f44d", "reaction_type": "unicode_emoji"},
+                {"emoji_name": "sunglasses", "emoji_code": "1f60e", "reaction_type": "unicode_emoji"}
+            ]
+        });
+        let theme = TuiTheme::zenburn();
+
+        let lines = thread_lines(&[message], 0, 80, true, &theme, &app, 0);
+        let text = lines.iter().map(line_text).collect::<Vec<_>>();
+
+        assert!(text.iter().any(|line| line == "👍 2  😎 1"));
+    }
+
+    #[test]
+    fn reaction_summary_falls_back_to_shortcode_for_custom_emoji() {
+        let mut message = test_message_with_text(1, "hello");
+        message.raw_json = json!({
+            "id": 1,
+            "reactions": [
+                {"emoji_name": "party parrot", "emoji_code": "123", "reaction_type": "realm_emoji"}
+            ]
+        });
+
+        let line = reaction_line(&message, Style::default()).unwrap();
+
+        assert_eq!(line_text(&line), ":party_parrot: 1");
     }
 
     #[test]
