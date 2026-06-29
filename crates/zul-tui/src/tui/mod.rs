@@ -102,6 +102,36 @@ struct ThreadImageEntry {
     error: Option<String>,
 }
 
+/// Raw Zulip credentials found in the process environment after dotenv loading.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StartupCredentials {
+    /// Zulip realm base URL from `ZULIP_BASE_URL` or `ZULIP_SITE`.
+    pub base_url: String,
+    /// Zulip email from `ZULIP_EMAIL`.
+    pub email: String,
+    /// Zulip API key from `ZULIP_API_KEY`.
+    pub api_key: String,
+}
+
+impl StartupCredentials {
+    /// Read startup credentials directly from the environment without defaults.
+    pub fn from_env() -> Self {
+        Self {
+            base_url: std::env::var("ZULIP_BASE_URL")
+                .or_else(|_| std::env::var("ZULIP_SITE"))
+                .unwrap_or_default(),
+            email: std::env::var("ZULIP_EMAIL").unwrap_or_default(),
+            api_key: std::env::var("ZULIP_API_KEY").unwrap_or_default(),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        !self.base_url.trim().is_empty()
+            && !self.email.trim().is_empty()
+            && !self.api_key.trim().is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfigPurpose {
     Login,
@@ -140,20 +170,28 @@ struct ConfigForm {
 
 impl ConfigForm {
     fn login(settings: &Settings) -> Self {
+        Self::login_with_values(
+            settings.zulip.base_url.clone().unwrap_or_default(),
+            settings.zulip.email.clone().unwrap_or_default(),
+            String::new(),
+        )
+    }
+
+    fn login_from_startup(credentials: &StartupCredentials) -> Self {
+        Self::login_with_values(
+            credentials.base_url.clone(),
+            credentials.email.clone(),
+            credentials.api_key.clone(),
+        )
+    }
+
+    fn login_with_values(base_url: String, email: String, api_key: String) -> Self {
         Self {
             purpose: ConfigPurpose::Login,
             fields: vec![
-                FormField::new(
-                    ConfigField::BaseUrl,
-                    "Base URL",
-                    settings.zulip.base_url.clone().unwrap_or_default(),
-                ),
-                FormField::new(
-                    ConfigField::Email,
-                    "Email",
-                    settings.zulip.email.clone().unwrap_or_default(),
-                ),
-                FormField::secret(ConfigField::ApiKey, "API key", String::new()),
+                FormField::new(ConfigField::BaseUrl, "Base URL", base_url),
+                FormField::new(ConfigField::Email, "Email", email),
+                FormField::secret(ConfigField::ApiKey, "API key", api_key),
             ],
             selected: 0,
             message: "Enter Zulip credentials, then press Ctrl-S to save.".to_string(),
@@ -279,6 +317,14 @@ impl FormField {
 
 impl TuiState {
     fn load(app: &App) -> Result<Self> {
+        Self::load_inner(app, None)
+    }
+
+    fn load_for_startup(app: &App, credentials: &StartupCredentials) -> Result<Self> {
+        Self::load_inner(app, Some(credentials))
+    }
+
+    fn load_inner(app: &App, startup_credentials: Option<&StartupCredentials>) -> Result<Self> {
         let mut state = Self {
             streams: app.streams()?,
             topics: Vec::new(),
@@ -309,7 +355,13 @@ impl TuiState {
         state.reload_topics(app)?;
         state.reload_messages(app)?;
         state.select_latest_message();
-        if !app.settings().auth_problems().is_empty() {
+        if let Some(credentials) =
+            startup_credentials.filter(|credentials| !credentials.is_complete())
+        {
+            state.form = Some(ConfigForm::login_from_startup(credentials));
+            state.mode = Mode::Login;
+            state.status = "credentials required".to_string();
+        } else if !app.settings().auth_problems().is_empty() {
             state.form = Some(ConfigForm::login(app.settings()));
             state.mode = Mode::Login;
             state.status = "credentials required".to_string();
@@ -438,10 +490,18 @@ impl TuiState {
 }
 
 pub async fn run(app: App) -> Result<()> {
+    run_with_startup_credentials(app, StartupCredentials::from_env()).await
+}
+
+/// Run the TUI using an already captured startup credential snapshot.
+pub async fn run_with_startup_credentials(
+    app: App,
+    startup_credentials: StartupCredentials,
+) -> Result<()> {
     let theme = TuiTheme::resolve(app.settings())?;
     let mut terminal = setup_terminal()?;
     let image_picker = detect_image_picker(app.settings());
-    let result = run_loop(&mut terminal, app, theme, image_picker).await;
+    let result = run_loop(&mut terminal, app, theme, image_picker, startup_credentials).await;
     restore_terminal(&mut terminal)?;
     result
 }
@@ -451,8 +511,9 @@ async fn run_loop(
     mut app: App,
     mut theme: TuiTheme,
     mut image_picker: Option<ImagePicker>,
+    startup_credentials: StartupCredentials,
 ) -> Result<()> {
-    let mut state = TuiState::load(&app)?;
+    let mut state = TuiState::load_for_startup(&app, &startup_credentials)?;
     let (poll_tx, poll_rx) = mpsc::channel();
     let (image_tx, image_rx) = mpsc::channel();
     let mut next_poll_at = Instant::now() + POLL_INTERVAL;
@@ -461,18 +522,24 @@ async fn run_loop(
     loop {
         drain_poll_events(&poll_rx, &mut poll_inflight, &mut state, &app)?;
         drain_image_events(&image_rx, &mut state, image_picker.as_ref());
-        if !app.offline() && !poll_inflight && Instant::now() >= next_poll_at {
+        if state.mode != Mode::Login
+            && !app.offline()
+            && !poll_inflight
+            && Instant::now() >= next_poll_at
+        {
             state.status = "polling Zulip...".to_string();
             spawn_poll(app.settings().clone(), app.offline(), poll_tx.clone());
             poll_inflight = true;
             next_poll_at = Instant::now() + POLL_INTERVAL;
         }
-        maybe_spawn_selected_image_fetch(
-            &mut state,
-            &app,
-            image_tx.clone(),
-            image_picker.as_ref().is_some(),
-        );
+        if state.mode != Mode::Login {
+            maybe_spawn_selected_image_fetch(
+                &mut state,
+                &app,
+                image_tx.clone(),
+                image_picker.as_ref().is_some(),
+            );
+        }
 
         terminal.draw(|frame| draw(frame, &mut state, &app, &theme, image_picker.as_ref()))?;
         if !event::poll(Duration::from_millis(150))? {
@@ -841,7 +908,6 @@ async fn handle_config_key(
     theme: &mut TuiTheme,
     image_picker: &mut Option<ImagePicker>,
 ) -> Result<bool> {
-    let missing_auth = !app.settings().auth_problems().is_empty();
     let Some(form) = state.form.as_mut() else {
         state.form = Some(if state.mode == Mode::Login {
             ConfigForm::login(app.settings())
@@ -852,7 +918,7 @@ async fn handle_config_key(
     };
     match key.code {
         KeyCode::Esc => {
-            if form.purpose == ConfigPurpose::Login && missing_auth {
+            if form.purpose == ConfigPurpose::Login {
                 form.message = "Credentials are required before opening the browser.".to_string();
             } else {
                 state.mode = Mode::Browser;
@@ -2625,6 +2691,50 @@ mod tests {
 
         assert_eq!(state.mode, Mode::Login);
         assert_eq!(state.form.as_ref().unwrap().purpose, ConfigPurpose::Login);
+    }
+
+    #[test]
+    fn incomplete_startup_env_forces_login_even_when_settings_have_auth() {
+        let mut fixture = TuiFixture::new(&[]);
+        fixture.settings.zulip = ZulipConfig {
+            base_url: Some("https://stale.example".to_string()),
+            email: Some("dotenv@example.com".to_string()),
+            api_key: Some("stale-secret".to_string()),
+        };
+        let app = App::open(fixture.settings.clone(), false).unwrap();
+        let startup = StartupCredentials {
+            base_url: String::new(),
+            email: String::new(),
+            api_key: String::new(),
+        };
+
+        let state = TuiState::load_for_startup(&app, &startup).unwrap();
+        let form = state.form.as_ref().unwrap();
+
+        assert_eq!(state.mode, Mode::Login);
+        assert_eq!(form.value(ConfigField::BaseUrl), "");
+        assert_eq!(form.value(ConfigField::Email), "");
+        assert_eq!(form.value(ConfigField::ApiKey), "");
+    }
+
+    #[test]
+    fn complete_startup_env_does_not_force_login() {
+        let mut fixture = TuiFixture::new(&[]);
+        fixture.settings.zulip = ZulipConfig {
+            base_url: Some("https://zulip.example".to_string()),
+            email: Some("ada@example.com".to_string()),
+            api_key: Some("secret".to_string()),
+        };
+        let app = App::open(fixture.settings.clone(), false).unwrap();
+        let startup = StartupCredentials {
+            base_url: "https://zulip.example".to_string(),
+            email: "ada@example.com".to_string(),
+            api_key: "secret".to_string(),
+        };
+
+        let state = TuiState::load_for_startup(&app, &startup).unwrap();
+
+        assert_eq!(state.mode, Mode::Browser);
     }
 
     #[test]

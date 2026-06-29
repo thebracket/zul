@@ -2,4 +2,4 @@
 
 mod tui;
 
-pub use tui::run;
+pub use tui::{run, run_with_startup_credentials, StartupCredentials};
