@@ -1026,6 +1026,49 @@ fn draw_overlay(frame: &mut Frame<'_>, state: &TuiState, app: &App, theme: &TuiT
             .wrap(Wrap { trim: false }),
         area,
     );
+    if let Some((x, y)) = overlay_cursor_position(state, area) {
+        frame.set_cursor_position((x, y));
+    }
+}
+
+fn overlay_cursor_position(state: &TuiState, area: Rect) -> Option<(u16, u16)> {
+    match state.mode {
+        Mode::SearchInput | Mode::Command => {
+            input_cursor_position(area, 2, state.input.lines().next().unwrap_or(""))
+        }
+        Mode::Composer => draft_cursor_position(area, &state.draft),
+        _ => None,
+    }
+}
+
+fn draft_cursor_position(area: Rect, draft: &str) -> Option<(u16, u16)> {
+    let last_line = draft.split('\n').next_back().unwrap_or("");
+    let line_index = draft.split('\n').count().saturating_sub(1);
+    input_cursor_position(area, 5 + line_index, last_line)
+}
+
+fn input_cursor_position(area: Rect, line_index: usize, text: &str) -> Option<(u16, u16)> {
+    let inner = overlay_inner_area(area)?;
+    let x_offset = display_width(text).min(inner.width.saturating_sub(1) as usize) as u16;
+    let y_offset = (line_index as u16).min(inner.height.saturating_sub(1));
+    Some((
+        inner.x.saturating_add(x_offset),
+        inner.y.saturating_add(y_offset),
+    ))
+}
+
+fn overlay_inner_area(area: Rect) -> Option<Rect> {
+    let width = area.width.checked_sub(2)?;
+    let height = area.height.checked_sub(2)?;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some(Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width,
+        height,
+    })
 }
 
 fn draw_search_results(frame: &mut Frame<'_>, state: &TuiState, theme: &TuiTheme) {
@@ -2077,6 +2120,44 @@ mod tests {
         assert!(lines[1].spans.iter().any(|span| {
             span.content.as_ref() == "three" && span.style.add_modifier.contains(Modifier::BOLD)
         }));
+    }
+
+    #[test]
+    fn empty_input_cursor_starts_on_input_line() {
+        let area = Rect::new(10, 20, 30, 10);
+
+        assert_eq!(input_cursor_position(area, 2, ""), Some((11, 23)));
+    }
+
+    #[test]
+    fn command_cursor_follows_text_width() {
+        let area = Rect::new(10, 20, 30, 10);
+
+        assert_eq!(input_cursor_position(area, 2, "abc"), Some((14, 23)));
+    }
+
+    #[test]
+    fn input_cursor_counts_wide_emoji_cells() {
+        let area = Rect::new(10, 20, 30, 10);
+
+        assert_eq!(input_cursor_position(area, 2, "a😎"), Some((14, 23)));
+    }
+
+    #[test]
+    fn input_cursor_clamps_to_overlay_width() {
+        let area = Rect::new(10, 20, 10, 10);
+
+        assert_eq!(
+            input_cursor_position(area, 2, "way too long for the modal"),
+            Some((18, 23))
+        );
+    }
+
+    #[test]
+    fn draft_cursor_follows_last_draft_line() {
+        let area = Rect::new(10, 20, 30, 10);
+
+        assert_eq!(draft_cursor_position(area, "one\ntwo"), Some((14, 27)));
     }
 
     #[test]
