@@ -16,26 +16,5 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn load_dotenv() {
-    if let Some(path) = explicit_dotenv_path(std::env::var("ZUL_DOTENV").ok()) {
-        let _ = dotenvy::from_path(path);
-    }
-}
-
-fn explicit_dotenv_path(value: Option<String>) -> Option<String> {
-    value.filter(|path| !path.trim().is_empty())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn dotenv_is_only_loaded_when_explicitly_configured() {
-        assert_eq!(explicit_dotenv_path(None), None);
-        assert_eq!(explicit_dotenv_path(Some("  ".to_string())), None);
-        assert_eq!(
-            explicit_dotenv_path(Some("/tmp/zul.env".to_string())),
-            Some("/tmp/zul.env".to_string())
-        );
-    }
+    let _ = dotenvy::dotenv();
 }
