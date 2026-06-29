@@ -9,8 +9,12 @@ use ego_tree::NodeRef;
 #[cfg(feature = "tui-images")]
 use image::ImageReader;
 use libzul::app::{App, PollResult};
-use libzul::config::{ImageMode, Settings, ThemeConfig};
+use libzul::config::{
+    CacheConfig, DigestConfig, ImageMode, SafetyConfig, Settings, ThemeConfig, UiConfig,
+    ZulipConfig,
+};
 use libzul::digest::{self, Digest};
+use libzul::zulip::client::ZulipClient;
 use libzul::zulip::models::{ImageAttachment, ImageBytes, ZulipMessage, ZulipStream, ZulipTopic};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -29,6 +33,7 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(feature = "tui-images")]
 use std::io::Cursor;
 use std::io::{self, Stdout};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
@@ -61,6 +66,9 @@ enum Mode {
     ConfirmSend,
     Command,
     Auth,
+    Login,
+    Config,
+    Help,
 }
 
 struct TuiState {
@@ -78,6 +86,7 @@ struct TuiState {
     mode: Mode,
     input: String,
     draft: String,
+    form: Option<ConfigForm>,
     status: String,
     last_poll_at: Option<DateTime<Utc>>,
     last_poll_new: usize,
@@ -91,6 +100,181 @@ struct ThreadImageEntry {
     protocol: Option<StatefulProtocol>,
     #[cfg(feature = "tui-images")]
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigPurpose {
+    Login,
+    Config,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigField {
+    BaseUrl,
+    Email,
+    ApiKey,
+    CacheTtlMinutes,
+    SyncHours,
+    CachePath,
+    StartView,
+    Theme,
+    Images,
+    ReadOnlyByDefault,
+    ConfirmSends,
+    DigestAliases,
+}
+
+struct FormField {
+    key: ConfigField,
+    label: &'static str,
+    value: String,
+    secret: bool,
+}
+
+struct ConfigForm {
+    purpose: ConfigPurpose,
+    fields: Vec<FormField>,
+    selected: usize,
+    message: String,
+}
+
+impl ConfigForm {
+    fn login(settings: &Settings) -> Self {
+        Self {
+            purpose: ConfigPurpose::Login,
+            fields: vec![
+                FormField::new(
+                    ConfigField::BaseUrl,
+                    "Base URL",
+                    settings.zulip.base_url.clone().unwrap_or_default(),
+                ),
+                FormField::new(
+                    ConfigField::Email,
+                    "Email",
+                    settings.zulip.email.clone().unwrap_or_default(),
+                ),
+                FormField::secret(ConfigField::ApiKey, "API key", String::new()),
+            ],
+            selected: 0,
+            message: "Enter Zulip credentials, then press Ctrl-S to save.".to_string(),
+        }
+    }
+
+    fn config(settings: &Settings) -> Self {
+        Self {
+            purpose: ConfigPurpose::Config,
+            fields: vec![
+                FormField::new(
+                    ConfigField::BaseUrl,
+                    "Base URL",
+                    settings.zulip.base_url.clone().unwrap_or_default(),
+                ),
+                FormField::new(
+                    ConfigField::Email,
+                    "Email",
+                    settings.zulip.email.clone().unwrap_or_default(),
+                ),
+                FormField::secret(ConfigField::ApiKey, "API key", String::new()),
+                FormField::new(
+                    ConfigField::CacheTtlMinutes,
+                    "Cache TTL minutes",
+                    settings.cache.ttl_minutes.to_string(),
+                ),
+                FormField::new(
+                    ConfigField::SyncHours,
+                    "Sync hours",
+                    settings.cache.default_sync_hours.to_string(),
+                ),
+                FormField::new(
+                    ConfigField::CachePath,
+                    "Cache path",
+                    settings
+                        .cache
+                        .path
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default(),
+                ),
+                FormField::new(
+                    ConfigField::StartView,
+                    "Start view",
+                    settings.ui.start_view.clone(),
+                ),
+                FormField::new(ConfigField::Theme, "Theme", settings.ui.theme.clone()),
+                FormField::new(
+                    ConfigField::Images,
+                    "Images",
+                    image_mode_value(settings.ui.images).to_string(),
+                ),
+                FormField::new(
+                    ConfigField::ReadOnlyByDefault,
+                    "Read only by default",
+                    settings.safety.read_only_by_default.to_string(),
+                ),
+                FormField::new(
+                    ConfigField::ConfirmSends,
+                    "Confirm sends",
+                    settings.safety.require_confirmation_for_sends.to_string(),
+                ),
+                FormField::new(
+                    ConfigField::DigestAliases,
+                    "Digest aliases",
+                    settings.digest.aliases.join(", "),
+                ),
+            ],
+            selected: 0,
+            message: "Edit values, then press Ctrl-S to save. Blank API key keeps the current key."
+                .to_string(),
+        }
+    }
+
+    fn selected_field_mut(&mut self) -> Option<&mut FormField> {
+        self.fields.get_mut(self.selected)
+    }
+
+    fn selected_field(&self) -> Option<&FormField> {
+        self.fields.get(self.selected)
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        self.selected = move_index(self.selected, self.fields.len(), delta);
+    }
+
+    fn value(&self, key: ConfigField) -> &str {
+        self.fields
+            .iter()
+            .find(|field| field.key == key)
+            .map(|field| field.value.as_str())
+            .unwrap_or("")
+    }
+}
+
+impl FormField {
+    fn new(key: ConfigField, label: &'static str, value: String) -> Self {
+        Self {
+            key,
+            label,
+            value,
+            secret: false,
+        }
+    }
+
+    fn secret(key: ConfigField, label: &'static str, value: String) -> Self {
+        Self {
+            key,
+            label,
+            value,
+            secret: true,
+        }
+    }
+
+    fn display_value(&self) -> String {
+        if self.secret && !self.value.is_empty() {
+            "*".repeat(self.value.graphemes(true).count())
+        } else {
+            self.value.clone()
+        }
+    }
 }
 
 impl TuiState {
@@ -114,6 +298,7 @@ impl TuiState {
             mode: Mode::Browser,
             input: String::new(),
             draft: String::new(),
+            form: None,
             status: "cache ready".to_string(),
             last_poll_at: None,
             last_poll_new: 0,
@@ -124,6 +309,11 @@ impl TuiState {
         state.reload_topics(app)?;
         state.reload_messages(app)?;
         state.select_latest_message();
+        if !app.settings().auth_problems().is_empty() {
+            state.form = Some(ConfigForm::login(app.settings()));
+            state.mode = Mode::Login;
+            state.status = "credentials required".to_string();
+        }
         Ok(state)
     }
 
@@ -258,9 +448,9 @@ pub async fn run(app: App) -> Result<()> {
 
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    app: App,
-    theme: TuiTheme,
-    image_picker: Option<ImagePicker>,
+    mut app: App,
+    mut theme: TuiTheme,
+    mut image_picker: Option<ImagePicker>,
 ) -> Result<()> {
     let mut state = TuiState::load(&app)?;
     let (poll_tx, poll_rx) = mpsc::channel();
@@ -291,20 +481,29 @@ async fn run_loop(
         let Event::Key(key) = event::read()? else {
             continue;
         };
-        if handle_key(key, &mut state, &app).await? {
+        if handle_key(key, &mut state, &mut app, &mut theme, &mut image_picker).await? {
             break;
         }
     }
     Ok(())
 }
 
-async fn handle_key(key: KeyEvent, state: &mut TuiState, app: &App) -> Result<bool> {
+async fn handle_key(
+    key: KeyEvent,
+    state: &mut TuiState,
+    app: &mut App,
+    theme: &mut TuiTheme,
+    image_picker: &mut Option<ImagePicker>,
+) -> Result<bool> {
     match state.mode {
         Mode::SearchInput | Mode::Command | Mode::Composer => {
             return handle_input_key(key, state, app).await;
         }
-        Mode::SearchResults | Mode::Digest | Mode::Auth => {
+        Mode::SearchResults | Mode::Digest | Mode::Auth | Mode::Help => {
             return handle_scrollable_mode_key(key, state);
+        }
+        Mode::Login | Mode::Config => {
+            return handle_config_key(key, state, app, theme, image_picker).await;
         }
         Mode::ConfirmSend => {
             match key.code {
@@ -408,6 +607,18 @@ async fn handle_key(key: KeyEvent, state: &mut TuiState, app: &App) -> Result<bo
         KeyCode::Char('a') => {
             state.popup_scroll = 0;
             state.mode = Mode::Auth;
+        }
+        KeyCode::Char('c') => {
+            state.form = Some(ConfigForm::config(app.settings()));
+            state.popup_scroll = 0;
+            state.mode = Mode::Config;
+        }
+        KeyCode::Char('?') => {
+            state.popup_scroll = 0;
+            state.mode = Mode::Help;
+        }
+        KeyCode::Char('L') => {
+            logout(state, app, theme, image_picker)?;
         }
         KeyCode::Char('d') => {
             state.digest = Some(digest::build_digest(
@@ -623,6 +834,258 @@ async fn handle_input_key(key: KeyEvent, state: &mut TuiState, app: &App) -> Res
     Ok(false)
 }
 
+async fn handle_config_key(
+    key: KeyEvent,
+    state: &mut TuiState,
+    app: &mut App,
+    theme: &mut TuiTheme,
+    image_picker: &mut Option<ImagePicker>,
+) -> Result<bool> {
+    let missing_auth = !app.settings().auth_problems().is_empty();
+    let Some(form) = state.form.as_mut() else {
+        state.form = Some(if state.mode == Mode::Login {
+            ConfigForm::login(app.settings())
+        } else {
+            ConfigForm::config(app.settings())
+        });
+        return Ok(false);
+    };
+    match key.code {
+        KeyCode::Esc => {
+            if form.purpose == ConfigPurpose::Login && missing_auth {
+                form.message = "Credentials are required before opening the browser.".to_string();
+            } else {
+                state.mode = Mode::Browser;
+                state.popup_scroll = 0;
+            }
+        }
+        KeyCode::Tab | KeyCode::Down => form.move_selection(1),
+        KeyCode::BackTab | KeyCode::Up => form.move_selection(-1),
+        KeyCode::Backspace => {
+            if let Some(field) = form.selected_field_mut() {
+                field.value.pop();
+            }
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(field) = form.selected_field_mut() {
+                field.value.clear();
+            }
+        }
+        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Err(err) = save_config_form(state, app, theme, image_picker).await {
+                if let Some(form) = state.form.as_mut() {
+                    form.message = format!("Save failed: {err}");
+                } else {
+                    state.status = format!("save failed: {err}");
+                }
+            }
+        }
+        KeyCode::Enter => {
+            if let Err(err) = save_config_form(state, app, theme, image_picker).await {
+                if let Some(form) = state.form.as_mut() {
+                    form.message = format!("Save failed: {err}");
+                } else {
+                    state.status = format!("save failed: {err}");
+                }
+            }
+        }
+        KeyCode::Char(c) => {
+            if let Some(field) = form.selected_field_mut() {
+                field.value.push(c);
+            }
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+async fn save_config_form(
+    state: &mut TuiState,
+    app: &mut App,
+    theme: &mut TuiTheme,
+    image_picker: &mut Option<ImagePicker>,
+) -> Result<()> {
+    let form = state
+        .form
+        .as_ref()
+        .context("configuration form is not active")?;
+    let purpose = form.purpose;
+    let mut settings = app.settings().clone();
+    let base_url = required_value(form, ConfigField::BaseUrl, "base URL")?
+        .trim_end_matches('/')
+        .to_string();
+    let email = required_value(form, ConfigField::Email, "email")?;
+    let api_key_input = form.value(ConfigField::ApiKey).trim().to_string();
+    let current_api_key = settings.zulip.api_key.clone().unwrap_or_default();
+    let api_key = if api_key_input.is_empty() && purpose == ConfigPurpose::Config {
+        current_api_key
+    } else {
+        api_key_input.clone()
+    };
+    if api_key.trim().is_empty() {
+        anyhow::bail!("API key is required");
+    }
+
+    settings.zulip = ZulipConfig {
+        base_url: Some(base_url),
+        email: Some(email),
+        api_key: Some(api_key.clone()),
+    };
+
+    if purpose == ConfigPurpose::Config {
+        settings.cache = CacheConfig {
+            ttl_minutes: positive_i64(form.value(ConfigField::CacheTtlMinutes), "cache TTL")?,
+            default_sync_hours: positive_i64(form.value(ConfigField::SyncHours), "sync hours")?,
+            path: optional_path(form.value(ConfigField::CachePath)),
+        };
+        settings.ui = UiConfig {
+            start_view: nonempty_or_default(form.value(ConfigField::StartView), "streams"),
+            theme: nonempty_or_default(form.value(ConfigField::Theme), "zenburn"),
+            images: parse_image_mode(form.value(ConfigField::Images))?,
+        };
+        settings.safety = SafetyConfig {
+            read_only_by_default: parse_bool(
+                form.value(ConfigField::ReadOnlyByDefault),
+                "read only by default",
+            )?,
+            require_confirmation_for_sends: parse_bool(
+                form.value(ConfigField::ConfirmSends),
+                "confirm sends",
+            )?,
+        };
+        settings.digest = DigestConfig {
+            aliases: split_aliases(form.value(ConfigField::DigestAliases)),
+        };
+    }
+
+    validate_credentials(&settings, app.offline()).await?;
+    settings.save_without_secret()?;
+    if purpose == ConfigPurpose::Login || !api_key_input.is_empty() {
+        settings.save_api_key(&api_key)?;
+    }
+    reload_app(state, app, theme, image_picker, "configuration saved")?;
+    Ok(())
+}
+
+fn reload_app(
+    state: &mut TuiState,
+    app: &mut App,
+    theme: &mut TuiTheme,
+    image_picker: &mut Option<ImagePicker>,
+    status: &str,
+) -> Result<()> {
+    let offline = app.offline();
+    let settings = Settings::load()?;
+    *app = App::open(settings, offline)?;
+    *theme = TuiTheme::resolve(app.settings())?;
+    *image_picker = detect_image_picker(app.settings());
+    *state = TuiState::load(app)?;
+    state.status = status.to_string();
+    Ok(())
+}
+
+fn logout(
+    state: &mut TuiState,
+    app: &mut App,
+    theme: &mut TuiTheme,
+    image_picker: &mut Option<ImagePicker>,
+) -> Result<()> {
+    let mut settings = app.settings().clone();
+    settings.clear_local_auth()?;
+    reload_app(state, app, theme, image_picker, "local credentials cleared")?;
+    if app.settings().auth_problems().is_empty() && env_auth_present() {
+        state.status =
+            "local credentials cleared; environment credentials are still active".to_string();
+    }
+    Ok(())
+}
+
+async fn validate_credentials(settings: &Settings, offline: bool) -> Result<()> {
+    let (base_url, email, api_key) = settings.require_auth()?;
+    if offline {
+        return Ok(());
+    }
+    ZulipClient::new(base_url, email, api_key)
+        .current_user()
+        .await
+        .context("validating Zulip credentials")?;
+    Ok(())
+}
+
+fn required_value(form: &ConfigForm, field: ConfigField, label: &str) -> Result<String> {
+    let value = form.value(field).trim();
+    if value.is_empty() {
+        anyhow::bail!("{label} is required");
+    }
+    Ok(value.to_string())
+}
+
+fn positive_i64(value: &str, label: &str) -> Result<i64> {
+    let parsed = value
+        .trim()
+        .parse::<i64>()
+        .with_context(|| format!("{label} must be a number"))?;
+    if parsed <= 0 {
+        anyhow::bail!("{label} must be greater than zero");
+    }
+    Ok(parsed)
+}
+
+fn optional_path(value: &str) -> Option<PathBuf> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+}
+
+fn nonempty_or_default(value: &str, default: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        default.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn parse_bool(value: &str, label: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Ok(true),
+        "false" | "no" | "off" | "0" => Ok(false),
+        _ => anyhow::bail!("{label} must be true or false"),
+    }
+}
+
+fn parse_image_mode(value: &str) -> Result<ImageMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "auto" => Ok(ImageMode::Auto),
+        "placeholder" | "placeholders" => Ok(ImageMode::Placeholder),
+        "off" | "none" => Ok(ImageMode::Off),
+        _ => anyhow::bail!("images must be auto, placeholder, or off"),
+    }
+}
+
+fn image_mode_value(mode: ImageMode) -> &'static str {
+    match mode {
+        ImageMode::Auto => "auto",
+        ImageMode::Placeholder => "placeholder",
+        ImageMode::Off => "off",
+    }
+}
+
+fn split_aliases(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|alias| !alias.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn env_auth_present() -> bool {
+    std::env::var_os("ZULIP_BASE_URL").is_some()
+        || std::env::var_os("ZULIP_SITE").is_some()
+        || std::env::var_os("ZULIP_EMAIL").is_some()
+        || std::env::var_os("ZULIP_API_KEY").is_some()
+}
+
 async fn run_command(state: &mut TuiState, app: &App) -> Result<()> {
     let command = state.input.trim().to_string();
     if command == "sync now" || command == "sync" {
@@ -714,9 +1177,14 @@ fn draw(
     draw_status(frame, outer[1], state, app, theme);
 
     match state.mode {
-        Mode::SearchInput | Mode::Command | Mode::Composer | Mode::ConfirmSend | Mode::Auth => {
-            draw_overlay(frame, state, app, theme);
-        }
+        Mode::SearchInput
+        | Mode::Command
+        | Mode::Composer
+        | Mode::ConfirmSend
+        | Mode::Auth
+        | Mode::Login
+        | Mode::Config
+        | Mode::Help => draw_overlay(frame, state, app, theme),
         Mode::SearchResults => draw_search_results(frame, state, theme),
         Mode::Digest => draw_digest(frame, state, theme),
         Mode::Browser => {}
@@ -958,7 +1426,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &TuiState, app: &App, t
         "poll pending".to_string()
     };
     let text = format!(
-        "{} | {} | {} | {} | {}{} | j/k h/l / r R : d o y q | {}",
+        "{} | {} | {} | {} | {}{} | ? c L j/k h/l / r R : d o y q | {}",
         account, realm, sync, poll, offline, draft, state.status
     );
     frame.render_widget(
@@ -968,7 +1436,11 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &TuiState, app: &App, t
 }
 
 fn draw_overlay(frame: &mut Frame<'_>, state: &TuiState, app: &App, theme: &TuiTheme) {
-    let area = centered_rect(70, 55, frame.area());
+    let area = if matches!(state.mode, Mode::Config | Mode::Help) {
+        centered_rect(82, 78, frame.area())
+    } else {
+        centered_rect(70, 55, frame.area())
+    };
     frame.render_widget(Clear, area);
     let text = match state.mode {
         Mode::SearchInput => format!("Search cached messages\n\n{}", state.input),
@@ -1014,8 +1486,15 @@ fn draw_overlay(frame: &mut Frame<'_>, state: &TuiState, app: &App, theme: &TuiT
             } else {
                 "missing"
             };
-            format!("Auth/config status\n\nRealm: {realm}\nAccount: {account}\nAPI key: {secret}\nCache: {}", app.settings().paths.cache_file.display())
+            format!(
+                "Auth/config status\n\nRealm: {realm}\nAccount: {account}\nAPI key: {secret}\nConfig: {}\nSecret: {}\nCache: {}",
+                app.settings().paths.config_file.display(),
+                app.settings().paths.secret_file.display(),
+                app.settings().paths.cache_file.display()
+            )
         }
+        Mode::Login | Mode::Config => form_overlay_text(state),
+        Mode::Help => help_text(app),
         _ => String::new(),
     };
     frame.render_widget(
@@ -1037,8 +1516,85 @@ fn overlay_cursor_position(state: &TuiState, area: Rect) -> Option<(u16, u16)> {
             input_cursor_position(area, 2, state.input.lines().next().unwrap_or(""))
         }
         Mode::Composer => draft_cursor_position(area, &state.draft),
+        Mode::Login | Mode::Config => form_cursor_position(area, state.form.as_ref()?),
         _ => None,
     }
+}
+
+fn form_overlay_text(state: &TuiState) -> String {
+    let Some(form) = &state.form else {
+        return String::new();
+    };
+    let title = match form.purpose {
+        ConfigPurpose::Login => "Login",
+        ConfigPurpose::Config => "Configuration",
+    };
+    let mut text = format!("{title}\n{}\n\n", form.message);
+    for (idx, field) in form.fields.iter().enumerate() {
+        let marker = if idx == form.selected { ">" } else { " " };
+        text.push_str(&format!(
+            "{marker} {:<22} {}\n",
+            field.label,
+            field.display_value()
+        ));
+    }
+    text.push_str("\nTab/Shift-Tab moves fields, Ctrl-U clears a field, Ctrl-S saves, Esc closes.");
+    if form.purpose == ConfigPurpose::Config {
+        text.push_str("\nImages accepts auto, placeholder, or off. Booleans accept true/false.");
+    }
+    text
+}
+
+fn help_text(app: &App) -> String {
+    let env_note = if env_auth_present() {
+        "\nEnvironment credentials are set, so logout only clears local files."
+    } else {
+        ""
+    };
+    format!(
+        "Keys\n\n\
+         ?  Show this help\n\
+         c  Edit configuration\n\
+         L  Logout and clear local credentials\n\
+         a  Show auth/config status\n\
+         q  Quit from the browser, close overlays elsewhere\n\n\
+         Navigation\n\n\
+         j/k or Up/Down  Move selection\n\
+         h/l or Left/Right  Move between panes\n\n\
+         Messages\n\n\
+         /  Search cached messages\n\
+         r  Reply to selected topic\n\
+         R  Sync recent messages\n\
+         d  Build digest\n\
+         o or y  Show selected message permalink\n\
+         : or Ctrl-P  Command palette\n\n\
+         Editing\n\n\
+         Tab/Shift-Tab  Move form fields\n\
+         Ctrl-U  Clear current form field\n\
+         Ctrl-S  Save draft or form\n\
+         Esc  Cancel overlay\n\n\
+         Config file: {}\n\
+         Secret file: {}\n\
+         Cache file: {}{}",
+        app.settings().paths.config_file.display(),
+        app.settings().paths.secret_file.display(),
+        app.settings().paths.cache_file.display(),
+        env_note
+    )
+}
+
+fn form_cursor_position(area: Rect, form: &ConfigForm) -> Option<(u16, u16)> {
+    let field = form.selected_field()?;
+    let line_index = 3 + form.selected;
+    let label_width = 25;
+    let inner = overlay_inner_area(area)?;
+    let x_offset = (label_width + display_width(&field.display_value()))
+        .min(inner.width.saturating_sub(1) as usize) as u16;
+    let y_offset = (line_index as u16).min(inner.height.saturating_sub(1));
+    Some((
+        inner.x.saturating_add(x_offset),
+        inner.y.saturating_add(y_offset),
+    ))
 }
 
 fn draft_cursor_position(area: Rect, draft: &str) -> Option<(u16, u16)> {
@@ -2058,6 +2614,55 @@ mod tests {
         let state = TuiState::load(&app).unwrap();
 
         assert_eq!(state.messages[state.message_idx].id, 3);
+    }
+
+    #[test]
+    fn missing_credentials_open_login_form() {
+        let fixture = TuiFixture::new(&[]);
+        let app = App::open(fixture.settings.clone(), false).unwrap();
+
+        let state = TuiState::load(&app).unwrap();
+
+        assert_eq!(state.mode, Mode::Login);
+        assert_eq!(state.form.as_ref().unwrap().purpose, ConfigPurpose::Login);
+    }
+
+    #[test]
+    fn complete_credentials_open_browser() {
+        let mut fixture = TuiFixture::new(&[]);
+        fixture.settings.zulip = ZulipConfig {
+            base_url: Some("https://zulip.example".to_string()),
+            email: Some("ada@example.com".to_string()),
+            api_key: Some("secret".to_string()),
+        };
+        let app = App::open(fixture.settings.clone(), false).unwrap();
+
+        let state = TuiState::load(&app).unwrap();
+
+        assert_eq!(state.mode, Mode::Browser);
+    }
+
+    #[test]
+    fn secret_form_fields_are_masked() {
+        let field = FormField::secret(ConfigField::ApiKey, "API key", "secret".to_string());
+
+        assert_eq!(field.display_value(), "******");
+    }
+
+    #[test]
+    fn config_parsers_accept_expected_values() {
+        assert_eq!(
+            parse_image_mode("placeholder").unwrap(),
+            ImageMode::Placeholder
+        );
+        assert_eq!(parse_image_mode("off").unwrap(), ImageMode::Off);
+        assert!(parse_image_mode("sparkles").is_err());
+        assert!(parse_bool("yes", "field").unwrap());
+        assert!(!parse_bool("0", "field").unwrap());
+        assert_eq!(
+            split_aliases("Ada, The Maintainer, "),
+            ["Ada", "The Maintainer"]
+        );
     }
 
     #[test]

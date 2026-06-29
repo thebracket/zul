@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
+use std::io::ErrorKind;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -180,9 +181,19 @@ impl Settings {
     /// Load settings from XDG paths, secret files, and environment variables.
     pub fn load() -> Result<Self> {
         let paths = AppPaths::discover()?;
-        let mut settings = if paths.config_file.exists() {
-            let body = fs::read_to_string(&paths.config_file)
-                .with_context(|| format!("reading {}", paths.config_file.display()))?;
+        let legacy_paths = AppPaths::legacy_project_dirs();
+        let config_file = if paths.config_file.exists() {
+            paths.config_file.clone()
+        } else {
+            legacy_paths
+                .as_ref()
+                .map(|legacy| legacy.config_file.clone())
+                .filter(|path| path.exists())
+                .unwrap_or_else(|| paths.config_file.clone())
+        };
+        let mut settings = if config_file.exists() {
+            let body = fs::read_to_string(&config_file)
+                .with_context(|| format!("reading {}", config_file.display()))?;
             Self::from_file_settings(
                 toml::from_str(&body).context("parsing zul config TOML")?,
                 paths,
@@ -192,6 +203,14 @@ impl Settings {
         };
 
         settings.load_secret_file()?;
+        if settings.zulip.api_key.is_none() {
+            if let Some(legacy) = legacy_paths
+                .as_ref()
+                .filter(|legacy| legacy.secret_file != settings.paths.secret_file)
+            {
+                settings.load_secret_file_from(&legacy.secret_file)?;
+            }
+        }
         settings.apply_env();
         if let Some(path) = settings.cache.path.clone() {
             settings.paths.cache_file = expand_tilde(path);
@@ -299,11 +318,19 @@ impl Settings {
     }
 
     fn load_secret_file(&mut self) -> Result<()> {
-        if self.zulip.api_key.is_some() || !self.paths.secret_file.exists() {
+        if self.zulip.api_key.is_some() {
             return Ok(());
         }
-        let api_key = fs::read_to_string(&self.paths.secret_file)
-            .with_context(|| format!("reading {}", self.paths.secret_file.display()))?
+        let secret_file = self.paths.secret_file.clone();
+        self.load_secret_file_from(&secret_file)
+    }
+
+    fn load_secret_file_from(&mut self, path: &PathBuf) -> Result<()> {
+        if self.zulip.api_key.is_some() || !path.exists() {
+            return Ok(());
+        }
+        let api_key = fs::read_to_string(path)
+            .with_context(|| format!("reading {}", path.display()))?
             .trim()
             .to_string();
         if !api_key.is_empty() {
@@ -336,18 +363,74 @@ impl Settings {
 
         Ok(())
     }
+
+    /// Clear locally persisted Zulip credentials and remove the local API key file.
+    pub fn clear_local_auth(&mut self) -> Result<()> {
+        self.zulip.base_url = None;
+        self.zulip.email = None;
+        self.zulip.api_key = None;
+        self.save_without_secret()?;
+        let mut secret_files = vec![self.paths.secret_file.clone()];
+        if AppPaths::discover()
+            .map(|paths| paths.secret_file == self.paths.secret_file)
+            .unwrap_or(false)
+        {
+            if let Some(legacy) = AppPaths::legacy_project_dirs() {
+                if legacy.secret_file != self.paths.secret_file {
+                    secret_files.push(legacy.secret_file);
+                }
+            }
+        }
+        for secret_file in secret_files {
+            match fs::remove_file(&secret_file) {
+                Ok(()) => {}
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => {
+                    return Err(err).with_context(|| format!("removing {}", secret_file.display()));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl AppPaths {
-    /// Discover default XDG paths for config, cache, and secrets.
+    /// Discover default config, cache, and secret paths.
     pub fn discover() -> Result<Self> {
-        let dirs = ProjectDirs::from("", "", "zul").context("unable to discover XDG paths")?;
-        Ok(Self {
+        preferred_paths()
+    }
+
+    fn legacy_project_dirs() -> Option<Self> {
+        let dirs = ProjectDirs::from("", "", "zul")?;
+        Some(Self {
             config_file: dirs.config_dir().join("config.toml"),
             cache_file: dirs.cache_dir().join("cache.sqlite"),
             secret_file: dirs.config_dir().join("api_key"),
         })
     }
+}
+
+#[cfg(not(windows))]
+fn preferred_paths() -> Result<AppPaths> {
+    let config_home = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .context("unable to discover config directory")?;
+    let cache_home = env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .context("unable to discover cache directory")?;
+    let config_dir = config_home.join("zul");
+    Ok(AppPaths {
+        config_file: config_dir.join("config.toml"),
+        cache_file: cache_home.join("zul").join("cache.sqlite"),
+        secret_file: config_dir.join("api_key"),
+    })
+}
+
+#[cfg(windows)]
+fn preferred_paths() -> Result<AppPaths> {
+    AppPaths::legacy_project_dirs().context("unable to discover platform paths")
 }
 
 fn expand_tilde(path: PathBuf) -> PathBuf {
@@ -419,6 +502,59 @@ mod tests {
     }
 
     #[test]
+    fn clear_local_auth_removes_secret_and_keeps_non_auth_config() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let paths = AppPaths {
+            config_file: dir.path().join("config.toml"),
+            cache_file: dir.path().join("cache.sqlite"),
+            secret_file: dir.path().join("api_key"),
+        };
+        let mut settings = Settings::from_file_settings(FileSettings::default(), paths.clone());
+        settings.zulip = ZulipConfig {
+            base_url: Some("https://zulip.example".to_string()),
+            email: Some("ada@example.com".to_string()),
+            api_key: Some("local-secret".to_string()),
+        };
+        settings.cache.ttl_minutes = 45;
+        settings.save_api_key("local-secret").unwrap();
+
+        settings.clear_local_auth().unwrap();
+
+        assert!(!paths.secret_file.exists());
+        let body = fs::read_to_string(paths.config_file).unwrap();
+        assert!(!body.contains("base_url"));
+        assert!(body.contains("ttl_minutes = 45"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_discovery_uses_xdg_zul_subdirectories() {
+        let config_dir = tempfile::TempDir::new().unwrap();
+        let cache_dir = tempfile::TempDir::new().unwrap();
+        let old_config = env::var_os("XDG_CONFIG_HOME");
+        let old_cache = env::var_os("XDG_CACHE_HOME");
+        env::set_var("XDG_CONFIG_HOME", config_dir.path());
+        env::set_var("XDG_CACHE_HOME", cache_dir.path());
+
+        let paths = AppPaths::discover().unwrap();
+
+        assert_eq!(
+            paths.config_file,
+            config_dir.path().join("zul").join("config.toml")
+        );
+        assert_eq!(
+            paths.secret_file,
+            config_dir.path().join("zul").join("api_key")
+        );
+        assert_eq!(
+            paths.cache_file,
+            cache_dir.path().join("zul").join("cache.sqlite")
+        );
+        restore_env("XDG_CONFIG_HOME", old_config);
+        restore_env("XDG_CACHE_HOME", old_cache);
+    }
+
+    #[test]
     fn parses_ui_theme_and_custom_theme_from_toml() {
         let file: FileSettings = toml::from_str(
             r##"
@@ -440,5 +576,13 @@ mod tests {
         assert_eq!(ui.theme, "cozy");
         assert_eq!(ui.images, ImageMode::Placeholder);
         assert_eq!(themes["cozy"].background.as_deref(), Some("#101820"));
+    }
+
+    fn restore_env(key: &str, value: Option<std::ffi::OsString>) {
+        if let Some(value) = value {
+            env::set_var(key, value);
+        } else {
+            env::remove_var(key);
+        }
     }
 }
