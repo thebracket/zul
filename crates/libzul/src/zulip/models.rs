@@ -1,6 +1,58 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Kind of Zulip conversation a message belongs to.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ZulipMessageType {
+    /// Channel/stream message with a topic.
+    Stream,
+    /// Direct message conversation.
+    Direct,
+}
+
+impl ZulipMessageType {
+    /// Stable cache representation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stream => "stream",
+            Self::Direct => "direct",
+        }
+    }
+
+    /// Parse a cached representation, defaulting old rows to stream messages.
+    pub fn from_cache(value: &str) -> Self {
+        match value {
+            "direct" => Self::Direct,
+            _ => Self::Stream,
+        }
+    }
+}
+
+/// One participant in a Zulip direct-message conversation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ZulipDmParticipant {
+    /// Zulip user ID, if present in the API response.
+    pub id: Option<i64>,
+    /// Display name.
+    pub name: String,
+    /// Email address, if present.
+    pub email: Option<String>,
+}
+
+/// Cached summary for one direct-message conversation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ZulipDirectConversation {
+    /// Stable cache key for the participant set.
+    pub key: String,
+    /// Participants displayed for the conversation.
+    pub participants: Vec<ZulipDmParticipant>,
+    /// Number of cached messages in this conversation.
+    pub message_count: i64,
+    /// Timestamp of the newest cached message in the conversation.
+    pub last_message_at: Option<DateTime<Utc>>,
+}
+
 /// Zulip stream metadata stored in the local cache.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ZulipStream {
@@ -32,12 +84,18 @@ pub struct ZulipTopic {
 pub struct ZulipMessage {
     /// Zulip message ID.
     pub id: i64,
+    /// Conversation kind.
+    pub message_type: ZulipMessageType,
     /// Zulip stream ID, if the API response included one.
     pub stream_id: Option<i64>,
     /// Stream display name.
     pub stream_name: String,
     /// Topic name.
     pub topic: String,
+    /// Stable direct-message conversation key, for direct messages.
+    pub dm_conversation_key: Option<String>,
+    /// Direct-message participants, for direct messages.
+    pub dm_participants: Vec<ZulipDmParticipant>,
     /// Sender Zulip user ID, if present.
     pub sender_id: Option<i64>,
     /// Sender display name.

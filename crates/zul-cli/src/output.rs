@@ -1,7 +1,7 @@
 use anyhow::Result;
 use libzul::app::{ReplyResult, SyncResult};
 use libzul::digest::Digest;
-use libzul::zulip::models::{ZulipMessage, ZulipStream, ZulipTopic};
+use libzul::zulip::models::{ZulipMessage, ZulipMessageType, ZulipStream, ZulipTopic};
 use serde::Serialize;
 
 pub fn print_json<T: Serialize + ?Sized>(value: &T) -> Result<()> {
@@ -71,10 +71,9 @@ impl PrintMode {
         }
         for message in messages {
             println!(
-                "[{}] #{} > {} | {}: {}",
+                "[{}] {} | {}: {}",
                 message.id,
-                message.stream_name,
-                message.topic,
+                message_destination(message),
                 message.sender_name,
                 message.plain_text
             );
@@ -181,6 +180,14 @@ impl PrintMode {
             }
         }
         Ok(())
+    }
+}
+
+fn message_destination(message: &ZulipMessage) -> String {
+    if message.message_type == ZulipMessageType::Direct {
+        format!("DM: {}", message.topic)
+    } else {
+        format!("#{} > {}", message.stream_name, message.topic)
     }
 }
 

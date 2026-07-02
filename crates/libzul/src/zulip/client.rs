@@ -243,6 +243,24 @@ impl ZulipClient {
         Ok(data.id)
     }
 
+    /// Send a direct message and return the created Zulip message ID.
+    pub async fn send_direct_message(
+        &self,
+        recipients: &[serde_json::Value],
+        message: &str,
+    ) -> Result<i64> {
+        let to = serde_json::to_string(recipients)?;
+        let data = self
+            .post("/api/v1/messages")
+            .form(&[("type", "direct"), ("to", &to), ("content", message)])
+            .send()
+            .await?
+            .json::<ZulipApiResponse<SendMessageResponse>>()
+            .await?
+            .into_data()?;
+        Ok(data.id)
+    }
+
     /// Fetch an authenticated image URL for terminal rendering.
     pub async fn image_bytes(&self, absolute_url: &str) -> Result<ImageBytes> {
         let response = self

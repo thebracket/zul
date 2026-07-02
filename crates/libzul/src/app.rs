@@ -3,9 +3,13 @@ use crate::cache::{send_hash, Cache, StreamActivity, SyncRecord};
 use crate::config::Settings;
 use crate::zulip::client::ZulipClient;
 use crate::zulip::images;
-use crate::zulip::models::{ImageAttachment, ImageBytes, ZulipMessage, ZulipStream, ZulipTopic};
+use crate::zulip::models::{
+    ImageAttachment, ImageBytes, ZulipDirectConversation, ZulipDmParticipant, ZulipMessage,
+    ZulipStream, ZulipTopic,
+};
 use anyhow::{Context, Result};
 use serde::Serialize;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::PathBuf;
@@ -308,6 +312,16 @@ impl App {
         self.cache.messages_for_topic(stream, topic)
     }
 
+    /// List cached direct-message conversations.
+    pub fn direct_conversations(&self) -> Result<Vec<ZulipDirectConversation>> {
+        self.cache.direct_conversations()
+    }
+
+    /// List cached messages for one direct-message conversation.
+    pub fn direct_conversation(&self, key: &str) -> Result<Vec<ZulipMessage>> {
+        self.cache.messages_for_direct_conversation(key)
+    }
+
     /// List cached messages newer than the requested lookback window.
     pub fn recent_messages(&self, hours: i64) -> Result<Vec<ZulipMessage>> {
         self.cache.recent_messages(hours)
@@ -365,6 +379,11 @@ impl App {
     /// Return cached message counts per stream.
     pub fn stream_activity(&self) -> Result<Vec<StreamActivity>> {
         self.cache.stream_activity()
+    }
+
+    /// Return the number of cached direct messages.
+    pub fn direct_message_count(&self) -> Result<i64> {
+        self.cache.direct_message_count()
     }
 
     /// Return the last recorded recent-sync state.
@@ -426,6 +445,66 @@ impl App {
         })
     }
 
+    /// Send or dry-run a direct-message reply with duplicate-send protection.
+    pub async fn reply_direct(
+        &self,
+        conversation: &ZulipDirectConversation,
+        message: &str,
+        dry_run: bool,
+        yes: bool,
+    ) -> Result<ReplyResult> {
+        let (realm, account, _) = self.settings.require_auth()?;
+        let destination = direct_destination(&conversation.participants);
+        let hash = send_hash("Direct messages", &conversation.key, message);
+        if self.cache.has_sent_hash(&hash)? {
+            anyhow::bail!("duplicate send blocked: this direct message was already sent");
+        }
+        if dry_run {
+            self.cache
+                .record_send("Direct messages", &conversation.key, message, None, true)?;
+            return Ok(ReplyResult::DryRun {
+                realm,
+                account,
+                stream: "Direct messages".to_string(),
+                topic: destination,
+                message: message.to_string(),
+                content_hash: hash,
+            });
+        }
+        if self.offline {
+            anyhow::bail!("offline mode is read-only; use --dry-run to preview a reply");
+        }
+        if !yes {
+            anyhow::bail!(
+                "sending requires --yes; use --dry-run to preview destination and content"
+            );
+        }
+        let recipients = direct_reply_recipients(&conversation.participants, &account);
+        if recipients.is_empty() {
+            anyhow::bail!("direct-message conversation has no sendable recipients");
+        }
+        self.cache
+            .record_send_attempt("Direct messages", &conversation.key, message)?;
+        let client = self.client()?;
+        let id = match client.send_direct_message(&recipients, message).await {
+            Ok(id) => id,
+            Err(err) => {
+                anyhow::bail!(
+                    "send outcome unknown after audit-first attempt was recorded; duplicate retry is blocked for safety: {err}"
+                );
+            }
+        };
+        self.cache.complete_send_attempt(&hash, id)?;
+        Ok(ReplyResult::Sent {
+            realm,
+            account,
+            stream: "Direct messages".to_string(),
+            topic: destination,
+            zulip_message_id: id,
+            content_hash: hash,
+        })
+    }
+
     async fn refresh_cached_authored_messages(
         &self,
         client: &ZulipClient,
@@ -454,6 +533,42 @@ impl App {
         let (base_url, email, api_key) = self.settings.require_auth()?;
         Ok(ZulipClient::new(base_url, email, api_key))
     }
+}
+
+fn direct_reply_recipients(
+    participants: &[ZulipDmParticipant],
+    account: &str,
+) -> Vec<serde_json::Value> {
+    let mut recipients = participants
+        .iter()
+        .filter(|participant| participant.email.as_deref() != Some(account))
+        .filter_map(direct_recipient_value)
+        .collect::<Vec<_>>();
+    if recipients.is_empty() {
+        recipients = participants
+            .iter()
+            .filter_map(direct_recipient_value)
+            .collect();
+    }
+    recipients
+}
+
+fn direct_recipient_value(participant: &ZulipDmParticipant) -> Option<serde_json::Value> {
+    participant
+        .id
+        .map(|id| json!(id))
+        .or_else(|| participant.email.as_ref().map(|email| json!(email)))
+}
+
+fn direct_destination(participants: &[ZulipDmParticipant]) -> String {
+    if participants.is_empty() {
+        return "Direct message".to_string();
+    }
+    participants
+        .iter()
+        .map(|participant| participant.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 async fn fetch_messages_by_ids(

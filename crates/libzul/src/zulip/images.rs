@@ -111,6 +111,7 @@ fn filename_hint(absolute_url: &str, fallback: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::zulip::models::ZulipMessageType;
     use chrono::Utc;
     use serde_json::json;
 
@@ -149,9 +150,12 @@ mod tests {
     fn message_with_html(html: &str) -> ZulipMessage {
         ZulipMessage {
             id: 10,
+            message_type: ZulipMessageType::Stream,
             stream_id: Some(1),
             stream_name: "core".to_string(),
             topic: "ops".to_string(),
+            dm_conversation_key: None,
+            dm_participants: Vec::new(),
             sender_id: Some(2),
             sender_name: "Ada".to_string(),
             sender_email: Some("ada@example.com".to_string()),

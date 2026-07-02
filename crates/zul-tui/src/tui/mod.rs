@@ -15,7 +15,10 @@ use libzul::config::{
 };
 use libzul::digest::{self, Digest};
 use libzul::zulip::client::ZulipClient;
-use libzul::zulip::models::{ImageAttachment, ImageBytes, ZulipMessage, ZulipStream, ZulipTopic};
+use libzul::zulip::models::{
+    ImageAttachment, ImageBytes, ZulipDirectConversation, ZulipMessage, ZulipMessageType,
+    ZulipStream, ZulipTopic,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -74,10 +77,12 @@ enum Mode {
 struct TuiState {
     streams: Vec<ZulipStream>,
     topics: Vec<ZulipTopic>,
+    direct_conversations: Vec<ZulipDirectConversation>,
     messages: Vec<ZulipMessage>,
     search_results: Vec<ZulipMessage>,
     digest: Option<Digest>,
     stream_activity: BTreeMap<String, i64>,
+    direct_message_count: i64,
     stream_idx: usize,
     topic_idx: usize,
     message_idx: usize,
@@ -100,6 +105,11 @@ struct ThreadImageEntry {
     protocol: Option<StatefulProtocol>,
     #[cfg(feature = "tui-images")]
     error: Option<String>,
+}
+
+enum ReplyDestination {
+    Stream { stream: String, topic: String },
+    Direct(ZulipDirectConversation),
 }
 
 /// Raw Zulip credentials found in the process environment after dotenv loading.
@@ -328,6 +338,7 @@ impl TuiState {
         let mut state = Self {
             streams: app.streams()?,
             topics: Vec::new(),
+            direct_conversations: Vec::new(),
             messages: Vec::new(),
             search_results: Vec::new(),
             digest: None,
@@ -336,6 +347,7 @@ impl TuiState {
                 .into_iter()
                 .map(|activity| (activity.stream_name, activity.message_count))
                 .collect(),
+            direct_message_count: app.direct_message_count()?,
             stream_idx: 0,
             topic_idx: 0,
             message_idx: 0,
@@ -370,9 +382,16 @@ impl TuiState {
     }
 
     fn selected_stream(&self) -> Option<&str> {
+        if self.selected_direct_messages() {
+            return None;
+        }
         self.streams
             .get(self.stream_idx)
             .map(|stream| stream.name.as_str())
+    }
+
+    fn selected_direct_messages(&self) -> bool {
+        self.stream_idx == self.streams.len()
     }
 
     fn selected_topic(&self) -> Option<&str> {
@@ -381,19 +400,43 @@ impl TuiState {
             .map(|topic| topic.name.as_str())
     }
 
+    fn selected_direct_conversation(&self) -> Option<&ZulipDirectConversation> {
+        self.selected_direct_messages()
+            .then(|| self.direct_conversations.get(self.topic_idx))
+            .flatten()
+    }
+
+    fn middle_len(&self) -> usize {
+        if self.selected_direct_messages() {
+            self.direct_conversations.len()
+        } else {
+            self.topics.len()
+        }
+    }
+
     fn reload_topics(&mut self, app: &App) -> Result<()> {
-        self.topics = match self.selected_stream() {
-            Some(stream) => app.topics(stream)?,
-            None => Vec::new(),
-        };
-        self.topic_idx = self.topic_idx.min(self.topics.len().saturating_sub(1));
+        if self.selected_direct_messages() {
+            self.topics = Vec::new();
+            self.direct_conversations = app.direct_conversations()?;
+        } else {
+            self.direct_conversations = Vec::new();
+            self.topics = match self.selected_stream() {
+                Some(stream) => app.topics(stream)?,
+                None => Vec::new(),
+            };
+        }
+        self.topic_idx = self.topic_idx.min(self.middle_len().saturating_sub(1));
         Ok(())
     }
 
     fn reload_messages(&mut self, app: &App) -> Result<()> {
-        self.messages = match (self.selected_stream(), self.selected_topic()) {
-            (Some(stream), Some(topic)) => app.topic(stream, topic)?,
-            _ => Vec::new(),
+        self.messages = if let Some(conversation) = self.selected_direct_conversation() {
+            app.direct_conversation(&conversation.key)?
+        } else {
+            match (self.selected_stream(), self.selected_topic()) {
+                (Some(stream), Some(topic)) => app.topic(stream, topic)?,
+                _ => Vec::new(),
+            }
         };
         self.message_idx = self.message_idx.min(self.messages.len().saturating_sub(1));
         Ok(())
@@ -406,7 +449,7 @@ impl TuiState {
     fn move_selection(&mut self, delta: isize, app: &App) -> Result<()> {
         match self.focus {
             Focus::Streams => {
-                self.stream_idx = move_index(self.stream_idx, self.streams.len(), delta);
+                self.stream_idx = move_index(self.stream_idx, self.streams.len() + 1, delta);
                 self.topic_idx = 0;
                 self.message_idx = 0;
                 self.reload_topics(app)?;
@@ -414,7 +457,7 @@ impl TuiState {
                 self.select_latest_message();
             }
             Focus::Topics => {
-                self.topic_idx = move_index(self.topic_idx, self.topics.len(), delta);
+                self.topic_idx = move_index(self.topic_idx, self.middle_len(), delta);
                 self.message_idx = 0;
                 self.reload_messages(app)?;
                 self.select_latest_message();
@@ -433,6 +476,10 @@ impl TuiState {
     fn refresh_from_cache(&mut self, app: &App, follow_if_was_at_end: bool) -> Result<()> {
         let selected_stream = self.selected_stream().map(ToString::to_string);
         let selected_topic = self.selected_topic().map(ToString::to_string);
+        let selected_direct = self.selected_direct_messages();
+        let selected_direct_key = self
+            .selected_direct_conversation()
+            .map(|conversation| conversation.key.clone());
         let selected_message_id = self
             .messages
             .get(self.message_idx)
@@ -444,17 +491,33 @@ impl TuiState {
             .into_iter()
             .map(|activity| (activity.stream_name, activity.message_count))
             .collect();
+        self.direct_message_count = app.direct_message_count()?;
 
-        self.stream_idx = selected_stream
-            .as_ref()
-            .and_then(|name| self.streams.iter().position(|stream| &stream.name == name))
-            .unwrap_or_else(|| self.stream_idx.min(self.streams.len().saturating_sub(1)));
+        self.stream_idx = if selected_direct {
+            self.streams.len()
+        } else {
+            selected_stream
+                .as_ref()
+                .and_then(|name| self.streams.iter().position(|stream| &stream.name == name))
+                .unwrap_or_else(|| self.stream_idx.min(self.streams.len()))
+        };
 
         self.reload_topics(app)?;
-        self.topic_idx = selected_topic
-            .as_ref()
-            .and_then(|name| self.topics.iter().position(|topic| &topic.name == name))
-            .unwrap_or_else(|| self.topic_idx.min(self.topics.len().saturating_sub(1)));
+        self.topic_idx = if selected_direct {
+            selected_direct_key
+                .as_ref()
+                .and_then(|key| {
+                    self.direct_conversations
+                        .iter()
+                        .position(|conversation| &conversation.key == key)
+                })
+                .unwrap_or_else(|| self.topic_idx.min(self.middle_len().saturating_sub(1)))
+        } else {
+            selected_topic
+                .as_ref()
+                .and_then(|name| self.topics.iter().position(|topic| &topic.name == name))
+                .unwrap_or_else(|| self.topic_idx.min(self.middle_len().saturating_sub(1)))
+        };
 
         self.reload_messages(app)?;
         if follow_if_was_at_end {
@@ -575,18 +638,21 @@ async fn handle_key(
         Mode::ConfirmSend => {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    let Some(stream) = state.selected_stream().map(ToString::to_string) else {
-                        state.status = "no stream selected".to_string();
-                        state.mode = Mode::Browser;
-                        return Ok(false);
-                    };
-                    let Some(topic) = state.selected_topic().map(ToString::to_string) else {
-                        state.status = "no topic selected".to_string();
+                    let Some(destination) = selected_reply_destination(state) else {
+                        state.status = "no conversation selected".to_string();
                         state.mode = Mode::Browser;
                         return Ok(false);
                     };
                     let draft = state.draft.clone();
-                    match app.reply(&stream, &topic, &draft, false, true).await {
+                    let send_result = match destination {
+                        ReplyDestination::Stream { stream, topic } => {
+                            app.reply(&stream, &topic, &draft, false, true).await
+                        }
+                        ReplyDestination::Direct(conversation) => {
+                            app.reply_direct(&conversation, &draft, false, true).await
+                        }
+                    };
+                    match send_result {
                         Ok(_) => {
                             let was_at_end = state.thread_at_end();
                             match app.poll_new_messages().await {
@@ -1195,6 +1261,60 @@ async fn run_command(state: &mut TuiState, app: &App) -> Result<()> {
     Ok(())
 }
 
+fn selected_reply_destination(state: &TuiState) -> Option<ReplyDestination> {
+    if let Some(conversation) = state.selected_direct_conversation() {
+        return Some(ReplyDestination::Direct(conversation.clone()));
+    }
+    Some(ReplyDestination::Stream {
+        stream: state.selected_stream()?.to_string(),
+        topic: state.selected_topic()?.to_string(),
+    })
+}
+
+fn selected_destination_label(state: &TuiState) -> String {
+    if let Some(conversation) = state.selected_direct_conversation() {
+        format!("DM: {}", direct_conversation_label(conversation))
+    } else {
+        match (state.selected_stream(), state.selected_topic()) {
+            (Some(stream), Some(topic)) => format!("#{stream} > {topic}"),
+            (Some(stream), None) => format!("#{stream} > no topic"),
+            _ => "no conversation".to_string(),
+        }
+    }
+}
+
+fn message_destination_label(message: &ZulipMessage) -> String {
+    if message.message_type == ZulipMessageType::Direct {
+        format!("DM: {}", direct_message_label(message))
+    } else {
+        format!("#{} > {}", message.stream_name, message.topic)
+    }
+}
+
+fn direct_message_label(message: &ZulipMessage) -> String {
+    if message.dm_participants.is_empty() {
+        return message.topic.clone();
+    }
+    message
+        .dm_participants
+        .iter()
+        .map(|participant| participant.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn direct_conversation_label(conversation: &ZulipDirectConversation) -> String {
+    if conversation.participants.is_empty() {
+        return "Direct message".to_string();
+    }
+    conversation
+        .participants
+        .iter()
+        .map(|participant| participant.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn handle_scrollable_mode_key(key: KeyEvent, state: &mut TuiState) -> Result<bool> {
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => {
@@ -1259,25 +1379,31 @@ fn draw(
 
 fn draw_streams(frame: &mut Frame<'_>, area: Rect, state: &TuiState, theme: &TuiTheme) {
     let content_height = list_content_height(area);
-    let start = visible_start(state.stream_idx, state.streams.len(), content_height);
+    let item_count = state.streams.len() + 1;
+    let start = visible_start(state.stream_idx, item_count, content_height);
     let active = state.focus == Focus::Streams;
-    let items = state
-        .streams
-        .iter()
-        .enumerate()
+    let items = (0..item_count)
         .skip(start)
         .take(content_height)
-        .map(|(idx, stream)| {
-            let count = state
-                .stream_activity
-                .get(&stream.name)
-                .copied()
-                .unwrap_or(0);
+        .map(|idx| {
+            let (count, name) = if idx == state.streams.len() {
+                (state.direct_message_count, "Direct messages".to_string())
+            } else {
+                let stream = &state.streams[idx];
+                (
+                    state
+                        .stream_activity
+                        .get(&stream.name)
+                        .copied()
+                        .unwrap_or(0),
+                    stream.name.clone(),
+                )
+            };
             selected_item(
                 idx == state.stream_idx,
                 active,
                 theme,
-                &format!("{count:>4}  {}", stream.name),
+                &format!("{count:>4}  {name}"),
             )
         })
         .collect::<Vec<_>>();
@@ -1291,27 +1417,58 @@ fn draw_streams(frame: &mut Frame<'_>, area: Rect, state: &TuiState, theme: &Tui
 
 fn draw_topics(frame: &mut Frame<'_>, area: Rect, state: &TuiState, theme: &TuiTheme) {
     let content_height = list_content_height(area);
-    let start = visible_start(state.topic_idx, state.topics.len(), content_height);
+    let item_count = state.middle_len();
+    let start = visible_start(state.topic_idx, item_count, content_height);
     let active = state.focus == Focus::Topics;
-    let items = state
-        .topics
-        .iter()
-        .enumerate()
-        .skip(start)
-        .take(content_height)
-        .map(|(idx, topic)| {
-            selected_item(
-                idx == state.topic_idx,
-                active,
-                theme,
-                &format!("{}  {}", topic.message_count, topic.name),
-            )
-        })
-        .collect::<Vec<_>>();
+    let items = if state.selected_direct_messages() {
+        state
+            .direct_conversations
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(content_height)
+            .map(|(idx, conversation)| {
+                selected_item(
+                    idx == state.topic_idx,
+                    active,
+                    theme,
+                    &format!(
+                        "{}  {}",
+                        conversation.message_count,
+                        direct_conversation_label(conversation)
+                    ),
+                )
+            })
+            .collect::<Vec<_>>()
+    } else {
+        state
+            .topics
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(content_height)
+            .map(|(idx, topic)| {
+                selected_item(
+                    idx == state.topic_idx,
+                    active,
+                    theme,
+                    &format!("{}  {}", topic.message_count, topic.name),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
     frame.render_widget(
         List::new(items)
             .style(Style::default().fg(theme.text).bg(theme.background))
-            .block(block("Topics", active, theme)),
+            .block(block(
+                if state.selected_direct_messages() {
+                    "Participants"
+                } else {
+                    "Topics"
+                },
+                active,
+                theme,
+            )),
         area,
     );
 }
@@ -1511,8 +1668,7 @@ fn draw_overlay(frame: &mut Frame<'_>, state: &TuiState, app: &App, theme: &TuiT
         Mode::SearchInput => format!("Search cached messages\n\n{}", state.input),
         Mode::Command => format!("Command palette\n\n{}", state.input),
         Mode::Composer => {
-            let stream = state.selected_stream().unwrap_or("no stream");
-            let topic = state.selected_topic().unwrap_or("no topic");
+            let destination = selected_destination_label(state);
             let realm = app
                 .settings()
                 .zulip
@@ -1526,15 +1682,14 @@ fn draw_overlay(frame: &mut Frame<'_>, state: &TuiState, app: &App, theme: &TuiT
                 .as_deref()
                 .unwrap_or("no account");
             format!(
-                "Reply draft\nRealm: {realm}\nAccount: {account}\nDestination: #{stream} > {topic}\n\n{}\n\nCtrl-S previews send, Esc cancels",
+                "Reply draft\nRealm: {realm}\nAccount: {account}\nDestination: {destination}\n\n{}\n\nCtrl-S previews send, Esc cancels",
                 state.draft
             )
         }
         Mode::ConfirmSend => {
-            let stream = state.selected_stream().unwrap_or("no stream");
-            let topic = state.selected_topic().unwrap_or("no topic");
+            let destination = selected_destination_label(state);
             format!(
-                "Send this draft?\nDestination: #{stream} > {topic}\n\n{}\n\nPress y to send, n to cancel",
+                "Send this draft?\nDestination: {destination}\n\n{}\n\nPress y to send, n to cancel",
                 state.draft
             )
         }
@@ -1731,7 +1886,7 @@ fn draw_search_results(frame: &mut Frame<'_>, state: &TuiState, theme: &TuiTheme
                     Style::default().fg(theme.message_id),
                 ),
                 Span::styled(
-                    format!("#{} > {} | ", message.stream_name, message.topic),
+                    format!("{} | ", message_destination_label(message)),
                     Style::default().fg(theme.inactive_title),
                 ),
                 Span::styled(
@@ -1773,16 +1928,20 @@ fn draw_digest(frame: &mut Frame<'_>, state: &TuiState, theme: &TuiTheme) {
         lines.push(Line::from("Unanswered questions"));
         for item in digest.unanswered_questions.iter().take(8) {
             lines.push(Line::from(format!(
-                "[{}] #{} > {} | {}",
-                item.id, item.stream, item.topic, item.text
+                "[{}] {} | {}",
+                item.id,
+                digest_item_destination(item),
+                item.text
             )));
         }
         lines.push(Line::from(""));
         lines.push(Line::from("Attention items"));
         for item in digest.likely_attention_items.iter().take(12) {
             lines.push(Line::from(format!(
-                "[{}] #{} > {} | {}",
-                item.id, item.stream, item.topic, item.text
+                "[{}] {} | {}",
+                item.id,
+                digest_item_destination(item),
+                item.text
             )));
         }
     }
@@ -2167,6 +2326,14 @@ fn is_html_spacing_tag(tag: &str) -> bool {
         tag,
         "p" | "div" | "li" | "ul" | "ol" | "blockquote" | "pre" | "tr" | "td" | "th"
     )
+}
+
+fn digest_item_destination(item: &libzul::digest::DigestItem) -> String {
+    if item.stream == "Direct messages" {
+        format!("DM: {}", item.topic)
+    } else {
+        format!("#{} > {}", item.stream, item.topic)
+    }
 }
 
 fn emoji_text(element: ElementRef<'_>) -> Option<String> {
@@ -2629,11 +2796,13 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use chrono::Utc;
     use libzul::cache::Cache;
     use libzul::config::{
         AppPaths, CacheConfig, DigestConfig, SafetyConfig, Settings, UiConfig, ZulipConfig,
     };
+    use libzul::zulip::models::ZulipDmParticipant;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -2858,6 +3027,35 @@ mod tests {
         state.refresh_from_cache(&app, false).unwrap();
 
         assert_eq!(state.messages[state.message_idx].id, 1);
+    }
+
+    #[test]
+    fn direct_messages_load_as_synthetic_left_pane_entry() {
+        let fixture = TuiFixture::new(&[1]);
+        fixture.insert_direct_messages(&[10, 11], "id:7");
+        let app = App::open(fixture.settings.clone(), false).unwrap();
+        let mut state = TuiState::load(&app).unwrap();
+
+        state.stream_idx = state.streams.len();
+        state.reload_topics(&app).unwrap();
+        state.reload_messages(&app).unwrap();
+
+        assert!(state.selected_direct_messages());
+        assert_eq!(state.direct_message_count, 2);
+        assert_eq!(state.middle_len(), 1);
+        assert_eq!(
+            direct_conversation_label(state.selected_direct_conversation().unwrap()),
+            "Grace Hopper"
+        );
+        assert_eq!(
+            state
+                .messages
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>(),
+            [10, 11]
+        );
+        assert_eq!(selected_destination_label(&state), "DM: Grace Hopper");
     }
 
     #[test]
@@ -3169,6 +3367,20 @@ mod tests {
                 .collect::<Vec<_>>();
             cache.upsert_messages(&messages).unwrap();
         }
+
+        fn insert_direct_messages(&self, message_ids: &[i64], key: &str) {
+            let cache = Cache::open(&self.settings.paths.cache_file).unwrap();
+            let participants = vec![ZulipDmParticipant {
+                id: Some(7),
+                name: "Grace Hopper".to_string(),
+                email: Some("grace@example.com".to_string()),
+            }];
+            let messages = message_ids
+                .iter()
+                .map(|id| test_direct_message(*id, key, participants.clone()))
+                .collect::<Vec<_>>();
+            cache.upsert_messages(&messages).unwrap();
+        }
     }
 
     fn test_message(id: i64) -> ZulipMessage {
@@ -3182,15 +3394,42 @@ mod tests {
     fn test_message_with_html(id: i64, html: &str, text: &str) -> ZulipMessage {
         ZulipMessage {
             id,
+            message_type: ZulipMessageType::Stream,
             stream_id: Some(1),
             stream_name: "core".to_string(),
             topic: "ops".to_string(),
+            dm_conversation_key: None,
+            dm_participants: Vec::new(),
             sender_id: Some(2),
             sender_name: "Ada".to_string(),
             sender_email: Some("ada@example.com".to_string()),
             timestamp: Utc::now(),
             rendered_html: html.to_string(),
             plain_text: text.to_string(),
+            permalink: None,
+            raw_json: json!({ "id": id }),
+        }
+    }
+
+    fn test_direct_message(
+        id: i64,
+        key: &str,
+        participants: Vec<ZulipDmParticipant>,
+    ) -> ZulipMessage {
+        ZulipMessage {
+            id,
+            message_type: ZulipMessageType::Direct,
+            stream_id: None,
+            stream_name: "Direct messages".to_string(),
+            topic: "Grace Hopper".to_string(),
+            dm_conversation_key: Some(key.to_string()),
+            dm_participants: participants,
+            sender_id: Some(7),
+            sender_name: "Grace Hopper".to_string(),
+            sender_email: Some("grace@example.com".to_string()),
+            timestamp: Utc.timestamp_opt(1_700_000_000 + id, 0).unwrap(),
+            rendered_html: format!("<p>dm {id}</p>"),
+            plain_text: format!("dm {id}"),
             permalink: None,
             raw_json: json!({ "id": id }),
         }
