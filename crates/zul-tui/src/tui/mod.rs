@@ -29,7 +29,7 @@ use ratatui_image::protocol::StatefulProtocol;
 #[cfg(feature = "tui-images")]
 use ratatui_image::{Resize, StatefulImage};
 use scraper::{ElementRef, Html, Node};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 #[cfg(feature = "tui-images")]
 use std::io::Cursor;
 use std::io::{self, Stdout};
@@ -1664,9 +1664,29 @@ fn form_cursor_position(area: Rect, form: &ConfigForm) -> Option<(u16, u16)> {
 }
 
 fn draft_cursor_position(area: Rect, draft: &str) -> Option<(u16, u16)> {
-    let last_line = draft.split('\n').next_back().unwrap_or("");
-    let line_index = draft.split('\n').count().saturating_sub(1);
-    input_cursor_position(area, 5 + line_index, last_line)
+    let inner = overlay_inner_area(area)?;
+    let width = inner.width.max(1) as usize;
+    let mut visual_line_index = 5usize;
+    let mut cursor_x = 0usize;
+
+    let mut lines = draft.split('\n').peekable();
+    while let Some(line) = lines.next() {
+        let widths = wrapped_line_widths(line, width);
+        visual_line_index += widths.len().saturating_sub(1);
+        cursor_x = widths.last().copied().unwrap_or(0);
+        if lines.peek().is_some() {
+            visual_line_index += 1;
+        }
+    }
+
+    Some((
+        inner
+            .x
+            .saturating_add(cursor_x.min(inner.width.saturating_sub(1) as usize) as u16),
+        inner
+            .y
+            .saturating_add((visual_line_index as u16).min(inner.height.saturating_sub(1))),
+    ))
 }
 
 fn input_cursor_position(area: Rect, line_index: usize, text: &str) -> Option<(u16, u16)> {
@@ -2384,6 +2404,76 @@ fn display_width(value: &str) -> usize {
     UnicodeWidthStr::width(value)
 }
 
+fn wrapped_line_widths(line: &str, width: usize) -> Vec<usize> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut pending_line_width = 0usize;
+    let mut word_width = 0usize;
+    let mut whitespace_width = 0usize;
+    let mut pending_whitespace = VecDeque::new();
+    let mut non_whitespace_previous = false;
+
+    for grapheme in line.graphemes(true) {
+        let symbol_width = display_width(grapheme);
+        if symbol_width > width {
+            continue;
+        }
+
+        let is_whitespace = grapheme.chars().all(char::is_whitespace);
+        let word_found = non_whitespace_previous && is_whitespace;
+        let untrimmed_overflow =
+            pending_line_width == 0 && word_width + whitespace_width + symbol_width > width;
+
+        if word_found || untrimmed_overflow {
+            pending_line_width += whitespace_width + word_width;
+            pending_whitespace.clear();
+            whitespace_width = 0;
+            word_width = 0;
+        }
+
+        let line_full = pending_line_width >= width;
+        let pending_word_overflow =
+            symbol_width > 0 && pending_line_width + whitespace_width + word_width >= width;
+
+        if line_full || pending_word_overflow {
+            let mut remaining_width = width.saturating_sub(pending_line_width);
+            lines.push(pending_line_width);
+            pending_line_width = 0;
+
+            while let Some(width) = pending_whitespace.front().copied() {
+                if width > remaining_width {
+                    break;
+                }
+                whitespace_width = whitespace_width.saturating_sub(width);
+                remaining_width -= width;
+                pending_whitespace.pop_front();
+            }
+
+            if is_whitespace && pending_whitespace.is_empty() {
+                continue;
+            }
+        }
+
+        if is_whitespace {
+            whitespace_width += symbol_width;
+            pending_whitespace.push_back(symbol_width);
+        } else {
+            word_width += symbol_width;
+        }
+
+        non_whitespace_previous = !is_whitespace;
+    }
+
+    pending_line_width += whitespace_width + word_width;
+    if pending_line_width > 0 {
+        lines.push(pending_line_width);
+    }
+    if lines.is_empty() {
+        lines.push(0);
+    }
+    lines
+}
+
 fn reaction_line(message: &ZulipMessage, style: Style) -> Option<Line<'static>> {
     let summaries = reaction_summaries(message);
     if summaries.is_empty() {
@@ -2873,6 +2963,20 @@ mod tests {
         let area = Rect::new(10, 20, 30, 10);
 
         assert_eq!(draft_cursor_position(area, "one\ntwo"), Some((14, 27)));
+    }
+
+    #[test]
+    fn draft_cursor_follows_wrapped_sentence() {
+        let area = Rect::new(10, 20, 10, 10);
+
+        assert_eq!(draft_cursor_position(area, "one two three"), Some((16, 27)));
+    }
+
+    #[test]
+    fn draft_cursor_follows_wrapped_long_word() {
+        let area = Rect::new(10, 20, 10, 10);
+
+        assert_eq!(draft_cursor_position(area, "abcdefghijk"), Some((14, 27)));
     }
 
     #[test]
