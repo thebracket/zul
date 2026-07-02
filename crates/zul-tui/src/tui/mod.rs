@@ -90,7 +90,7 @@ struct TuiState {
     focus: Focus,
     mode: Mode,
     input: String,
-    draft: String,
+    draft: TextEditor,
     form: Option<ConfigForm>,
     status: String,
     last_poll_at: Option<DateTime<Utc>>,
@@ -176,6 +176,163 @@ struct ConfigForm {
     fields: Vec<FormField>,
     selected: usize,
     message: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TextEditor {
+    text: String,
+    cursor: usize,
+    preferred_column: Option<usize>,
+}
+
+impl TextEditor {
+    fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.text.clear();
+        self.cursor = 0;
+        self.preferred_column = None;
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        self.text.insert(self.cursor, ch);
+        self.cursor += ch.len_utf8();
+        self.preferred_column = None;
+    }
+
+    fn insert_newline(&mut self) {
+        self.insert_char('\n');
+    }
+
+    fn backspace(&mut self) {
+        let Some(previous) = self.previous_grapheme_start() else {
+            return;
+        };
+        self.text.replace_range(previous..self.cursor, "");
+        self.cursor = previous;
+        self.preferred_column = None;
+    }
+
+    fn delete(&mut self) {
+        let Some(next) = self.next_grapheme_end() else {
+            return;
+        };
+        self.text.replace_range(self.cursor..next, "");
+        self.preferred_column = None;
+    }
+
+    fn move_left(&mut self) {
+        if let Some(previous) = self.previous_grapheme_start() {
+            self.cursor = previous;
+        }
+        self.preferred_column = None;
+    }
+
+    fn move_right(&mut self) {
+        if let Some(next) = self.next_grapheme_end() {
+            self.cursor = next;
+        }
+        self.preferred_column = None;
+    }
+
+    fn move_home(&mut self) {
+        self.cursor = self.current_line_start();
+        self.preferred_column = None;
+    }
+
+    fn move_end(&mut self) {
+        self.cursor = self.current_line_end();
+        self.preferred_column = None;
+    }
+
+    fn move_up(&mut self) {
+        let line_start = self.current_line_start();
+        if line_start == 0 {
+            self.cursor = 0;
+            self.preferred_column = Some(self.preferred_column.unwrap_or_else(|| self.column()));
+            return;
+        }
+        let preferred = self.preferred_column.unwrap_or_else(|| self.column());
+        let previous_end = line_start.saturating_sub(1);
+        let previous_start = self.text[..previous_end]
+            .rfind('\n')
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+        self.cursor = self.offset_for_column(previous_start, previous_end, preferred);
+        self.preferred_column = Some(preferred);
+    }
+
+    fn move_down(&mut self) {
+        let line_end = self.current_line_end();
+        if line_end >= self.text.len() {
+            self.preferred_column = Some(self.preferred_column.unwrap_or_else(|| self.column()));
+            return;
+        }
+        let preferred = self.preferred_column.unwrap_or_else(|| self.column());
+        let next_start = line_end + 1;
+        let next_end = self.text[next_start..]
+            .find('\n')
+            .map(|idx| next_start + idx)
+            .unwrap_or(self.text.len());
+        self.cursor = self.offset_for_column(next_start, next_end, preferred);
+        self.preferred_column = Some(preferred);
+    }
+
+    fn previous_grapheme_start(&self) -> Option<usize> {
+        self.text[..self.cursor]
+            .grapheme_indices(true)
+            .last()
+            .map(|(idx, _)| idx)
+    }
+
+    fn next_grapheme_end(&self) -> Option<usize> {
+        self.text[self.cursor..]
+            .graphemes(true)
+            .next()
+            .map(|grapheme| self.cursor + grapheme.len())
+    }
+
+    fn current_line_start(&self) -> usize {
+        self.text[..self.cursor]
+            .rfind('\n')
+            .map(|idx| idx + 1)
+            .unwrap_or(0)
+    }
+
+    fn current_line_end(&self) -> usize {
+        self.text[self.cursor..]
+            .find('\n')
+            .map(|idx| self.cursor + idx)
+            .unwrap_or(self.text.len())
+    }
+
+    fn column(&self) -> usize {
+        display_width(&self.text[self.current_line_start()..self.cursor])
+    }
+
+    fn offset_for_column(&self, line_start: usize, line_end: usize, target_column: usize) -> usize {
+        let line = &self.text[line_start..line_end];
+        let mut width = 0usize;
+        let mut offset = line_start;
+        for (idx, grapheme) in line.grapheme_indices(true) {
+            let grapheme_width = display_width(grapheme);
+            if width + grapheme_width > target_column {
+                break;
+            }
+            width += grapheme_width;
+            offset = line_start + idx + grapheme.len();
+            if width == target_column {
+                break;
+            }
+        }
+        offset
+    }
 }
 
 impl ConfigForm {
@@ -355,7 +512,7 @@ impl TuiState {
             focus: Focus::Streams,
             mode: Mode::Browser,
             input: String::new(),
-            draft: String::new(),
+            draft: TextEditor::default(),
             form: None,
             status: "cache ready".to_string(),
             last_poll_at: None,
@@ -643,7 +800,7 @@ async fn handle_key(
                         state.mode = Mode::Browser;
                         return Ok(false);
                     };
-                    let draft = state.draft.clone();
+                    let draft = state.draft.as_str().to_string();
                     let send_result = match destination {
                         ReplyDestination::Stream { stream, topic } => {
                             app.reply(&stream, &topic, &draft, false, true).await
@@ -933,11 +1090,30 @@ fn maybe_spawn_selected_image_fetch(
 }
 
 async fn handle_input_key(key: KeyEvent, state: &mut TuiState, app: &App) -> Result<bool> {
-    let target = if state.mode == Mode::Composer {
-        &mut state.draft
-    } else {
-        &mut state.input
-    };
+    if state.mode == Mode::Composer {
+        match key.code {
+            KeyCode::Esc => state.mode = Mode::Browser,
+            KeyCode::Backspace => state.draft.backspace(),
+            KeyCode::Delete => state.draft.delete(),
+            KeyCode::Left => state.draft.move_left(),
+            KeyCode::Right => state.draft.move_right(),
+            KeyCode::Up => state.draft.move_up(),
+            KeyCode::Down => state.draft.move_down(),
+            KeyCode::Home => state.draft.move_home(),
+            KeyCode::End => state.draft.move_end(),
+            KeyCode::Enter => state.draft.insert_newline(),
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if !state.draft.as_str().trim().is_empty() {
+                    state.mode = Mode::ConfirmSend;
+                }
+            }
+            KeyCode::Char(c) => state.draft.insert_char(c),
+            _ => {}
+        }
+        return Ok(false);
+    }
+
+    let target = &mut state.input;
     match key.code {
         KeyCode::Esc => state.mode = Mode::Browser,
         KeyCode::Backspace => {
@@ -951,16 +1127,8 @@ async fn handle_input_key(key: KeyEvent, state: &mut TuiState, app: &App) -> Res
                 state.mode = Mode::SearchResults;
             }
             Mode::Command => run_command(state, app).await?,
-            Mode::Composer => {
-                target.push('\n');
-            }
             _ => {}
         },
-        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if state.mode == Mode::Composer && !state.draft.trim().is_empty() {
-                state.mode = Mode::ConfirmSend;
-            }
-        }
         KeyCode::Char(c) => target.push(c),
         _ => {}
     }
@@ -1683,14 +1851,14 @@ fn draw_overlay(frame: &mut Frame<'_>, state: &TuiState, app: &App, theme: &TuiT
                 .unwrap_or("no account");
             format!(
                 "Reply draft\nRealm: {realm}\nAccount: {account}\nDestination: {destination}\n\n{}\n\nCtrl-S previews send, Esc cancels",
-                state.draft
+                state.draft.as_str()
             )
         }
         Mode::ConfirmSend => {
             let destination = selected_destination_label(state);
             format!(
                 "Send this draft?\nDestination: {destination}\n\n{}\n\nPress y to send, n to cancel",
-                state.draft
+                state.draft.as_str()
             )
         }
         Mode::Auth => {
@@ -1735,7 +1903,7 @@ fn overlay_cursor_position(state: &TuiState, area: Rect) -> Option<(u16, u16)> {
         Mode::SearchInput | Mode::Command => {
             input_cursor_position(area, 2, state.input.lines().next().unwrap_or(""))
         }
-        Mode::Composer => draft_cursor_position(area, &state.draft),
+        Mode::Composer => draft_cursor_position(area, state.draft.as_str(), state.draft.cursor),
         Mode::Login | Mode::Config => form_cursor_position(area, state.form.as_ref()?),
         _ => None,
     }
@@ -1817,19 +1985,27 @@ fn form_cursor_position(area: Rect, form: &ConfigForm) -> Option<(u16, u16)> {
     ))
 }
 
-fn draft_cursor_position(area: Rect, draft: &str) -> Option<(u16, u16)> {
+fn draft_cursor_position(area: Rect, draft: &str, cursor: usize) -> Option<(u16, u16)> {
     let inner = overlay_inner_area(area)?;
     let width = inner.width.max(1) as usize;
     let mut visual_line_index = 5usize;
-    let mut cursor_x = 0usize;
+    let cursor_x;
+    let cursor = cursor.min(draft.len());
+    let prefix = &draft[..cursor];
+    let mut lines = prefix.split('\n').peekable();
 
-    let mut lines = draft.split('\n').peekable();
-    while let Some(line) = lines.next() {
+    loop {
+        let Some(line) = lines.next() else {
+            cursor_x = 0;
+            break;
+        };
         let widths = wrapped_line_widths(line, width);
-        visual_line_index += widths.len().saturating_sub(1);
-        cursor_x = widths.last().copied().unwrap_or(0);
         if lines.peek().is_some() {
-            visual_line_index += 1;
+            visual_line_index += widths.len();
+        } else {
+            visual_line_index += widths.len().saturating_sub(1);
+            cursor_x = widths.last().copied().unwrap_or(0);
+            break;
         }
     }
 
@@ -3128,6 +3304,102 @@ mod tests {
     }
 
     #[test]
+    fn draft_editor_inserts_in_middle() {
+        let mut editor = TextEditor::default();
+        editor.insert_char('a');
+        editor.insert_char('c');
+        editor.move_left();
+        editor.insert_char('b');
+
+        assert_eq!(editor.as_str(), "abc");
+        assert_eq!(editor.cursor, 2);
+    }
+
+    #[test]
+    fn draft_editor_backspace_removes_previous_grapheme() {
+        let mut editor = TextEditor::default();
+        editor.insert_char('a');
+        editor.insert_char('😎');
+        editor.insert_char('b');
+        editor.move_left();
+        editor.backspace();
+
+        assert_eq!(editor.as_str(), "ab");
+        assert_eq!(editor.cursor, 1);
+    }
+
+    #[test]
+    fn draft_editor_delete_removes_current_grapheme() {
+        let mut editor = TextEditor::default();
+        editor.insert_char('a');
+        editor.insert_char('😎');
+        editor.insert_char('b');
+        editor.move_left();
+        editor.move_left();
+        editor.delete();
+
+        assert_eq!(editor.as_str(), "ab");
+        assert_eq!(editor.cursor, 1);
+    }
+
+    #[test]
+    fn draft_editor_left_right_move_by_grapheme() {
+        let mut editor = TextEditor::default();
+        editor.insert_char('a');
+        editor.insert_char('😎');
+        editor.insert_char('b');
+
+        editor.move_left();
+        assert_eq!(editor.cursor, "a😎".len());
+        editor.move_left();
+        assert_eq!(editor.cursor, "a".len());
+        editor.move_right();
+        assert_eq!(editor.cursor, "a😎".len());
+    }
+
+    #[test]
+    fn draft_editor_home_end_stay_on_current_line() {
+        let mut editor = TextEditor::default();
+        editor.insert_char('a');
+        editor.insert_newline();
+        editor.insert_char('b');
+        editor.insert_char('c');
+        editor.move_left();
+
+        editor.move_home();
+        assert_eq!(editor.cursor, "a\n".len());
+        editor.move_end();
+        assert_eq!(editor.cursor, "a\nbc".len());
+    }
+
+    #[test]
+    fn draft_editor_enter_splits_text_at_cursor() {
+        let mut editor = TextEditor::default();
+        editor.insert_char('a');
+        editor.insert_char('b');
+        editor.move_left();
+        editor.insert_newline();
+
+        assert_eq!(editor.as_str(), "a\nb");
+        assert_eq!(editor.cursor, "a\n".len());
+    }
+
+    #[test]
+    fn draft_editor_up_down_preserve_column() {
+        let mut editor = TextEditor::default();
+        for ch in "one\nthree\nx".chars() {
+            editor.insert_char(ch);
+        }
+
+        editor.move_up();
+        assert_eq!(editor.cursor, "one\n".len() + 1);
+        editor.move_up();
+        assert_eq!(editor.cursor, "o".len());
+        editor.move_down();
+        assert_eq!(editor.cursor, "one\nt".len());
+    }
+
+    #[test]
     fn empty_input_cursor_starts_on_input_line() {
         let area = Rect::new(10, 20, 30, 10);
 
@@ -3162,21 +3434,64 @@ mod tests {
     fn draft_cursor_follows_last_draft_line() {
         let area = Rect::new(10, 20, 30, 10);
 
-        assert_eq!(draft_cursor_position(area, "one\ntwo"), Some((14, 27)));
+        assert_eq!(
+            draft_cursor_position(area, "one\ntwo", "one\ntwo".len()),
+            Some((14, 27))
+        );
     }
 
     #[test]
     fn draft_cursor_follows_wrapped_sentence() {
         let area = Rect::new(10, 20, 10, 10);
 
-        assert_eq!(draft_cursor_position(area, "one two three"), Some((16, 27)));
+        assert_eq!(
+            draft_cursor_position(area, "one two three", "one two three".len()),
+            Some((16, 27))
+        );
     }
 
     #[test]
     fn draft_cursor_follows_wrapped_long_word() {
         let area = Rect::new(10, 20, 10, 10);
 
-        assert_eq!(draft_cursor_position(area, "abcdefghijk"), Some((14, 27)));
+        assert_eq!(
+            draft_cursor_position(area, "abcdefghijk", "abcdefghijk".len()),
+            Some((14, 27))
+        );
+    }
+
+    #[test]
+    fn draft_cursor_can_sit_in_middle_of_line() {
+        let area = Rect::new(10, 20, 30, 10);
+
+        assert_eq!(draft_cursor_position(area, "one two", 3), Some((14, 26)));
+    }
+
+    #[test]
+    fn draft_cursor_can_sit_on_earlier_multiline_line() {
+        let area = Rect::new(10, 20, 30, 10);
+
+        assert_eq!(draft_cursor_position(area, "one\ntwo", 1), Some((12, 26)));
+    }
+
+    #[test]
+    fn draft_cursor_counts_wide_emoji_before_cursor() {
+        let area = Rect::new(10, 20, 30, 10);
+
+        assert_eq!(
+            draft_cursor_position(area, "a😎b", "a😎".len()),
+            Some((14, 26))
+        );
+    }
+
+    #[test]
+    fn draft_cursor_can_sit_inside_wrapped_text() {
+        let area = Rect::new(10, 20, 10, 10);
+
+        assert_eq!(
+            draft_cursor_position(area, "one two three", "one two".len()),
+            Some((18, 26))
+        );
     }
 
     #[test]
