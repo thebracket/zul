@@ -1,6 +1,11 @@
+use crate::zulip::events::{
+    ChannelSubscriptionOptions, EventQueue, EventQueueOptions, EventsPage, GetEventsResponse,
+    MessageSubscription, RegisterEventQueueResponse, ZulipEvent,
+};
 use crate::zulip::models::{
-    CurrentUser, CurrentUserResponse, ImageBytes, MessagesResponse, SendMessageResponse,
-    SubscriptionsResponse, UploadFileResponse, ZulipApiResponse, ZulipMessage, ZulipStream,
+    CurrentUser, CurrentUserResponse, EmptyResponse, ImageBytes, MessagesResponse,
+    SendMessageResponse, SubscriptionsResponse, UploadFileResponse, ZulipApiResponse, ZulipMessage,
+    ZulipStream,
 };
 use crate::zulip::normalize;
 use anyhow::{Context, Result};
@@ -9,6 +14,7 @@ use reqwest::multipart::{Form, Part};
 use reqwest::Client;
 use serde_json::json;
 use std::collections::HashSet;
+use tokio::sync::{mpsc, oneshot};
 
 const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 
@@ -344,6 +350,103 @@ impl ZulipClient {
         })
     }
 
+    /// Register a Zulip real-time event queue.
+    pub async fn register_event_queue(&self, options: &EventQueueOptions) -> Result<EventQueue> {
+        let event_types = serde_json::to_string(&options.event_types)?;
+        let narrow = serde_json::to_string(&options.narrow)?;
+        let all_public_streams = options.all_public_streams.to_string();
+        let mut form = vec![
+            ("event_types", event_types),
+            ("apply_markdown", "true".to_string()),
+            ("client_gravatar", "false".to_string()),
+            ("all_public_streams", all_public_streams),
+        ];
+        if !options.narrow.is_empty() {
+            form.push(("narrow", narrow));
+        }
+        let idle_queue_timeout;
+        if let Some(timeout) = options.idle_queue_timeout_secs {
+            idle_queue_timeout = timeout.to_string();
+            form.push(("idle_queue_timeout", idle_queue_timeout));
+        }
+        let data = self
+            .post("/api/v1/register")
+            .form(&form)
+            .send()
+            .await?
+            .json::<ZulipApiResponse<RegisterEventQueueResponse>>()
+            .await?
+            .into_data()?;
+        let queue_id = data
+            .queue_id
+            .context("register event queue response missing queue_id")?;
+        Ok(EventQueue {
+            queue_id,
+            last_event_id: data.last_event_id,
+            idle_queue_timeout_secs: data.idle_queue_timeout_secs,
+            longpoll_timeout_seconds: data.event_queue_longpoll_timeout_seconds,
+        })
+    }
+
+    /// Fetch events from a registered Zulip event queue.
+    pub async fn get_events(
+        &self,
+        queue_id: &str,
+        last_event_id: i64,
+        dont_block: bool,
+    ) -> Result<EventsPage> {
+        let last_event_id = last_event_id.to_string();
+        let dont_block = dont_block.to_string();
+        let data = self
+            .get("/api/v1/events")
+            .query(&[
+                ("queue_id", queue_id),
+                ("last_event_id", last_event_id.as_str()),
+                ("dont_block", dont_block.as_str()),
+            ])
+            .send()
+            .await?
+            .json::<ZulipApiResponse<GetEventsResponse>>()
+            .await?
+            .into_data()?;
+        let queue_id = data.queue_id.unwrap_or_else(|| queue_id.to_string());
+        let events = data
+            .events
+            .into_iter()
+            .map(parse_event)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(EventsPage { queue_id, events })
+    }
+
+    /// Delete a Zulip event queue.
+    pub async fn delete_event_queue(&self, queue_id: &str) -> Result<()> {
+        self.delete("/api/v1/events")
+            .form(&[("queue_id", queue_id)])
+            .send()
+            .await?
+            .json::<ZulipApiResponse<EmptyResponse>>()
+            .await?
+            .into_data()?;
+        Ok(())
+    }
+
+    /// Subscribe to messages from one Zulip channel.
+    pub async fn subscribe_channel(
+        &self,
+        options: ChannelSubscriptionOptions,
+    ) -> Result<MessageSubscription> {
+        let event_options = options.event_queue_options();
+        let queue = self.register_event_queue(&event_options).await?;
+        let buffer = options.buffer.max(1);
+        let (tx, rx) = mpsc::channel(buffer);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let client = self.clone();
+        tokio::spawn(async move {
+            run_channel_subscription(client, event_options, queue, tx, shutdown_rx).await;
+        });
+        Ok(MessageSubscription::new(rx, shutdown_tx))
+    }
+
     fn get(&self, path: &str) -> reqwest::RequestBuilder {
         self.http
             .get(format!("{}{}", self.base_url, path))
@@ -355,6 +458,87 @@ impl ZulipClient {
             .post(format!("{}{}", self.base_url, path))
             .basic_auth(&self.email, Some(&self.api_key))
     }
+
+    fn delete(&self, path: &str) -> reqwest::RequestBuilder {
+        self.http
+            .delete(format!("{}{}", self.base_url, path))
+            .basic_auth(&self.email, Some(&self.api_key))
+    }
+}
+
+fn parse_event(raw: serde_json::Value) -> Result<ZulipEvent> {
+    let id = raw
+        .get("id")
+        .and_then(|value| value.as_i64())
+        .context("event missing id")?;
+    let event_type = raw
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    Ok(ZulipEvent {
+        id,
+        event_type,
+        raw_json: raw,
+    })
+}
+
+async fn run_channel_subscription(
+    client: ZulipClient,
+    event_options: EventQueueOptions,
+    mut queue: EventQueue,
+    tx: mpsc::Sender<Result<ZulipMessage>>,
+    mut shutdown: oneshot::Receiver<()>,
+) {
+    let mut re_registered_after_bad_queue = false;
+    loop {
+        let result = tokio::select! {
+            _ = &mut shutdown => break,
+            result = client.get_events(&queue.queue_id, queue.last_event_id, false) => result,
+        };
+
+        match result {
+            Ok(page) => {
+                re_registered_after_bad_queue = false;
+                for event in page.events {
+                    queue.last_event_id = queue.last_event_id.max(event.id);
+                    if event.event_type != "message" {
+                        continue;
+                    }
+                    let Some(message_json) = event.raw_json.get("message").cloned() else {
+                        continue;
+                    };
+                    let message =
+                        normalize::message(message_json).context("normalizing Zulip message event");
+                    if tx.send(message).await.is_err() {
+                        let _ = client.delete_event_queue(&queue.queue_id).await;
+                        return;
+                    }
+                }
+            }
+            Err(err) if err.to_string().contains("BAD_EVENT_QUEUE_ID") => {
+                if re_registered_after_bad_queue {
+                    let _ = tx.send(Err(err)).await;
+                    break;
+                }
+                match client.register_event_queue(&event_options).await {
+                    Ok(new_queue) => {
+                        queue = new_queue;
+                        re_registered_after_bad_queue = true;
+                    }
+                    Err(register_err) => {
+                        let _ = tx.send(Err(register_err)).await;
+                        break;
+                    }
+                }
+            }
+            Err(err) => {
+                let _ = tx.send(Err(err)).await;
+                break;
+            }
+        }
+    }
+    let _ = client.delete_event_queue(&queue.queue_id).await;
 }
 
 #[cfg(test)]

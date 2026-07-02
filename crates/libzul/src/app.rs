@@ -2,6 +2,7 @@ use crate::auth::AuthStatus;
 use crate::cache::{send_hash, Cache, StreamActivity, SyncRecord};
 use crate::config::Settings;
 use crate::zulip::client::{UploadedFile, ZulipClient};
+use crate::zulip::events::{ChannelSubscriptionOptions, MessageSubscription};
 use crate::zulip::images;
 use crate::zulip::models::{
     ImageAttachment, ImageBytes, ZulipDirectConversation, ZulipDmParticipant, ZulipMessage,
@@ -14,6 +15,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
+use tokio::sync::{mpsc, oneshot};
 
 const POLL_AUTHORED_REFRESH_BATCH: usize = 5;
 const SYNC_AUTHORED_REFRESH_BATCH: usize = 100;
@@ -391,6 +393,56 @@ impl App {
         client
             .upload_file_bytes(filename, content_type, bytes)
             .await
+    }
+
+    /// Subscribe to messages from one Zulip channel, optionally updating the local cache.
+    pub async fn subscribe_channel(
+        &self,
+        options: ChannelSubscriptionOptions,
+    ) -> Result<MessageSubscription> {
+        if self.offline {
+            anyhow::bail!("offline mode cannot subscribe to Zulip events");
+        }
+        let client = self.client()?;
+        if !options.cache {
+            return client.subscribe_channel(options).await;
+        }
+
+        let cache_path = self.settings.paths.cache_file.clone();
+        let buffer = options.buffer.max(1);
+        let mut inner = client.subscribe_channel(options).await?;
+        let (tx, rx) = mpsc::channel(buffer);
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            loop {
+                let event = tokio::select! {
+                    _ = &mut shutdown_rx => {
+                        inner.close();
+                        break;
+                    }
+                    event = inner.recv() => event,
+                };
+                let Some(result) = event else {
+                    break;
+                };
+                let outgoing = match result {
+                    Ok(message) => {
+                        match Cache::open(&cache_path)
+                            .and_then(|cache| cache.upsert_messages(std::slice::from_ref(&message)))
+                        {
+                            Ok(()) => Ok(message),
+                            Err(err) => Err(err),
+                        }
+                    }
+                    Err(err) => Err(err),
+                };
+                if tx.send(outgoing).await.is_err() {
+                    inner.close();
+                    break;
+                }
+            }
+        });
+        Ok(MessageSubscription::new(rx, shutdown_tx))
     }
 
     /// Build Zulip Markdown for an uploaded file link.

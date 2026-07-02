@@ -170,6 +170,8 @@ pub struct ZulipApiResponse<T> {
     pub result: String,
     /// Zulip message text for errors or status details.
     pub msg: String,
+    /// Zulip machine-readable error code, when present.
+    pub code: Option<String>,
     #[serde(flatten)]
     /// Endpoint-specific response payload.
     pub data: T,
@@ -227,11 +229,17 @@ pub struct UploadFileResponse {
     pub filename: Option<String>,
 }
 
+/// Empty response payload for endpoints that only return the Zulip envelope.
+#[derive(Debug, Deserialize)]
+pub struct EmptyResponse {}
+
 impl<T> ZulipApiResponse<T> {
     /// Return the endpoint payload or convert a Zulip error into an `anyhow` error.
     pub fn into_data(self) -> anyhow::Result<T> {
         if self.result == "success" {
             Ok(self.data)
+        } else if let Some(code) = self.code {
+            anyhow::bail!("Zulip API error {code}: {}", self.msg);
         } else {
             anyhow::bail!("Zulip API error: {}", self.msg);
         }

@@ -9,6 +9,11 @@ pub fn print_json<T: Serialize + ?Sized>(value: &T) -> Result<()> {
     Ok(())
 }
 
+pub fn print_json_line<T: Serialize + ?Sized>(value: &T) -> Result<()> {
+    println!("{}", serde_json::to_string(value)?);
+    Ok(())
+}
+
 pub struct PrintMode {
     pub json: bool,
 }

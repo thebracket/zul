@@ -1,6 +1,9 @@
-use crate::output::{print_json, PrintMode};
+use crate::output::{print_json, print_json_line, PrintMode};
+use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
+use libzul::zulip::events::ChannelSubscriptionOptions;
 use libzul::{digest, App, AuthLogin, AuthStatus, Settings};
+use std::time::Duration;
 
 #[derive(Debug, Parser)]
 #[command(name = "zul-cli", version, about = "Terminal-first Zulip client")]
@@ -26,12 +29,21 @@ enum Command {
     Search(SearchArgs),
     Digest(DigestArgs),
     Reply(ReplyArgs),
+    Events {
+        #[command(subcommand)]
+        command: EventsCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
     Login(AuthLoginArgs),
     Status,
+}
+
+#[derive(Debug, Subcommand)]
+enum EventsCommand {
+    Channel(EventsChannelArgs),
 }
 
 #[derive(Debug, Args)]
@@ -84,6 +96,21 @@ struct ReplyArgs {
     dry_run: bool,
     #[arg(long)]
     yes: bool,
+}
+
+#[derive(Debug, Args)]
+struct EventsChannelArgs {
+    channel: String,
+    #[arg(long)]
+    topic: Option<String>,
+    #[arg(long)]
+    no_cache: bool,
+    #[arg(long, default_value_t = 100)]
+    buffer: usize,
+    #[arg(long)]
+    max_messages: Option<usize>,
+    #[arg(long)]
+    timeout_seconds: Option<u64>,
 }
 
 pub async fn run() -> anyhow::Result<()> {
@@ -174,8 +201,53 @@ pub async fn run() -> anyhow::Result<()> {
                 .await?;
             mode.print_reply(&result)?;
         }
+        Command::Events { command } => match command {
+            EventsCommand::Channel(args) => {
+                let app = App::open(settings, cli.offline)?;
+                listen_channel(&app, args).await?;
+            }
+        },
     }
 
+    Ok(())
+}
+
+async fn listen_channel(app: &App, args: EventsChannelArgs) -> anyhow::Result<()> {
+    let mut options = ChannelSubscriptionOptions::new(args.channel);
+    options.topic = args.topic;
+    options.buffer = args.buffer;
+    options.cache = !args.no_cache;
+    let mut subscription = app.subscribe_channel(options).await?;
+    let mut seen = 0usize;
+    let deadline = args
+        .timeout_seconds
+        .map(|seconds| tokio::time::Instant::now() + Duration::from_secs(seconds));
+
+    loop {
+        if args.max_messages.is_some_and(|max| seen >= max) {
+            break;
+        }
+        let event = if let Some(deadline) = deadline {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            match tokio::time::timeout_at(deadline, subscription.recv()).await {
+                Ok(event) => event,
+                Err(_) => break,
+            }
+        } else {
+            subscription.recv().await
+        };
+
+        let Some(message) = event else {
+            break;
+        };
+        let message = message.context("receiving Zulip channel event")?;
+        print_json_line(&message)?;
+        seen += 1;
+    }
+    subscription.close();
     Ok(())
 }
 
