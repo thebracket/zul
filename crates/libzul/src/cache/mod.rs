@@ -7,6 +7,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -408,6 +409,24 @@ impl Cache {
         Ok(activity)
     }
 
+    /// Return unread cached message counts grouped by stream.
+    pub fn unread_stream_activity(&self) -> Result<Vec<StreamActivity>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.stream_name, COUNT(*)
+             FROM zulip_messages m
+             LEFT JOIN read_state r ON r.message_id = m.id AND r.read_at IS NOT NULL
+             WHERE m.message_type = 'stream' AND r.message_id IS NULL
+             GROUP BY m.stream_name",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(StreamActivity {
+                stream_name: row.get(0)?,
+                message_count: row.get(1)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// Return the number of cached direct messages.
     pub fn direct_message_count(&self) -> Result<i64> {
         self.conn
@@ -417,6 +436,88 @@ impl Cache {
                 |row| row.get(0),
             )
             .map_err(Into::into)
+    }
+
+    /// Return the number of unread cached direct messages.
+    pub fn unread_direct_message_count(&self) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM zulip_messages m
+                 LEFT JOIN read_state r ON r.message_id = m.id AND r.read_at IS NOT NULL
+                 WHERE m.message_type = 'direct' AND r.message_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// Return unread message counts keyed by topic name for one stream.
+    pub fn unread_topic_counts(&self, stream: &str) -> Result<BTreeMap<String, i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.topic, COUNT(*)
+             FROM zulip_messages m
+             LEFT JOIN read_state r ON r.message_id = m.id AND r.read_at IS NOT NULL
+             WHERE m.stream_name = ?1
+                AND m.message_type = 'stream'
+                AND r.message_id IS NULL
+             GROUP BY m.topic",
+        )?;
+        let rows = stmt.query_map(params![stream], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<BTreeMap<_, _>>>()?)
+    }
+
+    /// Return unread message counts keyed by direct-conversation key.
+    pub fn unread_direct_conversation_counts(&self) -> Result<BTreeMap<String, i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.dm_conversation_key, COUNT(*)
+             FROM zulip_messages m
+             LEFT JOIN read_state r ON r.message_id = m.id AND r.read_at IS NOT NULL
+             WHERE m.message_type = 'direct'
+                AND m.dm_conversation_key IS NOT NULL
+                AND r.message_id IS NULL
+             GROUP BY m.dm_conversation_key",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<BTreeMap<_, _>>>()?)
+    }
+
+    /// Mark cached message IDs as read.
+    pub fn mark_messages_read(&self, message_ids: &[i64]) -> Result<()> {
+        let read_at = Utc::now().timestamp();
+        for message_id in message_ids {
+            self.conn.execute(
+                "INSERT INTO read_state (message_id, read_at)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(message_id) DO UPDATE SET read_at = excluded.read_at",
+                params![message_id, read_at],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Return the subset of message IDs that have been marked read.
+    pub fn read_message_ids(&self, message_ids: &[i64]) -> Result<BTreeSet<i64>> {
+        let mut read_ids = BTreeSet::new();
+        for message_id in message_ids {
+            let is_read = self
+                .conn
+                .query_row(
+                    "SELECT 1 FROM read_state WHERE message_id = ?1 AND read_at IS NOT NULL",
+                    params![message_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if is_read {
+                read_ids.insert(*message_id);
+            }
+        }
+        Ok(read_ids)
     }
 
     /// List cached direct-message conversations.
@@ -734,6 +835,85 @@ mod tests {
                 .map(|message| message.id)
                 .collect::<Vec<_>>(),
             [1, 2]
+        );
+    }
+
+    #[test]
+    fn unread_counts_exclude_read_messages() {
+        let cache = Cache::in_memory().unwrap();
+        let participants = vec![ZulipDmParticipant {
+            id: Some(7),
+            name: "Ada".to_string(),
+            email: Some("ada@example.com".to_string()),
+        }];
+        cache
+            .upsert_messages(&[
+                test_message(1, "ada@example.com"),
+                test_message(2, "ada@example.com"),
+                direct_message(10, "id:7", participants.clone()),
+            ])
+            .unwrap();
+
+        assert_eq!(cache.unread_stream_activity().unwrap()[0].message_count, 2);
+        assert_eq!(
+            cache
+                .unread_topic_counts("core team")
+                .unwrap()
+                .get("Release"),
+            Some(&2)
+        );
+        assert_eq!(cache.unread_direct_message_count().unwrap(), 1);
+        assert_eq!(
+            cache
+                .unread_direct_conversation_counts()
+                .unwrap()
+                .get("id:7"),
+            Some(&1)
+        );
+
+        cache.mark_messages_read(&[1, 10]).unwrap();
+
+        assert_eq!(cache.unread_stream_activity().unwrap()[0].message_count, 1);
+        assert_eq!(
+            cache
+                .unread_topic_counts("core team")
+                .unwrap()
+                .get("Release"),
+            Some(&1)
+        );
+        assert_eq!(cache.unread_direct_message_count().unwrap(), 0);
+        assert!(cache
+            .unread_direct_conversation_counts()
+            .unwrap()
+            .get("id:7")
+            .is_none());
+        assert_eq!(cache.read_message_ids(&[1, 2, 10]).unwrap(), [1, 10].into());
+    }
+
+    #[test]
+    fn read_state_persists_after_reopening_cache() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("cache.sqlite");
+        {
+            let cache = Cache::open(&path).unwrap();
+            cache
+                .upsert_messages(&[
+                    test_message(1, "ada@example.com"),
+                    test_message(2, "ada@example.com"),
+                ])
+                .unwrap();
+            cache.mark_messages_read(&[1]).unwrap();
+        }
+
+        let cache = Cache::open(&path).unwrap();
+
+        assert_eq!(cache.read_message_ids(&[1, 2]).unwrap(), [1].into());
+        assert_eq!(
+            cache
+                .unread_topic_counts("core team")
+                .unwrap()
+                .get("Release"),
+            Some(&1)
         );
     }
 

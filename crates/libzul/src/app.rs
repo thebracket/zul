@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 
@@ -381,9 +382,39 @@ impl App {
         self.cache.stream_activity()
     }
 
+    /// Return unread cached message counts per stream.
+    pub fn unread_stream_activity(&self) -> Result<Vec<StreamActivity>> {
+        self.cache.unread_stream_activity()
+    }
+
     /// Return the number of cached direct messages.
     pub fn direct_message_count(&self) -> Result<i64> {
         self.cache.direct_message_count()
+    }
+
+    /// Return the number of unread cached direct messages.
+    pub fn unread_direct_message_count(&self) -> Result<i64> {
+        self.cache.unread_direct_message_count()
+    }
+
+    /// Return unread message counts keyed by topic for a stream.
+    pub fn unread_topic_counts(&self, stream: &str) -> Result<BTreeMap<String, i64>> {
+        self.cache.unread_topic_counts(stream)
+    }
+
+    /// Return unread message counts keyed by direct-conversation key.
+    pub fn unread_direct_conversation_counts(&self) -> Result<BTreeMap<String, i64>> {
+        self.cache.unread_direct_conversation_counts()
+    }
+
+    /// Mark cached message IDs as read.
+    pub fn mark_messages_read(&self, message_ids: &[i64]) -> Result<()> {
+        self.cache.mark_messages_read(message_ids)
+    }
+
+    /// Return the subset of message IDs that have been marked read.
+    pub fn read_message_ids(&self, message_ids: &[i64]) -> Result<BTreeSet<i64>> {
+        self.cache.read_message_ids(message_ids)
     }
 
     /// Return the last recorded recent-sync state.

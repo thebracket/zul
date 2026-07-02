@@ -81,8 +81,11 @@ struct TuiState {
     messages: Vec<ZulipMessage>,
     search_results: Vec<ZulipMessage>,
     digest: Option<Digest>,
-    stream_activity: BTreeMap<String, i64>,
-    direct_message_count: i64,
+    stream_unread_counts: BTreeMap<String, i64>,
+    direct_unread_count: i64,
+    topic_unread_counts: BTreeMap<String, i64>,
+    direct_unread_counts: BTreeMap<String, i64>,
+    read_message_ids: BTreeSet<i64>,
     stream_idx: usize,
     topic_idx: usize,
     message_idx: usize,
@@ -499,12 +502,15 @@ impl TuiState {
             messages: Vec::new(),
             search_results: Vec::new(),
             digest: None,
-            stream_activity: app
-                .stream_activity()?
+            stream_unread_counts: app
+                .unread_stream_activity()?
                 .into_iter()
                 .map(|activity| (activity.stream_name, activity.message_count))
                 .collect(),
-            direct_message_count: app.direct_message_count()?,
+            direct_unread_count: app.unread_direct_message_count()?,
+            topic_unread_counts: BTreeMap::new(),
+            direct_unread_counts: BTreeMap::new(),
+            read_message_ids: BTreeSet::new(),
             stream_idx: 0,
             topic_idx: 0,
             message_idx: 0,
@@ -524,6 +530,7 @@ impl TuiState {
         state.reload_topics(app)?;
         state.reload_messages(app)?;
         state.select_latest_message();
+        state.mark_selected_thread_read_if_at_end(app)?;
         if let Some(credentials) =
             startup_credentials.filter(|credentials| !credentials.is_complete())
         {
@@ -575,12 +582,19 @@ impl TuiState {
         if self.selected_direct_messages() {
             self.topics = Vec::new();
             self.direct_conversations = app.direct_conversations()?;
+            self.topic_unread_counts.clear();
+            self.direct_unread_counts = app.unread_direct_conversation_counts()?;
         } else {
             self.direct_conversations = Vec::new();
             self.topics = match self.selected_stream() {
                 Some(stream) => app.topics(stream)?,
                 None => Vec::new(),
             };
+            self.topic_unread_counts = match self.selected_stream() {
+                Some(stream) => app.unread_topic_counts(stream)?,
+                None => BTreeMap::new(),
+            };
+            self.direct_unread_counts.clear();
         }
         self.topic_idx = self.topic_idx.min(self.middle_len().saturating_sub(1));
         Ok(())
@@ -596,6 +610,7 @@ impl TuiState {
             }
         };
         self.message_idx = self.message_idx.min(self.messages.len().saturating_sub(1));
+        self.refresh_message_read_status(app)?;
         Ok(())
     }
 
@@ -612,15 +627,18 @@ impl TuiState {
                 self.reload_topics(app)?;
                 self.reload_messages(app)?;
                 self.select_latest_message();
+                self.mark_selected_thread_read_if_at_end(app)?;
             }
             Focus::Topics => {
                 self.topic_idx = move_index(self.topic_idx, self.middle_len(), delta);
                 self.message_idx = 0;
                 self.reload_messages(app)?;
                 self.select_latest_message();
+                self.mark_selected_thread_read_if_at_end(app)?;
             }
             Focus::Thread => {
                 self.message_idx = move_index(self.message_idx, self.messages.len(), delta);
+                self.mark_selected_thread_read_if_at_end(app)?;
             }
         }
         Ok(())
@@ -630,7 +648,7 @@ impl TuiState {
         self.messages.is_empty() || self.message_idx >= self.messages.len().saturating_sub(1)
     }
 
-    fn refresh_from_cache(&mut self, app: &App, follow_if_was_at_end: bool) -> Result<()> {
+    fn refresh_from_cache(&mut self, app: &App) -> Result<()> {
         let selected_stream = self.selected_stream().map(ToString::to_string);
         let selected_topic = self.selected_topic().map(ToString::to_string);
         let selected_direct = self.selected_direct_messages();
@@ -643,12 +661,12 @@ impl TuiState {
             .map(|message| message.id);
 
         self.streams = app.streams()?;
-        self.stream_activity = app
-            .stream_activity()?
+        self.stream_unread_counts = app
+            .unread_stream_activity()?
             .into_iter()
             .map(|activity| (activity.stream_name, activity.message_count))
             .collect();
-        self.direct_message_count = app.direct_message_count()?;
+        self.direct_unread_count = app.unread_direct_message_count()?;
 
         self.stream_idx = if selected_direct {
             self.streams.len()
@@ -677,9 +695,7 @@ impl TuiState {
         };
 
         self.reload_messages(app)?;
-        if follow_if_was_at_end {
-            self.message_idx = self.messages.len().saturating_sub(1);
-        } else if let Some(message_id) = selected_message_id {
+        if let Some(message_id) = selected_message_id {
             self.message_idx = self
                 .messages
                 .iter()
@@ -688,8 +704,54 @@ impl TuiState {
         } else {
             self.message_idx = self.message_idx.min(self.messages.len().saturating_sub(1));
         }
+        self.refresh_message_read_status(app)?;
+        self.mark_selected_thread_read_if_at_end(app)?;
 
         Ok(())
+    }
+
+    fn refresh_unread_counts(&mut self, app: &App) -> Result<()> {
+        self.stream_unread_counts = app
+            .unread_stream_activity()?
+            .into_iter()
+            .map(|activity| (activity.stream_name, activity.message_count))
+            .collect();
+        self.direct_unread_count = app.unread_direct_message_count()?;
+        if self.selected_direct_messages() {
+            self.topic_unread_counts.clear();
+            self.direct_unread_counts = app.unread_direct_conversation_counts()?;
+        } else {
+            self.direct_unread_counts.clear();
+            self.topic_unread_counts = match self.selected_stream() {
+                Some(stream) => app.unread_topic_counts(stream)?,
+                None => BTreeMap::new(),
+            };
+        }
+        Ok(())
+    }
+
+    fn refresh_message_read_status(&mut self, app: &App) -> Result<()> {
+        let message_ids = self
+            .messages
+            .iter()
+            .map(|message| message.id)
+            .collect::<Vec<_>>();
+        self.read_message_ids = app.read_message_ids(&message_ids)?;
+        Ok(())
+    }
+
+    fn mark_selected_thread_read_if_at_end(&mut self, app: &App) -> Result<()> {
+        if !self.thread_at_end() {
+            return Ok(());
+        }
+        let message_ids = self
+            .messages
+            .iter()
+            .map(|message| message.id)
+            .collect::<Vec<_>>();
+        app.mark_messages_read(&message_ids)?;
+        self.refresh_message_read_status(app)?;
+        self.refresh_unread_counts(app)
     }
 
     fn focus_left(&mut self) {
@@ -811,10 +873,9 @@ async fn handle_key(
                     };
                     match send_result {
                         Ok(_) => {
-                            let was_at_end = state.thread_at_end();
                             match app.poll_new_messages().await {
                                 Ok(result) => {
-                                    state.refresh_from_cache(app, true)?;
+                                    state.refresh_from_cache(app)?;
                                     state.last_poll_at = Some(Utc::now());
                                     state.last_poll_new = result.new_messages;
                                     state.poll_error = None;
@@ -824,9 +885,7 @@ async fn handle_key(
                                     );
                                 }
                                 Err(err) => {
-                                    if was_at_end {
-                                        state.refresh_from_cache(app, true)?;
-                                    }
+                                    state.refresh_from_cache(app)?;
                                     state.status = format!("sent draft; refresh failed: {err}");
                                 }
                             }
@@ -880,8 +939,7 @@ async fn handle_key(
         }
         KeyCode::Char('R') => match app.sync(app.settings().cache.default_sync_hours).await {
             Ok(sync) => {
-                let was_at_end = state.thread_at_end();
-                state.refresh_from_cache(app, was_at_end)?;
+                state.refresh_from_cache(app)?;
                 state.status = format!("synced {} messages", sync.messages);
             }
             Err(err) => state.status = format!("sync failed: {err}"),
@@ -934,8 +992,7 @@ fn drain_poll_events(
         *poll_inflight = false;
         match event {
             Ok(result) => {
-                let was_at_end = state.thread_at_end();
-                state.refresh_from_cache(app, was_at_end)?;
+                state.refresh_from_cache(app)?;
                 state.last_poll_at = Some(Utc::now());
                 state.last_poll_new = result.new_messages;
                 state.poll_error = None;
@@ -1555,12 +1612,12 @@ fn draw_streams(frame: &mut Frame<'_>, area: Rect, state: &TuiState, theme: &Tui
         .take(content_height)
         .map(|idx| {
             let (count, name) = if idx == state.streams.len() {
-                (state.direct_message_count, "Direct messages".to_string())
+                (state.direct_unread_count, "Direct messages".to_string())
             } else {
                 let stream = &state.streams[idx];
                 (
                     state
-                        .stream_activity
+                        .stream_unread_counts
                         .get(&stream.name)
                         .copied()
                         .unwrap_or(0),
@@ -1602,7 +1659,11 @@ fn draw_topics(frame: &mut Frame<'_>, area: Rect, state: &TuiState, theme: &TuiT
                     theme,
                     &format!(
                         "{}  {}",
-                        conversation.message_count,
+                        state
+                            .direct_unread_counts
+                            .get(&conversation.key)
+                            .copied()
+                            .unwrap_or(0),
                         direct_conversation_label(conversation)
                     ),
                 )
@@ -1620,7 +1681,15 @@ fn draw_topics(frame: &mut Frame<'_>, area: Rect, state: &TuiState, theme: &TuiT
                     idx == state.topic_idx,
                     active,
                     theme,
-                    &format!("{}  {}", topic.message_count, topic.name),
+                    &format!(
+                        "{}  {}",
+                        state
+                            .topic_unread_counts
+                            .get(&topic.name)
+                            .copied()
+                            .unwrap_or(0),
+                        topic.name
+                    ),
                 )
             })
             .collect::<Vec<_>>()
@@ -1662,6 +1731,7 @@ fn draw_thread(
         app,
         image_slot_rows,
         now,
+        &state.read_message_ids,
     );
     let selected_line = selected_message_line_start(&state.messages, state.message_idx, width, app);
     let start = visible_line_start(selected_line, all_lines.len(), content_height);
@@ -2333,13 +2403,21 @@ fn thread_lines(
     app: &App,
     image_slot_rows: u16,
     now: DateTime<Utc>,
+    read_message_ids: &BTreeSet<i64>,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for (idx, message) in messages.iter().enumerate() {
         let selected = idx == selected_idx;
+        let unread = !read_message_ids.contains(&message.id);
         let header_style = Style::default().bg(theme.background);
         let marker_style = Style::default().fg(theme.text).bg(theme.background);
-        let selection_marker = if selected { " > " } else { "   " };
+        let selection_marker = if selected {
+            " > "
+        } else if unread {
+            " * "
+        } else {
+            "   "
+        };
         lines.push(Line::from(vec![
             Span::styled(selection_marker, marker_style),
             Span::styled(
@@ -3128,16 +3206,60 @@ mod tests {
     }
 
     #[test]
-    fn refresh_follows_when_thread_was_at_end() {
+    fn initial_selected_thread_is_marked_read() {
+        let fixture = TuiFixture::new(&[1, 2, 3]);
+        let app = App::open(fixture.settings.clone(), false).unwrap();
+        let state = TuiState::load(&app).unwrap();
+
+        assert_eq!(state.messages[state.message_idx].id, 3);
+        assert_eq!(state.read_message_ids, [1, 2, 3].into());
+        assert_eq!(
+            state.stream_unread_counts.get("core").copied().unwrap_or(0),
+            0
+        );
+        assert_eq!(
+            state.topic_unread_counts.get("ops").copied().unwrap_or(0),
+            0
+        );
+    }
+
+    #[test]
+    fn refresh_preserves_cursor_and_keeps_new_messages_unread() {
         let fixture = TuiFixture::new(&[1, 2, 3]);
         let app = App::open(fixture.settings.clone(), false).unwrap();
         let mut state = TuiState::load(&app).unwrap();
         state.message_idx = 2;
 
         fixture.insert_messages(&[4]);
-        state.refresh_from_cache(&app, true).unwrap();
+        state.refresh_from_cache(&app).unwrap();
+
+        assert_eq!(state.messages[state.message_idx].id, 3);
+        assert!(!state.read_message_ids.contains(&4));
+        assert_eq!(state.stream_unread_counts.get("core"), Some(&1));
+        assert_eq!(state.topic_unread_counts.get("ops"), Some(&1));
+    }
+
+    #[test]
+    fn moving_to_new_thread_end_marks_thread_read() {
+        let fixture = TuiFixture::new(&[1, 2, 3]);
+        let app = App::open(fixture.settings.clone(), false).unwrap();
+        let mut state = TuiState::load(&app).unwrap();
+        fixture.insert_messages(&[4]);
+        state.refresh_from_cache(&app).unwrap();
+
+        state.focus = Focus::Thread;
+        state.move_selection(1, &app).unwrap();
 
         assert_eq!(state.messages[state.message_idx].id, 4);
+        assert!(state.read_message_ids.contains(&4));
+        assert_eq!(
+            state.stream_unread_counts.get("core").copied().unwrap_or(0),
+            0
+        );
+        assert_eq!(
+            state.topic_unread_counts.get("ops").copied().unwrap_or(0),
+            0
+        );
     }
 
     #[test]
@@ -3250,7 +3372,7 @@ mod tests {
         state.message_idx = 0;
 
         fixture.insert_messages(&[4]);
-        state.refresh_from_cache(&app, false).unwrap();
+        state.refresh_from_cache(&app).unwrap();
 
         assert_eq!(state.messages[state.message_idx].id, 1);
     }
@@ -3267,7 +3389,7 @@ mod tests {
         state.reload_messages(&app).unwrap();
 
         assert!(state.selected_direct_messages());
-        assert_eq!(state.direct_message_count, 2);
+        assert_eq!(state.direct_unread_count, 2);
         assert_eq!(state.middle_len(), 1);
         assert_eq!(
             direct_conversation_label(state.selected_direct_conversation().unwrap()),
@@ -3295,7 +3417,16 @@ mod tests {
         )];
         let theme = TuiTheme::zenburn();
 
-        let lines = thread_lines(&messages, 0, 80, &theme, &app, 0, Utc::now());
+        let lines = thread_lines(
+            &messages,
+            0,
+            80,
+            &theme,
+            &app,
+            0,
+            Utc::now(),
+            &BTreeSet::from([1]),
+        );
         let body = &lines[1];
 
         assert_eq!(line_text(body), "Awesome 😎 bold");
@@ -3317,7 +3448,16 @@ mod tests {
         messages[1].timestamp = now - ChronoDuration::days(1);
         let theme = TuiTheme::zenburn();
 
-        let lines = thread_lines(&messages, 1, 80, &theme, &app, 0, now);
+        let lines = thread_lines(
+            &messages,
+            1,
+            80,
+            &theme,
+            &app,
+            0,
+            now,
+            &BTreeSet::from([1, 2]),
+        );
 
         assert_eq!(line_text(&lines[0]), "   15m ago Ada");
         assert_eq!(line_text(&lines[3]), " > 1 day ago Ada");
@@ -3325,6 +3465,31 @@ mod tests {
         assert_eq!(lines[3].spans[1].style.bg, Some(theme.background));
         assert_eq!(lines[4].spans[0].style.bg, Some(theme.background));
         assert_ne!(lines[3].spans[0].style.bg, Some(theme.active_selection_bg));
+    }
+
+    #[test]
+    fn unread_thread_messages_use_star_marker() {
+        let settings = test_settings(TempDir::new().unwrap().path());
+        let app = App::open(settings, false).unwrap();
+        let messages = vec![
+            test_message_with_text(1, "first"),
+            test_message_with_text(2, "second"),
+        ];
+        let theme = TuiTheme::zenburn();
+
+        let lines = thread_lines(
+            &messages,
+            0,
+            80,
+            &theme,
+            &app,
+            0,
+            Utc::now(),
+            &BTreeSet::from([1]),
+        );
+
+        assert!(line_text(&lines[0]).starts_with(" > "));
+        assert!(line_text(&lines[3]).starts_with(" * "));
     }
 
     #[test]
@@ -3361,19 +3526,58 @@ mod tests {
         let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
 
         assert_eq!(fuzzy_time_ago(now + ChronoDuration::seconds(1), now), "now");
-        assert_eq!(fuzzy_time_ago(now - ChronoDuration::seconds(59), now), "now");
-        assert_eq!(fuzzy_time_ago(now - ChronoDuration::minutes(1), now), "1m ago");
-        assert_eq!(fuzzy_time_ago(now - ChronoDuration::minutes(15), now), "15m ago");
-        assert_eq!(fuzzy_time_ago(now - ChronoDuration::hours(1), now), "1h ago");
-        assert_eq!(fuzzy_time_ago(now - ChronoDuration::hours(23), now), "23h ago");
-        assert_eq!(fuzzy_time_ago(now - ChronoDuration::days(1), now), "1 day ago");
-        assert_eq!(fuzzy_time_ago(now - ChronoDuration::days(6), now), "6 days ago");
-        assert_eq!(fuzzy_time_ago(now - ChronoDuration::days(7), now), "1 week ago");
-        assert_eq!(fuzzy_time_ago(now - ChronoDuration::days(21), now), "3 weeks ago");
-        assert_eq!(fuzzy_time_ago(now - ChronoDuration::days(45), now), "1 month ago");
-        assert_eq!(fuzzy_time_ago(now - ChronoDuration::days(120), now), "4 months ago");
-        assert_eq!(fuzzy_time_ago(now - ChronoDuration::days(365), now), "1 year ago");
-        assert_eq!(fuzzy_time_ago(now - ChronoDuration::days(800), now), "2 years ago");
+        assert_eq!(
+            fuzzy_time_ago(now - ChronoDuration::seconds(59), now),
+            "now"
+        );
+        assert_eq!(
+            fuzzy_time_ago(now - ChronoDuration::minutes(1), now),
+            "1m ago"
+        );
+        assert_eq!(
+            fuzzy_time_ago(now - ChronoDuration::minutes(15), now),
+            "15m ago"
+        );
+        assert_eq!(
+            fuzzy_time_ago(now - ChronoDuration::hours(1), now),
+            "1h ago"
+        );
+        assert_eq!(
+            fuzzy_time_ago(now - ChronoDuration::hours(23), now),
+            "23h ago"
+        );
+        assert_eq!(
+            fuzzy_time_ago(now - ChronoDuration::days(1), now),
+            "1 day ago"
+        );
+        assert_eq!(
+            fuzzy_time_ago(now - ChronoDuration::days(6), now),
+            "6 days ago"
+        );
+        assert_eq!(
+            fuzzy_time_ago(now - ChronoDuration::days(7), now),
+            "1 week ago"
+        );
+        assert_eq!(
+            fuzzy_time_ago(now - ChronoDuration::days(21), now),
+            "3 weeks ago"
+        );
+        assert_eq!(
+            fuzzy_time_ago(now - ChronoDuration::days(45), now),
+            "1 month ago"
+        );
+        assert_eq!(
+            fuzzy_time_ago(now - ChronoDuration::days(120), now),
+            "4 months ago"
+        );
+        assert_eq!(
+            fuzzy_time_ago(now - ChronoDuration::days(365), now),
+            "1 year ago"
+        );
+        assert_eq!(
+            fuzzy_time_ago(now - ChronoDuration::days(800), now),
+            "2 years ago"
+        );
     }
 
     #[test]
@@ -3616,7 +3820,16 @@ mod tests {
         });
         let theme = TuiTheme::zenburn();
 
-        let lines = thread_lines(&[message], 0, 80, &theme, &app, 0, Utc::now());
+        let lines = thread_lines(
+            &[message],
+            0,
+            80,
+            &theme,
+            &app,
+            0,
+            Utc::now(),
+            &BTreeSet::from([1]),
+        );
         let text = lines.iter().map(line_text).collect::<Vec<_>>();
 
         assert!(text.iter().any(|line| line == "👍 2  😎 1"));
@@ -3649,7 +3862,16 @@ mod tests {
         )];
         let theme = TuiTheme::zenburn();
 
-        let lines = thread_lines(&messages, 0, 40, &theme, &app, IMAGE_ROWS, Utc::now());
+        let lines = thread_lines(
+            &messages,
+            0,
+            40,
+            &theme,
+            &app,
+            IMAGE_ROWS,
+            Utc::now(),
+            &BTreeSet::from([1]),
+        );
         let text = lines.iter().map(line_text).collect::<Vec<_>>();
 
         assert!(text.iter().any(|line| line == "[image: rack.png]"));
@@ -3672,7 +3894,16 @@ mod tests {
         )];
         let theme = TuiTheme::zenburn();
 
-        let lines = thread_lines(&messages, 0, 40, &theme, &app, 0, Utc::now());
+        let lines = thread_lines(
+            &messages,
+            0,
+            40,
+            &theme,
+            &app,
+            0,
+            Utc::now(),
+            &BTreeSet::from([1]),
+        );
         let text = lines.iter().map(line_text).collect::<Vec<_>>();
 
         assert!(!text.iter().any(|line| line.contains("[image:")));
