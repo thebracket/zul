@@ -1653,6 +1653,7 @@ fn draw_thread(
     let active = state.focus == Focus::Thread;
     let width = area.width.saturating_sub(4).max(1) as usize;
     let image_slot_rows = image_slot_rows(app.settings().ui.images, image_picker.is_some());
+    let now = Utc::now();
     let all_lines = thread_lines(
         &state.messages,
         state.message_idx,
@@ -1660,6 +1661,7 @@ fn draw_thread(
         theme,
         app,
         image_slot_rows,
+        now,
     );
     let selected_line = selected_message_line_start(&state.messages, state.message_idx, width, app);
     let start = visible_line_start(selected_line, all_lines.len(), content_height);
@@ -2047,6 +2049,7 @@ fn draw_search_results(frame: &mut Frame<'_>, state: &TuiState, theme: &TuiTheme
     let area = centered_rect(86, 76, frame.area());
     frame.render_widget(Clear, area);
     let content_height = list_content_height(area);
+    let now = Utc::now();
     let start = state
         .popup_scroll
         .min(state.search_results.len().saturating_sub(content_height));
@@ -2058,7 +2061,7 @@ fn draw_search_results(frame: &mut Frame<'_>, state: &TuiState, theme: &TuiTheme
         .map(|message| {
             ListItem::new(Line::from(vec![
                 Span::styled(
-                    format!("[{}] ", message.id),
+                    format!("{} ", fuzzy_time_ago(message.timestamp, now)),
                     Style::default().fg(theme.message_id),
                 ),
                 Span::styled(
@@ -2329,6 +2332,7 @@ fn thread_lines(
     theme: &TuiTheme,
     app: &App,
     image_slot_rows: u16,
+    now: DateTime<Utc>,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for (idx, message) in messages.iter().enumerate() {
@@ -2339,7 +2343,7 @@ fn thread_lines(
         lines.push(Line::from(vec![
             Span::styled(selection_marker, marker_style),
             Span::styled(
-                format!("[{}]", message.id),
+                fuzzy_time_ago(message.timestamp, now),
                 header_style.fg(theme.message_id),
             ),
             Span::raw(" "),
@@ -2880,6 +2884,51 @@ fn reaction_display(reaction_type: &str, emoji_code: &str, emoji_name: &str) -> 
     emoji_from_shortcode(emoji_name).unwrap_or_else(|| format_shortcode(emoji_name))
 }
 
+fn fuzzy_time_ago(timestamp: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let Ok(age) = now.signed_duration_since(timestamp).to_std() else {
+        return "now".to_string();
+    };
+    let seconds = age.as_secs();
+    if seconds < 60 {
+        return "now".to_string();
+    }
+
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes}m ago");
+    }
+
+    let hours = minutes / 60;
+    if hours < 24 {
+        return format!("{hours}h ago");
+    }
+
+    let days = hours / 24;
+    if days < 7 {
+        return plural_time(days, "day");
+    }
+
+    let weeks = days / 7;
+    if weeks < 5 {
+        return plural_time(weeks, "week");
+    }
+
+    if days < 365 {
+        let months = days / 30;
+        return plural_time(months.max(1), "month");
+    }
+
+    plural_time((days / 365).max(1), "year")
+}
+
+fn plural_time(value: u64, unit: &str) -> String {
+    if value == 1 {
+        format!("1 {unit} ago")
+    } else {
+        format!("{value} {unit}s ago")
+    }
+}
+
 fn selected_message_line_start(
     messages: &[ZulipMessage],
     selected_idx: usize,
@@ -2972,6 +3021,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration as ChronoDuration;
     use chrono::TimeZone;
     use chrono::Utc;
     use libzul::cache::Cache;
@@ -3245,7 +3295,7 @@ mod tests {
         )];
         let theme = TuiTheme::zenburn();
 
-        let lines = thread_lines(&messages, 0, 80, &theme, &app, 0);
+        let lines = thread_lines(&messages, 0, 80, &theme, &app, 0, Utc::now());
         let body = &lines[1];
 
         assert_eq!(line_text(body), "Awesome 😎 bold");
@@ -3258,16 +3308,19 @@ mod tests {
     fn selected_thread_message_uses_marker_without_selection_colors() {
         let settings = test_settings(TempDir::new().unwrap().path());
         let app = App::open(settings, false).unwrap();
-        let messages = vec![
+        let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let mut messages = vec![
             test_message_with_text(1, "first"),
             test_message_with_text(2, "second"),
         ];
+        messages[0].timestamp = now - ChronoDuration::minutes(15);
+        messages[1].timestamp = now - ChronoDuration::days(1);
         let theme = TuiTheme::zenburn();
 
-        let lines = thread_lines(&messages, 1, 80, &theme, &app, 0);
+        let lines = thread_lines(&messages, 1, 80, &theme, &app, 0, now);
 
-        assert_eq!(line_text(&lines[0]), "   [1] Ada");
-        assert_eq!(line_text(&lines[3]), " > [2] Ada");
+        assert_eq!(line_text(&lines[0]), "   15m ago Ada");
+        assert_eq!(line_text(&lines[3]), " > 1 day ago Ada");
         assert_eq!(lines[3].spans[0].style.bg, Some(theme.background));
         assert_eq!(lines[3].spans[1].style.bg, Some(theme.background));
         assert_eq!(lines[4].spans[0].style.bg, Some(theme.background));
@@ -3301,6 +3354,26 @@ mod tests {
         assert!(lines[1].spans.iter().any(|span| {
             span.content.as_ref() == "three" && span.style.add_modifier.contains(Modifier::BOLD)
         }));
+    }
+
+    #[test]
+    fn fuzzy_time_ago_formats_boundaries() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+
+        assert_eq!(fuzzy_time_ago(now + ChronoDuration::seconds(1), now), "now");
+        assert_eq!(fuzzy_time_ago(now - ChronoDuration::seconds(59), now), "now");
+        assert_eq!(fuzzy_time_ago(now - ChronoDuration::minutes(1), now), "1m ago");
+        assert_eq!(fuzzy_time_ago(now - ChronoDuration::minutes(15), now), "15m ago");
+        assert_eq!(fuzzy_time_ago(now - ChronoDuration::hours(1), now), "1h ago");
+        assert_eq!(fuzzy_time_ago(now - ChronoDuration::hours(23), now), "23h ago");
+        assert_eq!(fuzzy_time_ago(now - ChronoDuration::days(1), now), "1 day ago");
+        assert_eq!(fuzzy_time_ago(now - ChronoDuration::days(6), now), "6 days ago");
+        assert_eq!(fuzzy_time_ago(now - ChronoDuration::days(7), now), "1 week ago");
+        assert_eq!(fuzzy_time_ago(now - ChronoDuration::days(21), now), "3 weeks ago");
+        assert_eq!(fuzzy_time_ago(now - ChronoDuration::days(45), now), "1 month ago");
+        assert_eq!(fuzzy_time_ago(now - ChronoDuration::days(120), now), "4 months ago");
+        assert_eq!(fuzzy_time_ago(now - ChronoDuration::days(365), now), "1 year ago");
+        assert_eq!(fuzzy_time_ago(now - ChronoDuration::days(800), now), "2 years ago");
     }
 
     #[test]
@@ -3543,7 +3616,7 @@ mod tests {
         });
         let theme = TuiTheme::zenburn();
 
-        let lines = thread_lines(&[message], 0, 80, &theme, &app, 0);
+        let lines = thread_lines(&[message], 0, 80, &theme, &app, 0, Utc::now());
         let text = lines.iter().map(line_text).collect::<Vec<_>>();
 
         assert!(text.iter().any(|line| line == "👍 2  😎 1"));
@@ -3576,7 +3649,7 @@ mod tests {
         )];
         let theme = TuiTheme::zenburn();
 
-        let lines = thread_lines(&messages, 0, 40, &theme, &app, IMAGE_ROWS);
+        let lines = thread_lines(&messages, 0, 40, &theme, &app, IMAGE_ROWS, Utc::now());
         let text = lines.iter().map(line_text).collect::<Vec<_>>();
 
         assert!(text.iter().any(|line| line == "[image: rack.png]"));
@@ -3599,7 +3672,7 @@ mod tests {
         )];
         let theme = TuiTheme::zenburn();
 
-        let lines = thread_lines(&messages, 0, 40, &theme, &app, 0);
+        let lines = thread_lines(&messages, 0, 40, &theme, &app, 0, Utc::now());
         let text = lines.iter().map(line_text).collect::<Vec<_>>();
 
         assert!(!text.iter().any(|line| line.contains("[image:")));
