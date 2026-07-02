@@ -1332,7 +1332,6 @@ fn draw_thread(
         &state.messages,
         state.message_idx,
         width,
-        active,
         theme,
         app,
         image_slot_rows,
@@ -1992,7 +1991,6 @@ fn thread_lines(
     messages: &[ZulipMessage],
     selected_idx: usize,
     width: usize,
-    active: bool,
     theme: &TuiTheme,
     app: &App,
     image_slot_rows: u16,
@@ -2000,9 +1998,11 @@ fn thread_lines(
     let mut lines = Vec::new();
     for (idx, message) in messages.iter().enumerate() {
         let selected = idx == selected_idx;
-        let selection_style = selection_style(selected, active, theme);
-        let header_style = selection_style.unwrap_or_else(|| Style::default().bg(theme.background));
+        let header_style = Style::default().bg(theme.background);
+        let marker_style = Style::default().fg(theme.text).bg(theme.background);
+        let selection_marker = if selected { " > " } else { "   " };
         lines.push(Line::from(vec![
+            Span::styled(selection_marker, marker_style),
             Span::styled(
                 format!("[{}]", message.id),
                 header_style.fg(theme.message_id),
@@ -2014,17 +2014,14 @@ fn thread_lines(
             ),
         ]));
 
-        let body_style =
-            selection_style.unwrap_or_else(|| Style::default().fg(theme.text).bg(theme.background));
+        let body_style = Style::default().fg(theme.text).bg(theme.background);
         for line in message_body_lines(message, width, body_style) {
             lines.push(line);
         }
 
-        let reaction_style = selection_style.unwrap_or_else(|| {
-            Style::default()
-                .fg(theme.inactive_title)
-                .bg(theme.background)
-        });
+        let reaction_style = Style::default()
+            .fg(theme.inactive_title)
+            .bg(theme.background);
         if let Some(line) = reaction_line(message, reaction_style) {
             lines.push(line);
         }
@@ -2032,11 +2029,9 @@ fn thread_lines(
         if app.settings().ui.images != ImageMode::Off {
             let attachments = app.image_attachments(message);
             for (image_idx, attachment) in attachments.iter().enumerate() {
-                let style = selection_style.unwrap_or_else(|| {
-                    Style::default()
-                        .fg(theme.inactive_title)
-                        .bg(theme.background)
-                });
+                let style = Style::default()
+                    .fg(theme.inactive_title)
+                    .bg(theme.background);
                 lines.push(Line::from(Span::styled(
                     format!("[image: {}]", attachment.label()),
                     style,
@@ -2045,8 +2040,7 @@ fn thread_lines(
                     for _ in 0..image_slot_rows {
                         lines.push(Line::from(Span::styled(
                             "",
-                            selection_style
-                                .unwrap_or_else(|| Style::default().bg(theme.background)),
+                            Style::default().bg(theme.background),
                         )));
                     }
                 }
@@ -2054,7 +2048,7 @@ fn thread_lines(
         }
         lines.push(Line::from(Span::styled(
             "",
-            selection_style.unwrap_or_else(|| Style::default().bg(theme.background)),
+            Style::default().bg(theme.background),
         )));
     }
 
@@ -2543,18 +2537,6 @@ fn reaction_display(reaction_type: &str, emoji_code: &str, emoji_name: &str) -> 
     emoji_from_shortcode(emoji_name).unwrap_or_else(|| format_shortcode(emoji_name))
 }
 
-fn selection_style(selected: bool, active: bool, theme: &TuiTheme) -> Option<Style> {
-    if !selected {
-        return None;
-    }
-    let (fg, bg) = if active {
-        (theme.active_selection_fg, theme.active_selection_bg)
-    } else {
-        (theme.inactive_selection_fg, theme.inactive_selection_bg)
-    };
-    Some(Style::default().fg(fg).bg(bg))
-}
-
 fn selected_message_line_start(
     messages: &[ZulipMessage],
     selected_idx: usize,
@@ -2889,13 +2871,33 @@ mod tests {
         )];
         let theme = TuiTheme::zenburn();
 
-        let lines = thread_lines(&messages, 0, 80, true, &theme, &app, 0);
+        let lines = thread_lines(&messages, 0, 80, &theme, &app, 0);
         let body = &lines[1];
 
         assert_eq!(line_text(body), "Awesome 😎 bold");
         assert!(body.spans.iter().any(|span| {
             span.content.as_ref() == "bold" && span.style.add_modifier.contains(Modifier::BOLD)
         }));
+    }
+
+    #[test]
+    fn selected_thread_message_uses_marker_without_selection_colors() {
+        let settings = test_settings(TempDir::new().unwrap().path());
+        let app = App::open(settings, false).unwrap();
+        let messages = vec![
+            test_message_with_text(1, "first"),
+            test_message_with_text(2, "second"),
+        ];
+        let theme = TuiTheme::zenburn();
+
+        let lines = thread_lines(&messages, 1, 80, &theme, &app, 0);
+
+        assert_eq!(line_text(&lines[0]), "   [1] Ada");
+        assert_eq!(line_text(&lines[3]), " > [2] Ada");
+        assert_eq!(lines[3].spans[0].style.bg, Some(theme.background));
+        assert_eq!(lines[3].spans[1].style.bg, Some(theme.background));
+        assert_eq!(lines[4].spans[0].style.bg, Some(theme.background));
+        assert_ne!(lines[3].spans[0].style.bg, Some(theme.active_selection_bg));
     }
 
     #[test]
@@ -3028,7 +3030,7 @@ mod tests {
         });
         let theme = TuiTheme::zenburn();
 
-        let lines = thread_lines(&[message], 0, 80, true, &theme, &app, 0);
+        let lines = thread_lines(&[message], 0, 80, &theme, &app, 0);
         let text = lines.iter().map(line_text).collect::<Vec<_>>();
 
         assert!(text.iter().any(|line| line == "👍 2  😎 1"));
@@ -3061,7 +3063,7 @@ mod tests {
         )];
         let theme = TuiTheme::zenburn();
 
-        let lines = thread_lines(&messages, 0, 40, true, &theme, &app, IMAGE_ROWS);
+        let lines = thread_lines(&messages, 0, 40, &theme, &app, IMAGE_ROWS);
         let text = lines.iter().map(line_text).collect::<Vec<_>>();
 
         assert!(text.iter().any(|line| line == "[image: rack.png]"));
@@ -3084,7 +3086,7 @@ mod tests {
         )];
         let theme = TuiTheme::zenburn();
 
-        let lines = thread_lines(&messages, 0, 40, true, &theme, &app, 0);
+        let lines = thread_lines(&messages, 0, 40, &theme, &app, 0);
         let text = lines.iter().map(line_text).collect::<Vec<_>>();
 
         assert!(!text.iter().any(|line| line.contains("[image:")));
