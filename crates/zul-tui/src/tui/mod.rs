@@ -1296,6 +1296,8 @@ async fn handle_config_key(
         }
         KeyCode::Tab | KeyCode::Down => form.move_selection(1),
         KeyCode::BackTab | KeyCode::Up => form.move_selection(-1),
+        KeyCode::Right => cycle_theme_field(form, app.settings(), 1),
+        KeyCode::Left => cycle_theme_field(form, app.settings(), -1),
         KeyCode::Backspace => {
             if let Some(field) = form.selected_field_mut() {
                 field.value.pop();
@@ -1512,6 +1514,51 @@ fn split_aliases(value: &str) -> Vec<String> {
         .filter(|alias| !alias.is_empty())
         .map(ToString::to_string)
         .collect()
+}
+
+fn cycle_theme_field(form: &mut ConfigForm, settings: &Settings, delta: isize) {
+    if form.purpose != ConfigPurpose::Config
+        || form
+            .selected_field()
+            .map(|field| field.key != ConfigField::Theme)
+            .unwrap_or(true)
+    {
+        return;
+    }
+    let options = theme_options(settings);
+    if options.is_empty() {
+        return;
+    }
+    let current = form.value(ConfigField::Theme).trim();
+    let current_idx = options
+        .iter()
+        .position(|option| option == current)
+        .or_else(|| {
+            options
+                .iter()
+                .position(|option| option.eq_ignore_ascii_case(current))
+        })
+        .unwrap_or(0);
+    let next_idx = wrap_index(current_idx, options.len(), delta);
+    if let Some(field) = form.selected_field_mut() {
+        field.value = options[next_idx].clone();
+    }
+}
+
+fn theme_options(settings: &Settings) -> Vec<String> {
+    let mut options = TuiTheme::builtin_names()
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+    for name in settings.themes.keys() {
+        if !options
+            .iter()
+            .any(|option| option.eq_ignore_ascii_case(name))
+        {
+            options.push(name.clone());
+        }
+    }
+    options
 }
 
 fn env_auth_present() -> bool {
@@ -2078,7 +2125,9 @@ fn form_overlay_text(state: &TuiState) -> String {
     }
     text.push_str("\nTab/Shift-Tab moves fields, Ctrl-U clears a field, Ctrl-S saves, Esc closes.");
     if form.purpose == ConfigPurpose::Config {
-        text.push_str("\nImages accepts auto, placeholder, or off. Booleans accept true/false.");
+        text.push_str(
+            "\nLeft/Right cycles the Theme field. Images accepts auto, placeholder, or off. Booleans accept true/false.",
+        );
     }
     text
 }
@@ -2338,25 +2387,44 @@ impl TuiTheme {
     fn resolve(settings: &Settings) -> Result<Self> {
         let name = settings.ui.theme.trim();
         let theme_name = if name.is_empty() { "zenburn" } else { name };
-        let mut theme = if theme_name.eq_ignore_ascii_case("zenburn") {
-            Self::zenburn()
+        let mut theme = if let Some(theme) = Self::builtin(theme_name) {
+            theme
         } else if settings.themes.contains_key(theme_name) {
             Self::zenburn()
         } else {
             anyhow::bail!("unknown TUI theme '{theme_name}'");
         };
 
-        if let Some(config) = settings.themes.get(theme_name).or_else(|| {
-            if theme_name.eq_ignore_ascii_case("zenburn") {
-                settings.themes.get("zenburn")
-            } else {
-                None
-            }
-        }) {
+        if let Some(config) = settings.themes.get(theme_name) {
             theme.apply_config(config)?;
         }
 
         Ok(theme)
+    }
+
+    fn builtin(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "zenburn" => Some(Self::zenburn()),
+            "solarized-dark" => Some(Self::solarized_dark()),
+            "gruvbox-dark" => Some(Self::gruvbox_dark()),
+            "dracula" => Some(Self::dracula()),
+            "nord" => Some(Self::nord()),
+            "catppuccin-mocha" => Some(Self::catppuccin_mocha()),
+            "tokyo-night" => Some(Self::tokyo_night()),
+            _ => None,
+        }
+    }
+
+    fn builtin_names() -> &'static [&'static str] {
+        &[
+            "zenburn",
+            "solarized-dark",
+            "gruvbox-dark",
+            "dracula",
+            "nord",
+            "catppuccin-mocha",
+            "tokyo-night",
+        ]
     }
 
     fn zenburn() -> Self {
@@ -2375,6 +2443,120 @@ impl TuiTheme {
             status_fg: rgb(0x3f, 0x3f, 0x3f),
             status_bg: rgb(0xd0, 0xbf, 0x8f),
             modal_text: rgb(0xdc, 0xdc, 0xcc),
+        }
+    }
+
+    fn solarized_dark() -> Self {
+        Self {
+            background: rgb(0x00, 0x2b, 0x36),
+            text: rgb(0x83, 0x94, 0x96),
+            pane_border: rgb(0x58, 0x6e, 0x75),
+            active_title: rgb(0xb5, 0x89, 0x00),
+            inactive_title: rgb(0x26, 0x8b, 0xd2),
+            active_selection_fg: rgb(0x00, 0x2b, 0x36),
+            active_selection_bg: rgb(0x93, 0xa1, 0xa1),
+            inactive_selection_fg: rgb(0x93, 0xa1, 0xa1),
+            inactive_selection_bg: rgb(0x07, 0x36, 0x42),
+            message_id: rgb(0x2a, 0xa1, 0x98),
+            sender: rgb(0x85, 0x99, 0x00),
+            status_fg: rgb(0x00, 0x2b, 0x36),
+            status_bg: rgb(0xb5, 0x89, 0x00),
+            modal_text: rgb(0x93, 0xa1, 0xa1),
+        }
+    }
+
+    fn gruvbox_dark() -> Self {
+        Self {
+            background: rgb(0x28, 0x28, 0x28),
+            text: rgb(0xeb, 0xdb, 0xb2),
+            pane_border: rgb(0x66, 0x5c, 0x54),
+            active_title: rgb(0xfa, 0xbd, 0x2f),
+            inactive_title: rgb(0x83, 0xa5, 0x98),
+            active_selection_fg: rgb(0x28, 0x28, 0x28),
+            active_selection_bg: rgb(0xd7, 0x99, 0x21),
+            inactive_selection_fg: rgb(0xeb, 0xdb, 0xb2),
+            inactive_selection_bg: rgb(0x3c, 0x38, 0x36),
+            message_id: rgb(0x8e, 0xc0, 0x7c),
+            sender: rgb(0xb8, 0xbb, 0x26),
+            status_fg: rgb(0x28, 0x28, 0x28),
+            status_bg: rgb(0xfe, 0x80, 0x19),
+            modal_text: rgb(0xeb, 0xdb, 0xb2),
+        }
+    }
+
+    fn dracula() -> Self {
+        Self {
+            background: rgb(0x28, 0x2a, 0x36),
+            text: rgb(0xf8, 0xf8, 0xf2),
+            pane_border: rgb(0x62, 0x72, 0xa4),
+            active_title: rgb(0xff, 0x79, 0xc6),
+            inactive_title: rgb(0x8b, 0xe9, 0xfd),
+            active_selection_fg: rgb(0x28, 0x2a, 0x36),
+            active_selection_bg: rgb(0xbd, 0x93, 0xf9),
+            inactive_selection_fg: rgb(0xf8, 0xf8, 0xf2),
+            inactive_selection_bg: rgb(0x44, 0x47, 0x5a),
+            message_id: rgb(0x8b, 0xe9, 0xfd),
+            sender: rgb(0x50, 0xfa, 0x7b),
+            status_fg: rgb(0x28, 0x2a, 0x36),
+            status_bg: rgb(0xff, 0xb8, 0x6c),
+            modal_text: rgb(0xf8, 0xf8, 0xf2),
+        }
+    }
+
+    fn nord() -> Self {
+        Self {
+            background: rgb(0x2e, 0x34, 0x40),
+            text: rgb(0xd8, 0xde, 0xe9),
+            pane_border: rgb(0x4c, 0x56, 0x6a),
+            active_title: rgb(0x88, 0xc0, 0xd0),
+            inactive_title: rgb(0x81, 0xa1, 0xc1),
+            active_selection_fg: rgb(0x2e, 0x34, 0x40),
+            active_selection_bg: rgb(0xa3, 0xbe, 0x8c),
+            inactive_selection_fg: rgb(0xe5, 0xe9, 0xf0),
+            inactive_selection_bg: rgb(0x3b, 0x42, 0x52),
+            message_id: rgb(0x8f, 0xbc, 0xbb),
+            sender: rgb(0xa3, 0xbe, 0x8c),
+            status_fg: rgb(0x2e, 0x34, 0x40),
+            status_bg: rgb(0xeb, 0xcb, 0x8b),
+            modal_text: rgb(0xe5, 0xe9, 0xf0),
+        }
+    }
+
+    fn catppuccin_mocha() -> Self {
+        Self {
+            background: rgb(0x1e, 0x1e, 0x2e),
+            text: rgb(0xcd, 0xd6, 0xf4),
+            pane_border: rgb(0x6c, 0x70, 0x86),
+            active_title: rgb(0xf5, 0xc2, 0xe7),
+            inactive_title: rgb(0x89, 0xb4, 0xfa),
+            active_selection_fg: rgb(0x1e, 0x1e, 0x2e),
+            active_selection_bg: rgb(0xa6, 0xe3, 0xa1),
+            inactive_selection_fg: rgb(0xcd, 0xd6, 0xf4),
+            inactive_selection_bg: rgb(0x31, 0x32, 0x44),
+            message_id: rgb(0x94, 0xe2, 0xd5),
+            sender: rgb(0xa6, 0xe3, 0xa1),
+            status_fg: rgb(0x1e, 0x1e, 0x2e),
+            status_bg: rgb(0xfa, 0xe3, 0xb0),
+            modal_text: rgb(0xcd, 0xd6, 0xf4),
+        }
+    }
+
+    fn tokyo_night() -> Self {
+        Self {
+            background: rgb(0x1a, 0x1b, 0x26),
+            text: rgb(0xc0, 0xca, 0xf5),
+            pane_border: rgb(0x56, 0x5f, 0x89),
+            active_title: rgb(0x7a, 0xdc, 0xa7),
+            inactive_title: rgb(0x7a, 0xa2, 0xf7),
+            active_selection_fg: rgb(0x1a, 0x1b, 0x26),
+            active_selection_bg: rgb(0xe0, 0xaf, 0x68),
+            inactive_selection_fg: rgb(0xc0, 0xca, 0xf5),
+            inactive_selection_bg: rgb(0x24, 0x28, 0x3b),
+            message_id: rgb(0x7d, 0xcf, 0xf3),
+            sender: rgb(0x9e, 0xce, 0x6a),
+            status_fg: rgb(0x1a, 0x1b, 0x26),
+            status_bg: rgb(0xbb, 0x9a, 0xf7),
+            modal_text: rgb(0xc0, 0xca, 0xf5),
         }
     }
 
@@ -3128,6 +3310,13 @@ fn move_index(current: usize, len: usize, delta: isize) -> usize {
     next.clamp(0, len.saturating_sub(1) as isize) as usize
 }
 
+fn wrap_index(current: usize, len: usize, delta: isize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    (current as isize + delta).rem_euclid(len as isize) as usize
+}
+
 fn list_content_height(area: Rect) -> usize {
     area.height.saturating_sub(2).max(1) as usize
 }
@@ -3219,6 +3408,16 @@ mod tests {
     }
 
     #[test]
+    fn built_in_themes_resolve() {
+        for name in TuiTheme::builtin_names() {
+            let mut settings = test_settings(TempDir::new().unwrap().path());
+            settings.ui.theme = (*name).to_string();
+
+            TuiTheme::resolve(&settings).unwrap();
+        }
+    }
+
+    #[test]
     fn custom_theme_overrides_builtin_fields() {
         let mut settings = test_settings(TempDir::new().unwrap().path());
         settings.ui.theme = "cozy".to_string();
@@ -3263,6 +3462,53 @@ mod tests {
         let error = TuiTheme::resolve(&settings).unwrap_err().to_string();
 
         assert!(error.contains("unknown TUI theme"));
+    }
+
+    #[test]
+    fn theme_options_include_builtins_and_custom_themes() {
+        let mut settings = test_settings(TempDir::new().unwrap().path());
+        settings
+            .themes
+            .insert("cozy".to_string(), ThemeConfig::default());
+
+        let options = theme_options(&settings);
+
+        assert!(options.contains(&"zenburn".to_string()));
+        assert!(options.contains(&"dracula".to_string()));
+        assert!(options.contains(&"cozy".to_string()));
+    }
+
+    #[test]
+    fn config_theme_field_cycles_available_options() {
+        let mut settings = test_settings(TempDir::new().unwrap().path());
+        settings.ui.theme = "zenburn".to_string();
+        let mut form = ConfigForm::config(&settings);
+        form.selected = form
+            .fields
+            .iter()
+            .position(|field| field.key == ConfigField::Theme)
+            .unwrap();
+
+        cycle_theme_field(&mut form, &settings, 1);
+        assert_eq!(form.value(ConfigField::Theme), "solarized-dark");
+
+        cycle_theme_field(&mut form, &settings, -1);
+        assert_eq!(form.value(ConfigField::Theme), "zenburn");
+    }
+
+    #[test]
+    fn config_theme_cycling_leaves_other_fields_unchanged() {
+        let settings = test_settings(TempDir::new().unwrap().path());
+        let mut form = ConfigForm::config(&settings);
+        form.selected = form
+            .fields
+            .iter()
+            .position(|field| field.key == ConfigField::Email)
+            .unwrap();
+
+        cycle_theme_field(&mut form, &settings, 1);
+
+        assert_eq!(form.value(ConfigField::Theme), "zenburn");
     }
 
     #[test]
