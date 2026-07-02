@@ -216,6 +216,17 @@ pub struct SendMessageResponse {
     pub id: i64,
 }
 
+/// Response payload for the upload-file endpoint.
+#[derive(Debug, Deserialize)]
+pub struct UploadFileResponse {
+    /// URL of the uploaded file, available on modern Zulip servers.
+    pub url: Option<String>,
+    /// Legacy alias for `url`.
+    pub uri: Option<String>,
+    /// Filename stored by Zulip.
+    pub filename: Option<String>,
+}
+
 impl<T> ZulipApiResponse<T> {
     /// Return the endpoint payload or convert a Zulip error into an `anyhow` error.
     pub fn into_data(self) -> anyhow::Result<T> {

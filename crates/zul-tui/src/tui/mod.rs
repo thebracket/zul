@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -33,7 +35,6 @@ use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::{Resize, StatefulImage};
 use scraper::{ElementRef, Html, Node};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-#[cfg(feature = "tui-images")]
 use std::io::Cursor;
 use std::io::{self, Stdout};
 use std::path::PathBuf;
@@ -206,6 +207,12 @@ impl TextEditor {
     fn insert_char(&mut self, ch: char) {
         self.text.insert(self.cursor, ch);
         self.cursor += ch.len_utf8();
+        self.preferred_column = None;
+    }
+
+    fn insert_str(&mut self, text: &str) {
+        self.text.insert_str(self.cursor, text);
+        self.cursor += text.len();
         self.preferred_column = None;
     }
 
@@ -827,11 +834,14 @@ async fn run_loop(
         if !event::poll(Duration::from_millis(150))? {
             continue;
         }
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
-        if handle_key(key, &mut state, &mut app, &mut theme, &mut image_picker).await? {
-            break;
+        match event::read()? {
+            Event::Key(key) => {
+                if handle_key(key, &mut state, &mut app, &mut theme, &mut image_picker).await? {
+                    break;
+                }
+            }
+            Event::Paste(text) => handle_paste(text, &mut state),
+            _ => {}
         }
     }
     Ok(())
@@ -1164,6 +1174,9 @@ async fn handle_input_key(key: KeyEvent, state: &mut TuiState, app: &App) -> Res
                     state.mode = Mode::ConfirmSend;
                 }
             }
+            KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                paste_from_clipboard(state, app).await;
+            }
             KeyCode::Char(c) => state.draft.insert_char(c),
             _ => {}
         }
@@ -1190,6 +1203,71 @@ async fn handle_input_key(key: KeyEvent, state: &mut TuiState, app: &App) -> Res
         _ => {}
     }
     Ok(false)
+}
+
+fn handle_paste(text: String, state: &mut TuiState) {
+    if state.mode == Mode::Composer {
+        state.draft.insert_str(&text);
+    }
+}
+
+async fn paste_from_clipboard(state: &mut TuiState, app: &App) {
+    match clipboard_payload() {
+        Ok(ClipboardPayload::Image {
+            filename,
+            content_type,
+            bytes,
+        }) => match app.upload_file_bytes(&filename, &content_type, bytes).await {
+            Ok(uploaded) => {
+                let markdown = App::uploaded_file_markdown(&uploaded);
+                state.draft.insert_str(&markdown);
+                state.status = format!("pasted image {}", uploaded.filename);
+            }
+            Err(err) => state.status = format!("image paste failed: {err}"),
+        },
+        Ok(ClipboardPayload::Text(text)) => {
+            state.draft.insert_str(&text);
+            state.status = "pasted text".to_string();
+        }
+        Err(err) => state.status = format!("paste failed: {err}"),
+    }
+}
+
+enum ClipboardPayload {
+    Image {
+        filename: String,
+        content_type: String,
+        bytes: Vec<u8>,
+    },
+    Text(String),
+}
+
+fn clipboard_payload() -> Result<ClipboardPayload> {
+    let mut clipboard = arboard::Clipboard::new().context("opening clipboard")?;
+    if let Ok(image) = clipboard.get_image() {
+        return Ok(ClipboardPayload::Image {
+            filename: "clipboard.png".to_string(),
+            content_type: "image/png".to_string(),
+            bytes: encode_clipboard_image_png(&image)?,
+        });
+    }
+    let text = clipboard.get_text().context("reading clipboard text")?;
+    Ok(ClipboardPayload::Text(text))
+}
+
+fn encode_clipboard_image_png(image: &arboard::ImageData<'_>) -> Result<Vec<u8>> {
+    let Some(buffer) = image::RgbaImage::from_raw(
+        image.width as u32,
+        image.height as u32,
+        image.bytes.to_vec(),
+    ) else {
+        anyhow::bail!("clipboard image bytes did not match dimensions");
+    };
+    let mut bytes = Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(buffer)
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .context("encoding clipboard image")?;
+    Ok(bytes.into_inner())
 }
 
 async fn handle_config_key(
@@ -3084,14 +3162,18 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     Terminal::new(backend).map_err(Into::into)
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -3590,6 +3672,32 @@ mod tests {
 
         assert_eq!(editor.as_str(), "abc");
         assert_eq!(editor.cursor, 2);
+    }
+
+    #[test]
+    fn draft_editor_pastes_string_at_cursor() {
+        let mut editor = TextEditor::default();
+        editor.insert_str("hello  world");
+        for _ in 0.." world".len() {
+            editor.move_left();
+        }
+        editor.insert_str("there");
+
+        assert_eq!(editor.as_str(), "hello there world");
+        assert_eq!(editor.cursor, "hello there".len());
+    }
+
+    #[test]
+    fn composer_paste_event_inserts_text() {
+        let fixture = TuiFixture::new(&[]);
+        let app = App::open(fixture.settings.clone(), false).unwrap();
+        let mut state = TuiState::load(&app).unwrap();
+        state.mode = Mode::Composer;
+        state.draft.insert_str("hello ");
+
+        handle_paste("there\nfriend".to_string(), &mut state);
+
+        assert_eq!(state.draft.as_str(), "hello there\nfriend");
     }
 
     #[test]

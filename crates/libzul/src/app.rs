@@ -1,7 +1,7 @@
 use crate::auth::AuthStatus;
 use crate::cache::{send_hash, Cache, StreamActivity, SyncRecord};
 use crate::config::Settings;
-use crate::zulip::client::ZulipClient;
+use crate::zulip::client::{UploadedFile, ZulipClient};
 use crate::zulip::images;
 use crate::zulip::models::{
     ImageAttachment, ImageBytes, ZulipDirectConversation, ZulipDmParticipant, ZulipMessage,
@@ -377,6 +377,31 @@ impl App {
         Ok(image)
     }
 
+    /// Upload file bytes to Zulip storage.
+    pub async fn upload_file_bytes(
+        &self,
+        filename: &str,
+        content_type: &str,
+        bytes: Vec<u8>,
+    ) -> Result<UploadedFile> {
+        if self.offline {
+            anyhow::bail!("offline mode cannot upload files");
+        }
+        let client = self.client()?;
+        client
+            .upload_file_bytes(filename, content_type, bytes)
+            .await
+    }
+
+    /// Build Zulip Markdown for an uploaded file link.
+    pub fn uploaded_file_markdown(uploaded: &UploadedFile) -> String {
+        format!(
+            "[{}]({})",
+            sanitize_upload_filename(&uploaded.filename),
+            uploaded.url
+        )
+    }
+
     /// Return cached message counts per stream.
     pub fn stream_activity(&self) -> Result<Vec<StreamActivity>> {
         self.cache.stream_activity()
@@ -584,6 +609,10 @@ fn direct_reply_recipients(
     recipients
 }
 
+fn sanitize_upload_filename(filename: &str) -> String {
+    filename.replace(['[', ']'], "")
+}
+
 fn direct_recipient_value(participant: &ZulipDmParticipant) -> Option<serde_json::Value> {
     participant
         .id
@@ -630,6 +659,24 @@ fn image_cache_path(settings: &Settings, key: &str) -> PathBuf {
         .parent()
         .map(|parent| parent.join("images").join(filename.as_str()))
         .unwrap_or_else(|| PathBuf::from("images").join(filename))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uploaded_file_markdown_sanitizes_filename_brackets() {
+        let uploaded = UploadedFile {
+            url: "/user_uploads/1/a/file.png".to_string(),
+            filename: "screen[shot].png".to_string(),
+        };
+
+        assert_eq!(
+            App::uploaded_file_markdown(&uploaded),
+            "[screenshot.png](/user_uploads/1/a/file.png)"
+        );
+    }
 }
 
 fn hex_lower(bytes: &[u8]) -> String {

@@ -1,10 +1,11 @@
 use crate::zulip::models::{
     CurrentUser, CurrentUserResponse, ImageBytes, MessagesResponse, SendMessageResponse,
-    SubscriptionsResponse, ZulipApiResponse, ZulipMessage, ZulipStream,
+    SubscriptionsResponse, UploadFileResponse, ZulipApiResponse, ZulipMessage, ZulipStream,
 };
 use crate::zulip::normalize;
 use anyhow::{Context, Result};
 use reqwest::header::CONTENT_TYPE;
+use reqwest::multipart::{Form, Part};
 use reqwest::Client;
 use serde_json::json;
 use std::collections::HashSet;
@@ -18,6 +19,15 @@ pub struct ZulipClient {
     base_url: String,
     email: String,
     api_key: String,
+}
+
+/// File uploaded to Zulip storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadedFile {
+    /// URL returned by Zulip for the uploaded file.
+    pub url: String,
+    /// Filename returned by Zulip, or the requested filename if omitted.
+    pub filename: String,
 }
 
 impl ZulipClient {
@@ -259,6 +269,36 @@ impl ZulipClient {
             .await?
             .into_data()?;
         Ok(data.id)
+    }
+
+    /// Upload file bytes and return the uploaded file metadata.
+    pub async fn upload_file_bytes(
+        &self,
+        filename: &str,
+        content_type: &str,
+        bytes: Vec<u8>,
+    ) -> Result<UploadedFile> {
+        let part = Part::bytes(bytes)
+            .file_name(filename.to_string())
+            .mime_str(content_type)
+            .context("setting upload content type")?;
+        let form = Form::new().part("filename", part);
+        let data = self
+            .post("/api/v1/user_uploads")
+            .multipart(form)
+            .send()
+            .await?
+            .json::<ZulipApiResponse<UploadFileResponse>>()
+            .await?
+            .into_data()?;
+        let url = data
+            .url
+            .or(data.uri)
+            .context("upload response missing url")?;
+        Ok(UploadedFile {
+            url,
+            filename: data.filename.unwrap_or_else(|| filename.to_string()),
+        })
     }
 
     /// Fetch an authenticated image URL for terminal rendering.
