@@ -1,6 +1,10 @@
 # zul
 
-A Rust library to help access Zulip, along with a TUI for using Zulip on the go.
+A Rust library to help access Zulip, along with a TUI for using Zulip on the go. It can handle most Zulip operations, and includes
+a nice TUI zulip client (that supports image rendering in terminals that support it). Not a heavily supported system; I created it
+because I needed it for a project.
+
+<img width="1440" height="804" alt="image" src="https://github.com/user-attachments/assets/07062395-08c0-4d7d-a4d2-a156b57d75ca" />
 
 ## Crates
 
