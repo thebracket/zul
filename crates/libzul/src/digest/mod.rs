@@ -174,7 +174,7 @@ fn unanswered_questions(messages: &[ZulipMessage]) -> Vec<DigestItem> {
         }
     }
 
-    unanswered.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    unanswered.sort_by_key(|item| std::cmp::Reverse(item.timestamp));
     unanswered.truncate(50);
     unanswered
 }
