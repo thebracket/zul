@@ -5,7 +5,7 @@
 //! the binary owns stdout; handlers only enqueue complete JSON lines.
 
 use crate::protocol::{self, Envelope, RequestId};
-use crate::tools::{self, ToolFailure, ToolState};
+use crate::tools::{self, ToolContext, ToolFailure};
 use serde_json::{json, Value};
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -20,7 +20,7 @@ MCP 2026-07-28; set the client's protocol to \"2026-07-28\" and retry";
 /// Dispatcher for inbound frames and owner of in-flight request tasks.
 pub struct Server {
     tx: mpsc::Sender<String>,
-    tools: Rc<ToolState>,
+    tools: Rc<ToolContext>,
     active: Rc<RefCell<HashSet<String>>>,
     tasks: JoinSet<()>,
 }
@@ -30,7 +30,7 @@ impl Server {
     pub fn new(tx: mpsc::Sender<String>) -> Self {
         Self {
             tx,
-            tools: Rc::new(ToolState::default()),
+            tools: Rc::new(ToolContext::new()),
             active: Rc::new(RefCell::new(HashSet::new())),
             tasks: JoinSet::new(),
         }
@@ -136,7 +136,7 @@ fn rpc_error(code: i64, message: impl Into<String>) -> RpcError {
 }
 
 async fn handle_request(
-    tools: &ToolState,
+    tools: &ToolContext,
     method: &str,
     params: Option<&Value>,
 ) -> Result<Value, RpcError> {
@@ -190,7 +190,7 @@ async fn handle_request(
     }
 }
 
-async fn call_tool(tools: &ToolState, params: Option<&Value>) -> Result<Value, RpcError> {
+async fn call_tool(tools: &ToolContext, params: Option<&Value>) -> Result<Value, RpcError> {
     let params = params.ok_or_else(|| {
         rpc_error(
             protocol::INVALID_PARAMS,
@@ -229,7 +229,7 @@ mod tests {
 
     #[tokio::test]
     async fn discovery_ignores_missing_metadata() {
-        let tools = ToolState::default();
+        let tools = ToolContext::new();
         let result = handle_request(&tools, "server/discover", None)
             .await
             .expect("discovery result");
@@ -242,7 +242,7 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_initialize_is_rejected_with_guidance() {
-        let tools = ToolState::default();
+        let tools = ToolContext::new();
         let err = handle_request(&tools, "initialize", None)
             .await
             .expect_err("initialize must fail");
@@ -254,7 +254,7 @@ mod tests {
 
     #[tokio::test]
     async fn version_metadata_is_required_and_exact() {
-        let tools = ToolState::default();
+        let tools = ToolContext::new();
         let missing = handle_request(&tools, "tools/list", Some(&json!({})))
             .await
             .expect_err("missing metadata must fail");
@@ -279,7 +279,7 @@ mod tests {
 
     #[tokio::test]
     async fn tools_list_is_complete_and_private() {
-        let tools = ToolState::default();
+        let tools = ToolContext::new();
         let result = handle_request(&tools, "tools/list", Some(&modern(json!({}))))
             .await
             .expect("tools/list result");
@@ -287,13 +287,14 @@ mod tests {
         assert!(result["ttlMs"].is_number());
         assert_eq!(result["cacheScope"], "private");
         let catalog = result["tools"].as_array().expect("tools array");
-        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog.len(), 7);
         assert_eq!(catalog[0]["name"], tools::WHOAMI);
+        assert_eq!(catalog[6]["name"], tools::SEARCH);
     }
 
     #[tokio::test]
     async fn unknown_method_and_tool_are_protocol_errors() {
-        let tools = ToolState::default();
+        let tools = ToolContext::new();
         let method = handle_request(&tools, "prompts/list", Some(&modern(json!({}))))
             .await
             .expect_err("unknown method must fail");
@@ -311,7 +312,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_arguments_are_a_tool_error_result() {
-        let tools = ToolState::default();
+        let tools = ToolContext::new();
         let result = handle_request(
             &tools,
             "tools/call",

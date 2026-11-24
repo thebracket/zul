@@ -246,8 +246,14 @@ fn serves_discovery_tools_and_protocol_errors() {
         "method": "tools/list",
         "params": [],
     }));
+    // 15: sync without credentials is a tool error, not a panic.
+    harness.send(&modern(
+        json!(15),
+        "tools/call",
+        json!({"name": "sync", "arguments": {}}),
+    ));
 
-    let responses = collect(&harness, 13);
+    let responses = collect(&harness, 14);
     let responses = by_id(&responses);
 
     let discover = responses.get("n:1").expect("discovery response");
@@ -295,15 +301,33 @@ fn serves_discovery_tools_and_protocol_errors() {
     assert!(list["ttlMs"].is_number());
     assert_eq!(list["cacheScope"], "private");
     let tools = list["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 1);
+    let names: Vec<&str> = tools
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("tool name"))
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "whoami",
+            "sync",
+            "list_streams",
+            "list_topics",
+            "read_topic",
+            "recent",
+            "search"
+        ]
+    );
+    for tool in tools {
+        assert!(tool["description"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty()));
+        assert_eq!(tool["inputSchema"]["type"], "object");
+        assert!(tool["inputSchema"]["properties"].is_object());
+        assert!(tool["inputSchema"]["required"].is_array());
+        assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+    }
     let whoami = &tools[0];
     assert_eq!(whoami["name"], "whoami");
-    assert!(whoami["description"]
-        .as_str()
-        .is_some_and(|text| !text.is_empty()));
-    assert_eq!(whoami["inputSchema"]["type"], "object");
-    assert!(whoami["inputSchema"]["properties"].is_object());
-    assert_eq!(whoami["inputSchema"]["additionalProperties"], false);
 
     let unknown = responses.get("n:5").expect("unknown method response");
     assert_eq!(unknown["error"]["code"], -32601);
@@ -367,6 +391,17 @@ fn serves_discovery_tools_and_protocol_errors() {
         .as_str()
         .is_some_and(|message| message.contains("params")));
 
+    let sync = &responses.get("n:15").expect("sync response")["result"];
+    assert_eq!(sync["resultType"], "complete");
+    assert_eq!(sync["isError"], true);
+    assert!(
+        sync.get("structuredContent").is_none(),
+        "a failed sync must not carry a structured payload: {sync}"
+    );
+    assert!(sync["content"][0]["text"]
+        .as_str()
+        .is_some_and(|text| text.contains("sync failed")));
+
     for line in responses.keys() {
         assert!(
             !line.contains("api_key"),
@@ -407,7 +442,7 @@ fn answers_requests_read_before_stdin_closes() {
         responses.get("n:2").expect("tools list")["result"]["tools"]
             .as_array()
             .map(Vec::len),
-        Some(1)
+        Some(7)
     );
     assert_eq!(
         responses.get("n:3").expect("unknown method")["error"]["code"],

@@ -10,15 +10,12 @@
 //! slow tool cannot block stdin, and written by a single task fed through a
 //! bounded queue. Stderr is reserved for diagnostics.
 
-mod protocol;
-mod server;
-mod tools;
-
-use server::Server;
 use std::io;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
+use zul_mcp::protocol;
+use zul_mcp::server::Server;
 
 /// Largest request line accepted on stdin, in bytes.
 const MAX_LINE_BYTES: usize = 1024 * 1024;

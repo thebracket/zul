@@ -18,3 +18,4 @@ tokio = { workspace = true, features = ["io-std", "io-util", "net", "rt", "sync"
 
 [dev-dependencies]
 tempfile.workspace = true
+wiremock.workspace = true
