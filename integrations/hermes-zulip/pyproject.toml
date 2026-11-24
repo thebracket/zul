@@ -13,6 +13,9 @@ classifiers = [
 ]
 dependencies = []
 
+[project.scripts]
+hermes-zulip-install = "hermes_zulip.install:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
