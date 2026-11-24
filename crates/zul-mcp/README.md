@@ -394,22 +394,26 @@ Cursors and gaps:
   batch.
 - Push streams announce truncation with a fresh `active` notification carrying
   `truncated: true`, and the announced cursor depends on the cause:
-  - Aged truncation advances the announced cursor past the aged message (the
-    same position poll reports). `active` and subsequent heartbeats report that
-    advanced cursor, so resuming from it moves forward instead of repeating the
-    same truncation.
+  - Aged-only truncation advances the announced cursor past the aged message
+    (the same position poll reports). `active` and subsequent heartbeats report
+    that advanced cursor, so resuming from it moves forward instead of repeating
+    the same truncation.
   - Page-cap truncation re-anchors the announced cursor to the safe pre-batch
     position, because matching messages in the cut-short batch may still be
     queued. The stream's internal fetch position stays at the last evaluated
     message, so the live stream keeps progressing without refetching the batch.
+    When a batch is both aged-truncated and page-cap-truncated, page-cap wins:
+    the announced/heartbeat cursor is the safe pre-batch position, so a resume
+    may replay duplicates but never skips, while the internal fetch position
+    still advances.
 - Resuming from a page-cap re-anchored cursor can replay matching messages that
   were already delivered before the truncation. This is at-least-once delivery
   with no silent gap; when possible, resume a watch from the last event cursor
   you actually processed. A watch reports skipped events in its wake message.
 - `maxAgeMs: 0` is not a useful watch setting. Any message is already older than
   the exact evaluation instant when it is fetched, so a batch of matching
-  messages is announced as truncated and no event is delivered; the cursor
-  still advances past each aged message.
+  messages is announced as truncated and no event is delivered; the internal
+  fetch position still advances past each aged message.
 - The upstream page cap is 25 pages of 1,000 messages (25,000 per fetch), and
   `truncated` is set only when the cap was reached on a full final page that
   still advanced: more history may remain. A short final page proves the batch
