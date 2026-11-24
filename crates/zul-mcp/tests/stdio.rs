@@ -1030,7 +1030,7 @@ fn events_list_and_poll_serve_the_extension() {
     );
     for parameter in [
         "anchor=newest",
-        "num_before=0",
+        "num_before=1",
         "num_after=0",
         "include_anchor=true",
     ] {
@@ -1105,6 +1105,10 @@ fn stream_aborts_at_eof_without_a_result_or_a_credential_leak() {
     assert!(
         request.contains("anchor=newest"),
         "stream setup must ask for the newest message: {request}"
+    );
+    assert!(
+        request.contains("num_before=1"),
+        "stream setup must use the one-message window that returns the newest id: {request}"
     );
 }
 

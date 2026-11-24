@@ -1355,12 +1355,18 @@ async fn null_cursor_stream_starts_at_the_newest_message() {
     let mock = MockServer::start().await;
     let timestamp = now();
     mount_with(&mock, move |request: &wiremock::Request| {
-        let anchor = request
-            .url
-            .query_pairs()
-            .find(|(key, _)| key == "anchor")
-            .map(|(_, value)| value.to_string());
-        let messages = if anchor.as_deref() == Some("newest") {
+        let query = |name: &str| {
+            request
+                .url
+                .query_pairs()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.to_string())
+        };
+        // A zero-window newest anchor returns no rows from real Zulip, so only
+        // the one-message window may resolve to the newest id.
+        let messages = if query("anchor").as_deref() == Some("newest")
+            && query("num_before").as_deref() == Some("1")
+        {
             vec![message(
                 777,
                 "core",

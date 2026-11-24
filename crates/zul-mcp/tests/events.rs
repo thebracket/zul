@@ -205,7 +205,7 @@ async fn null_cursor_starts_from_now_without_replaying_backlog() {
     Mock::given(method("GET"))
         .and(path("/api/v1/messages"))
         .and(query_param("anchor", "newest"))
-        .and(query_param("num_before", "0"))
+        .and(query_param("num_before", "1"))
         .and(query_param("num_after", "0"))
         .and(query_param("include_anchor", "true"))
         .and(query_param("apply_markdown", "true"))
@@ -251,6 +251,7 @@ async fn null_cursor_on_an_empty_realm_uses_zero_and_normalizes_the_realm() {
     Mock::given(method("GET"))
         .and(path("/api/v1/messages"))
         .and(query_param("anchor", "newest"))
+        .and(query_param("num_before", "1"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "result": "success",
             "msg": "",

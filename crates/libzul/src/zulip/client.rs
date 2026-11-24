@@ -128,15 +128,18 @@ impl ZulipClient {
 
     /// Fetch the ID of the newest message visible to the current user.
     ///
-    /// Returns `None` when the realm has no messages. The request asks for the
-    /// newest anchor itself (`anchor=newest`, `include_anchor=true`) with no
-    /// messages before or after it, so the response carries at most one message.
+    /// Returns `None` when the realm has no messages. Zulip returns no rows for
+    /// `anchor=newest` with a zero window (`num_before=0`, `num_after=0`), even
+    /// with `include_anchor=true`, so the request asks for the one message
+    /// before the anchor (`num_before=1`, `num_after=0`,
+    /// `include_anchor=true`). The largest integer `id` in that response is the
+    /// newest message.
     pub async fn latest_message_id(&self) -> Result<Option<i64>> {
         let data = self
             .get("/api/v1/messages")
             .query(&[
                 ("anchor", "newest"),
-                ("num_before", "0"),
+                ("num_before", "1"),
                 ("num_after", "0"),
                 ("apply_markdown", "true"),
                 ("client_gravatar", "false"),
@@ -529,6 +532,8 @@ mod tests {
     #[tokio::test]
     async fn latest_message_id_chooses_the_newest_integer_id() {
         let server = MockServer::start().await;
+        // Real Zulip returns no rows for a zero-window newest anchor, so a
+        // request with `num_before=0` must not be what the client sends.
         Mock::given(method("GET"))
             .and(path("/api/v1/messages"))
             .and(query_param("anchor", "newest"))
@@ -538,10 +543,25 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "result": "success",
                 "msg": "",
+                "messages": [],
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/messages"))
+            .and(query_param("anchor", "newest"))
+            .and(query_param("num_before", "1"))
+            .and(query_param("num_after", "0"))
+            .and(query_param("include_anchor", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": "success",
+                "msg": "",
                 "messages": [
                     raw_message(json!(41)),
                     raw_message(json!("999")),
                     raw_message(json!(43)),
+                    raw_message(json!(175119)),
                 ],
             })))
             .expect(1)
@@ -553,7 +573,11 @@ mod tests {
             "ada@example.com".to_string(),
             "key".to_string(),
         );
-        assert_eq!(client.latest_message_id().await.unwrap(), Some(43));
+        assert_eq!(
+            client.latest_message_id().await.unwrap(),
+            Some(175119),
+            "the one-message window before the newest anchor carries the newest id"
+        );
         server.verify().await;
     }
 
