@@ -313,6 +313,37 @@ impl ZulipClient {
         Ok(data.id)
     }
 
+    /// Send a typing notification for a stream message compose box.
+    pub async fn send_typing_stream(&self, stream_id: i64, topic: &str, op: &str) -> Result<()> {
+        let stream_id = stream_id.to_string();
+        self.post("/api/v1/typing")
+            .form(&[
+                ("type", "stream"),
+                ("op", op),
+                ("to", stream_id.as_str()),
+                ("topic", topic),
+            ])
+            .send()
+            .await?
+            .json::<ZulipApiResponse<EmptyResponse>>()
+            .await?
+            .into_data()?;
+        Ok(())
+    }
+
+    /// Send a typing notification for a direct-message compose box.
+    pub async fn send_typing_direct(&self, recipients: &[i64], op: &str) -> Result<()> {
+        let to = serde_json::to_string(recipients)?;
+        self.post("/api/v1/typing")
+            .form(&[("type", "direct"), ("op", op), ("to", &to)])
+            .send()
+            .await?
+            .json::<ZulipApiResponse<EmptyResponse>>()
+            .await?
+            .into_data()?;
+        Ok(())
+    }
+
     /// Upload file bytes and return the uploaded file metadata.
     pub async fn upload_file_bytes(
         &self,
@@ -665,7 +696,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::Mutex;
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{body_string_contains, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn raw_message(id: serde_json::Value) -> serde_json::Value {
@@ -920,5 +951,64 @@ mod tests {
 
         assert_eq!(message.id, 10);
         assert_eq!(message.raw_json["reactions"][0]["emoji_name"], "thumbs_up");
+    }
+
+    #[tokio::test]
+    async fn typing_stream_posts_stream_form() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/typing"))
+            .and(body_string_contains("type=stream"))
+            .and(body_string_contains("op=start"))
+            .and(body_string_contains("to=42"))
+            .and(body_string_contains("topic=ops"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": "success",
+                "msg": "",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = ZulipClient::new(
+            server.uri(),
+            "ada@example.com".to_string(),
+            "key".to_string(),
+        );
+        client
+            .send_typing_stream(42, "ops", "start")
+            .await
+            .expect("stream typing");
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn typing_direct_posts_recipient_ids() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/typing"))
+            .and(body_string_contains("type=direct"))
+            .and(body_string_contains("op=stop"))
+            .and(body_string_contains("to=%5B7%2C8%5D"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": "success",
+                "msg": "",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = ZulipClient::new(
+            server.uri(),
+            "ada@example.com".to_string(),
+            "key".to_string(),
+        );
+        client
+            .send_typing_direct(&[7, 8], "stop")
+            .await
+            .expect("direct typing");
+
+        server.verify().await;
     }
 }

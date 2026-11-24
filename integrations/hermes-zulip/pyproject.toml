@@ -1,0 +1,19 @@
+[build-system]
+requires = ["maturin>=1.8,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "zul-bridge"
+description = "Blocking Python bridge over libzul for the Hermes Zulip adapter"
+requires-python = ">=3.11"
+dynamic = ["version"]
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[tool.maturin]
+module-name = "zul_bridge"
+# `extension-module` stops pyo3 linking libpython on Unix; only the wheel build
+# wants that, so plain `cargo test` does not enable it.
+features = ["extension-module"]

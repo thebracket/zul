@@ -1,4 +1,6 @@
 /target/
+/integrations/hermes-zulip/target/
+/integrations/hermes-zulip/.venv/
 .env
 .env.*
 !.env.example
