@@ -328,11 +328,15 @@ fn newest_integer_id(messages: &[serde_json::Value]) -> Option<i64> {
         .max()
 }
 
-type PageFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<serde_json::Value>>> + 'a>>;
+type PageFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<serde_json::Value>>> + Send + 'a>>;
 
 /// One source of forward message pages, so pagination can be tested without a
 /// network.
-trait PageSource {
+///
+/// The returned future is `Send` and the source is `Sync`, so callers that
+/// await forward pagination keep a `Send` future (the TUI polls on a spawned
+/// task).
+trait PageSource: Sync {
     /// Fetch the page of messages after `anchor`.
     fn page<'a>(&'a self, anchor: &'a str) -> PageFuture<'a>;
 }
@@ -401,7 +405,7 @@ async fn collect_messages_after(
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::cell::RefCell;
+    use std::sync::Mutex;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -426,14 +430,17 @@ mod tests {
     }
 
     struct FakePages {
-        pages: RefCell<Vec<Vec<serde_json::Value>>>,
-        anchors: RefCell<Vec<String>>,
+        pages: Mutex<Vec<Vec<serde_json::Value>>>,
+        anchors: Mutex<Vec<String>>,
     }
 
     impl PageSource for FakePages {
         fn page<'a>(&'a self, anchor: &'a str) -> PageFuture<'a> {
-            self.anchors.borrow_mut().push(anchor.to_string());
-            let page = self.pages.borrow_mut().remove(0);
+            self.anchors
+                .lock()
+                .expect("anchors lock")
+                .push(anchor.to_string());
+            let page = self.pages.lock().expect("pages lock").remove(0);
             Box::pin(async move { Ok(page) })
         }
     }
@@ -454,11 +461,11 @@ mod tests {
     #[tokio::test]
     async fn truncation_flag_follows_the_page_cap_boundary() {
         let full_then_full = FakePages {
-            pages: RefCell::new(vec![
+            pages: Mutex::new(vec![
                 raw_page(11, MESSAGES_PAGE_SIZE),
                 raw_page(1011, MESSAGES_PAGE_SIZE),
             ]),
-            anchors: RefCell::new(Vec::new()),
+            anchors: Mutex::new(Vec::new()),
         };
         let (messages, truncated) = collect_messages_after(&full_then_full, 10, 2)
             .await
@@ -468,16 +475,16 @@ mod tests {
         assert_eq!(messages.first().map(|message| message.id), Some(11));
         assert_eq!(messages.last().map(|message| message.id), Some(2010));
         assert_eq!(
-            *full_then_full.anchors.borrow(),
+            *full_then_full.anchors.lock().expect("anchors lock"),
             vec!["10".to_string(), "1010".to_string()]
         );
 
         let duplicate_full_page = FakePages {
-            pages: RefCell::new(vec![
+            pages: Mutex::new(vec![
                 raw_page(11, MESSAGES_PAGE_SIZE),
                 raw_page(11, MESSAGES_PAGE_SIZE),
             ]),
-            anchors: RefCell::new(Vec::new()),
+            anchors: Mutex::new(Vec::new()),
         };
         let (messages, truncated) = collect_messages_after(&duplicate_full_page, 10, 2)
             .await
@@ -488,16 +495,16 @@ mod tests {
         );
         assert_eq!(messages.len(), MESSAGES_PAGE_SIZE);
         assert_eq!(
-            *duplicate_full_page.anchors.borrow(),
+            *duplicate_full_page.anchors.lock().expect("anchors lock"),
             vec!["10".to_string(), "1010".to_string()]
         );
 
         let full_then_short = FakePages {
-            pages: RefCell::new(vec![
+            pages: Mutex::new(vec![
                 raw_page(11, MESSAGES_PAGE_SIZE),
                 raw_page(1011, MESSAGES_PAGE_SIZE - 1),
             ]),
-            anchors: RefCell::new(Vec::new()),
+            anchors: Mutex::new(Vec::new()),
         };
         let (messages, truncated) = collect_messages_after(&full_then_short, 10, 2)
             .await
@@ -506,14 +513,17 @@ mod tests {
         assert_eq!(messages.len(), MESSAGES_PAGE_SIZE * 2 - 1);
 
         let short = FakePages {
-            pages: RefCell::new(vec![raw_page(11, MESSAGES_PAGE_SIZE - 1)]),
-            anchors: RefCell::new(Vec::new()),
+            pages: Mutex::new(vec![raw_page(11, MESSAGES_PAGE_SIZE - 1)]),
+            anchors: Mutex::new(Vec::new()),
         };
         let (_, truncated) = collect_messages_after(&short, 10, 2)
             .await
             .expect("short page");
         assert!(!truncated);
-        assert_eq!(*short.anchors.borrow(), vec!["10".to_string()]);
+        assert_eq!(
+            *short.anchors.lock().expect("anchors lock"),
+            vec!["10".to_string()]
+        );
     }
 
     #[tokio::test]
