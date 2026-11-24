@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-use zul_mcp::events::{self, PollError};
+use zul_mcp::events::{self, EventsError};
 use zul_mcp::protocol;
 
 const API_KEY: &str = "zul-mcp-events-test-key-8d1a-DO-NOT-LEAK";
@@ -119,7 +119,7 @@ fn assert_invalid_params(params: Value) {
     assert!(
         matches!(
             events::parse_poll_params(&params),
-            Err(PollError::InvalidParams(_))
+            Err(EventsError::InvalidParams(_))
         ),
         "expected invalid params for {params}"
     );
@@ -373,6 +373,10 @@ async fn filters_apply_exact_stream_topic_sender_and_exclude_self() {
     )
     .await;
     assert_eq!(event_ids(&stream_only), vec![10, 11, 14]);
+    assert!(
+        !event_ids(&stream_only).contains(&13),
+        "a stream filter must never match a direct message"
+    );
 
     let wrong_topic = poll(
         &settings,
@@ -392,7 +396,7 @@ async fn filters_apply_exact_stream_topic_sender_and_exclude_self() {
 }
 
 #[tokio::test]
-async fn direct_messages_use_a_stream_label_and_a_null_topic() {
+async fn direct_messages_use_null_stream_and_topic() {
     let dir = TempDir::new().expect("temp dir");
     let server = MockServer::start().await;
     let base = now();
@@ -438,7 +442,10 @@ async fn direct_messages_use_a_stream_label_and_a_null_topic() {
     assert_eq!(data["message_id"], 13);
     assert_eq!(data["realm"], server.uri());
     assert_eq!(data["message_type"], "private");
-    assert_eq!(data["stream"], "direct message");
+    assert!(
+        data["stream"].is_null(),
+        "direct messages have no filterable stream"
+    );
     assert!(data["topic"].is_null());
     assert_eq!(data["sender_name"], "Grace");
     assert_eq!(data["sender_email"], "grace@example.com");
@@ -714,7 +721,7 @@ async fn malformed_and_foreign_cursors_are_rejected_without_contacting_zulip() {
             .await
             .expect_err("cursor must be rejected");
         assert!(
-            matches!(error, PollError::InvalidParams(_)),
+            matches!(error, EventsError::InvalidParams(_)),
             "cursor {cursor:?} must be invalid params"
         );
         assert!(!error.message().contains(API_KEY));
@@ -766,7 +773,7 @@ async fn errors_never_include_the_api_key() {
     let error = events::poll(&settings, params)
         .await
         .expect_err("upstream rejection must fail");
-    assert!(matches!(error, PollError::Internal(_)));
+    assert!(matches!(error, EventsError::Internal(_)));
     assert!(error.message().contains("Invalid API key"));
     assert!(!error.message().contains(API_KEY));
 
@@ -779,7 +786,7 @@ async fn errors_never_include_the_api_key() {
     let error = events::poll(&settings, params)
         .await
         .expect_err("missing credentials must fail");
-    assert!(matches!(error, PollError::Internal(_)));
+    assert!(matches!(error, EventsError::Internal(_)));
     assert!(error.message().contains("missing Zulip API key"));
     assert!(!error.message().contains(API_KEY));
     assert!(!error.message().contains('\n'), "errors stay one line");

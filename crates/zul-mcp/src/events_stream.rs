@@ -13,10 +13,7 @@
 //! and retried with jittered backoff; the poll loop only claims progress after
 //! a successful fetch.
 
-use crate::events::{
-    self, configured_realm, encode_cursor, matches_message, occurrence, PollFilter, StreamParams,
-    MESSAGES_AFTER_BATCH_LIMIT,
-};
+use crate::events::{self, encode_cursor, evaluate, occurrence, PollFilter, StreamParams};
 use crate::protocol::{self, RequestId};
 use crate::tools::one_line;
 use chrono::Utc;
@@ -134,6 +131,37 @@ impl SubscribeError {
     }
 }
 
+/// Capacity reserved for one stream while its setup is still in flight.
+///
+/// Setup can make an upstream request (`latest_message_id`), so the stream cap
+/// must be claimed before that call rather than only at subscription time.
+/// Dropping an unconsumed permit releases the reservation, including on setup
+/// failure or timeout.
+pub(crate) struct HubPermit {
+    hub: Rc<StreamHub>,
+    held: bool,
+}
+
+impl HubPermit {
+    /// Turn the reservation into a registered subscriber.
+    fn consume(mut self) {
+        self.hub
+            .reserved
+            .set(self.hub.reserved.get().saturating_sub(1));
+        self.held = false;
+    }
+}
+
+impl Drop for HubPermit {
+    fn drop(&mut self) {
+        if self.held {
+            self.hub
+                .reserved
+                .set(self.hub.reserved.get().saturating_sub(1));
+        }
+    }
+}
+
 struct Account {
     settings: Rc<Settings>,
     realm: String,
@@ -141,11 +169,26 @@ struct Account {
 
 struct Subscriber {
     generation: u64,
+    /// Resume position reported by `active` and heartbeats. A truncation
+    /// re-anchor moves this back to the announced safe cursor.
     cursor: Rc<Cell<i64>>,
+    /// Next message the subscriber still needs. Never regresses, so a
+    /// re-anchor does not refetch and redeliver the same batch forever.
+    fetch_cursor: Rc<Cell<i64>>,
     filter: PollFilter,
     max_age_ms: Option<i64>,
     account_email: Option<String>,
     tx: mpsc::Sender<Delivery>,
+}
+
+/// Everything needed to register one subscription.
+pub(crate) struct SubscriptionRequest {
+    pub(crate) id: RequestId,
+    pub(crate) realm: String,
+    pub(crate) start_cursor: i64,
+    pub(crate) params: StreamParams,
+    pub(crate) heartbeat: Duration,
+    pub(crate) settings: Rc<Settings>,
 }
 
 /// A registered subscription: its delivery queue, cursor, and lifetime guard.
@@ -175,6 +218,7 @@ impl Drop for SubscriptionGuard {
 pub struct StreamHub {
     config: EventsConfig,
     subscribers: RefCell<HashMap<String, Subscriber>>,
+    reserved: Cell<usize>,
     account: RefCell<Option<Account>>,
     poller: RefCell<Option<JoinHandle<()>>>,
     poller_running: Cell<bool>,
@@ -189,6 +233,7 @@ impl StreamHub {
         Self {
             config,
             subscribers: RefCell::new(HashMap::new()),
+            reserved: Cell::new(0),
             account: RefCell::new(None),
             poller: RefCell::new(None),
             poller_running: Cell::new(false),
@@ -198,20 +243,60 @@ impl StreamHub {
         }
     }
 
+    /// Reserve one stream slot before any setup work that can hit upstream.
+    pub(crate) fn reserve(self: &Rc<Self>) -> Result<HubPermit, SubscribeError> {
+        if self.shutting_down.get() {
+            return Err(SubscribeError::ShuttingDown);
+        }
+        let in_use = self.subscribers.borrow().len() + self.reserved.get();
+        if in_use >= self.config.max_streams {
+            return Err(SubscribeError::TooManyStreams {
+                limit: self.config.max_streams,
+            });
+        }
+        self.reserved.set(self.reserved.get() + 1);
+        Ok(HubPermit {
+            hub: Rc::clone(self),
+            held: true,
+        })
+    }
+
     /// Register one subscription and make sure the shared poller is running.
+    ///
+    /// Test convenience: production setup reserves first and calls
+    /// [`Self::subscribe_with_permit`].
+    #[cfg(test)]
     pub(crate) fn subscribe(
         self: &Rc<Self>,
-        id: RequestId,
-        start_cursor: i64,
-        params: StreamParams,
-        heartbeat: Duration,
-        settings: Rc<Settings>,
+        request: SubscriptionRequest,
     ) -> Result<Subscription, SubscribeError> {
+        let permit = self.reserve()?;
+        self.subscribe_with_permit(permit, request)
+    }
+
+    /// Register one subscription under an already reserved stream slot.
+    ///
+    /// Setup callers reserve before their upstream request and pass the permit
+    /// here, so the cap covers setup as well as running streams. The permit is
+    /// consumed on success and released on any failure.
+    pub(crate) fn subscribe_with_permit(
+        self: &Rc<Self>,
+        permit: HubPermit,
+        request: SubscriptionRequest,
+    ) -> Result<Subscription, SubscribeError> {
+        let SubscriptionRequest {
+            id,
+            realm,
+            start_cursor,
+            params,
+            heartbeat,
+            settings,
+        } = request;
+        debug_assert!(Rc::ptr_eq(&permit.hub, self));
         if self.shutting_down.get() {
             return Err(SubscribeError::ShuttingDown);
         }
 
-        let realm = configured_realm(&settings);
         {
             let mut account = self.account.borrow_mut();
             match account.as_ref() {
@@ -229,16 +314,13 @@ impl StreamHub {
         }
 
         let mut subscribers = self.subscribers.borrow_mut();
-        if subscribers.len() >= self.config.max_streams {
-            return Err(SubscribeError::TooManyStreams {
-                limit: self.config.max_streams,
-            });
-        }
+        debug_assert!(subscribers.len() < self.config.max_streams);
 
         let key = id.registry_key();
         let generation = self.next_generation.get().wrapping_add(1);
         self.next_generation.set(generation);
         let cursor = Rc::new(Cell::new(start_cursor));
+        let fetch_cursor = Rc::new(Cell::new(start_cursor));
         let capacity = self.config.subscriber_capacity.max(1);
         let (tx, rx) = mpsc::channel(capacity);
         let account_email = settings.zulip.email.clone();
@@ -247,6 +329,7 @@ impl StreamHub {
             Subscriber {
                 generation,
                 cursor: Rc::clone(&cursor),
+                fetch_cursor,
                 filter: params.arguments,
                 max_age_ms: params.max_age_ms,
                 account_email,
@@ -259,6 +342,9 @@ impl StreamHub {
             let hub = Rc::clone(self);
             *self.poller.borrow_mut() = Some(tokio::task::spawn_local(poll_loop(hub)));
         }
+        // The inserted subscriber now counts against the cap; release the
+        // setup reservation without double-counting.
+        permit.consume();
         drop(subscribers);
 
         Ok(Subscription {
@@ -305,7 +391,13 @@ impl StreamHub {
         self.subscribers
             .borrow()
             .iter()
-            .map(|(key, subscriber)| (key.clone(), subscriber.generation, subscriber.cursor.get()))
+            .map(|(key, subscriber)| {
+                (
+                    key.clone(),
+                    subscriber.generation,
+                    subscriber.fetch_cursor.get(),
+                )
+            })
             .collect()
     }
 
@@ -330,10 +422,16 @@ impl StreamHub {
 
     /// Fan one ascending batch out to every subscriber that still needs it.
     ///
-    /// Evaluation (cursor check, age, filter) and queueing happen together, so
+    /// Evaluation (cursor check, match, age) and queueing happen together, so
     /// a message is enqueued at most once per subscriber. Filtered and aged
-    /// messages still advance the cursor.
-    fn dispatch(&self, messages: Vec<ZulipMessage>, targets: &[(String, u64, i64)]) {
+    /// messages still advance the cursor. A truncation re-anchors the
+    /// subscription to the safe pre-batch cursor it announces.
+    fn dispatch(
+        &self,
+        messages: Vec<ZulipMessage>,
+        batch_truncated: bool,
+        targets: &[(String, u64, i64)],
+    ) {
         if targets.is_empty() {
             return;
         }
@@ -342,15 +440,14 @@ impl StreamHub {
             .map(|(key, generation, _)| (key.as_str(), *generation))
             .collect();
         let now_ms = Utc::now().timestamp_millis();
-        let cap_hit = messages.len() >= MESSAGES_AFTER_BATCH_LIMIT;
-        // A safe resume point is the cursor from before this batch: matching
-        // messages in the batch are evaluated but may still be queued, so a
-        // truncated notification must not claim they were delivered.
+        // A safe resume point is the fetch position from before this batch:
+        // matching messages in the batch are evaluated but may still be queued,
+        // so a truncated notification must not claim they were delivered.
         let batch_start: HashMap<String, i64> = self
             .subscribers
             .borrow()
             .iter()
-            .map(|(key, subscriber)| (key.clone(), subscriber.cursor.get()))
+            .map(|(key, subscriber)| (key.clone(), subscriber.fetch_cursor.get()))
             .collect();
         let mut truncated: HashSet<String> = HashSet::new();
         let mut overflowed: Vec<(String, mpsc::Sender<Delivery>)> = Vec::new();
@@ -364,23 +461,24 @@ impl StreamHub {
                     if targets.get(key.as_str()) != Some(&subscriber.generation) {
                         continue;
                     }
-                    if message.id <= subscriber.cursor.get() {
+                    if message.id <= subscriber.fetch_cursor.get() {
                         continue;
                     }
-                    if let Some(max_age_ms) = subscriber.max_age_ms {
-                        let age_ms = now_ms.saturating_sub(message.timestamp.timestamp_millis());
-                        if age_ms > max_age_ms {
-                            subscriber.cursor.set(message.id);
-                            truncated.insert(key.clone());
-                            continue;
-                        }
-                    }
-                    if !matches_message(
-                        &subscriber.filter,
+                    let evaluation = evaluate(
                         &message,
+                        &subscriber.filter,
                         subscriber.account_email.as_deref(),
-                    ) {
+                        subscriber.max_age_ms,
+                        now_ms,
+                    );
+                    if evaluation.advance {
+                        subscriber.fetch_cursor.set(message.id);
                         subscriber.cursor.set(message.id);
+                    }
+                    if evaluation.truncated {
+                        truncated.insert(key.clone());
+                    }
+                    if !evaluation.deliver {
                         continue;
                     }
                     match subscriber
@@ -403,7 +501,7 @@ impl StreamHub {
             }
         }
 
-        if cap_hit {
+        if batch_truncated {
             let subscribers = self.subscribers.borrow();
             for (key, subscriber) in subscribers.iter() {
                 if targets.get(key.as_str()) == Some(&subscriber.generation) {
@@ -422,12 +520,17 @@ impl StreamHub {
         }
     }
 
-    fn push_truncated(&self, key: &str, cursor: i64) {
-        let subscribers = self.subscribers.borrow();
-        let Some(subscriber) = subscribers.get(key) else {
+    fn push_truncated(&self, key: &str, cursor_id: i64) {
+        let cursor = encode_cursor(&self.realm(), cursor_id);
+        let mut subscribers = self.subscribers.borrow_mut();
+        let Some(subscriber) = subscribers.get_mut(key) else {
             return;
         };
-        let cursor = encode_cursor(&self.realm(), cursor);
+        // Re-anchor the announced cursor to the safe position, so `active` and
+        // later heartbeats report one resume point. The fetch cursor stays at
+        // the last evaluated message, so the same batch is not refetched and
+        // redelivered forever.
+        subscriber.cursor.set(cursor_id);
         let tx = subscriber.tx.clone();
         drop(subscribers);
         match tx.try_send(Delivery::Truncated { cursor }) {
@@ -480,10 +583,6 @@ impl StreamHub {
             terminate(tx, code, message.clone());
         }
     }
-
-    fn next_backoff(&self, current: Duration) -> Duration {
-        current.saturating_mul(2).min(MAX_BACKOFF)
-    }
 }
 
 fn overflow_message() -> String {
@@ -524,10 +623,10 @@ async fn poll_loop(hub: Rc<StreamHub>) {
             }
         };
 
-        match client.messages_after(anchor).await {
-            Ok(mut messages) => {
+        match client.messages_after_with_truncation(anchor).await {
+            Ok((mut messages, batch_truncated)) => {
                 messages.sort_by_key(|message| message.id);
-                hub.dispatch(messages, &targets);
+                hub.dispatch(messages, batch_truncated, &targets);
                 delay = interval;
             }
             Err(err) => {
@@ -541,7 +640,9 @@ async fn poll_loop(hub: Rc<StreamHub>) {
                     return;
                 }
                 hub.report_error(format!("events/stream upstream poll failed: {message}"));
-                delay = jittered(&hub, hub.next_backoff(delay));
+                let seed = advance_rng(hub.rng.get());
+                hub.rng.set(seed);
+                delay = jittered(seed, next_backoff(delay));
             }
         }
 
@@ -552,14 +653,19 @@ async fn poll_loop(hub: Rc<StreamHub>) {
     }
 }
 
+/// Double a retry delay, capped at [`MAX_BACKOFF`].
+fn next_backoff(current: Duration) -> Duration {
+    current.saturating_mul(2).min(MAX_BACKOFF)
+}
+
+/// Advance the deterministic pseudo-random state used for retry jitter.
+fn advance_rng(seed: u64) -> u64 {
+    seed.wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407)
+}
+
 /// Add deterministic pseudo-random jitter of roughly ±25% to a retry delay.
-fn jittered(hub: &StreamHub, duration: Duration) -> Duration {
-    let seed = hub
-        .rng
-        .get()
-        .wrapping_mul(6_364_136_223_846_793_005)
-        .wrapping_add(1_442_695_040_888_963_407);
-    hub.rng.set(seed);
+fn jittered(seed: u64, duration: Duration) -> Duration {
     let base = duration.as_millis().max(1) as u64;
     let quarter = base / 4;
     let spread = quarter.saturating_mul(2).max(1);
@@ -772,6 +878,23 @@ mod tests {
         events::parse_stream_params(&json!({"name": EVENT_NAME})).expect("params")
     }
 
+    fn subscription_request(
+        realm: String,
+        id: i64,
+        start_cursor: i64,
+        params: StreamParams,
+        heartbeat: Duration,
+    ) -> SubscriptionRequest {
+        SubscriptionRequest {
+            id: RequestId::Number(id.into()),
+            realm,
+            start_cursor,
+            params,
+            heartbeat,
+            settings: Rc::new(settings()),
+        }
+    }
+
     fn hub(config: EventsConfig) -> Rc<StreamHub> {
         Rc::new(StreamHub::new(config))
     }
@@ -837,17 +960,18 @@ mod tests {
                     ..config()
                 });
                 let mut subscription = hub
-                    .subscribe(
-                        RequestId::Number(1.into()),
+                    .subscribe(subscription_request(
+                        "https://chat.example".to_string(),
+                        1,
                         100,
                         stream_params(),
                         Duration::from_secs(30),
-                        Rc::new(settings()),
-                    )
+                    ))
                     .expect("subscription");
                 let targets = hub.snapshot();
                 hub.dispatch(
                     vec![message(101, Utc::now()), message(102, Utc::now())],
+                    false,
                     &targets,
                 );
                 assert_eq!(hub.subscribers.borrow().len(), 0);
@@ -877,17 +1001,18 @@ mod tests {
                     ..config()
                 });
                 let subscription = hub
-                    .subscribe(
-                        RequestId::Number(1.into()),
+                    .subscribe(subscription_request(
+                        "https://chat.example".to_string(),
+                        1,
                         100,
                         stream_params(),
                         Duration::from_secs(30),
-                        Rc::new(settings()),
-                    )
+                    ))
                     .expect("subscription");
                 let targets = hub.snapshot();
                 hub.dispatch(
                     vec![message(101, Utc::now()), message(102, Utc::now())],
+                    false,
                     &targets,
                 );
                 let (tx, mut rx) = mpsc::channel(8);
@@ -931,23 +1056,23 @@ mod tests {
                 let mut held = Vec::new();
                 for id in [1, 2] {
                     held.push(
-                        hub.subscribe(
-                            RequestId::Number(id.into()),
+                        hub.subscribe(subscription_request(
+                            "https://chat.example".to_string(),
+                            id.into(),
                             100,
                             stream_params(),
                             Duration::from_secs(30),
-                            Rc::new(settings()),
-                        )
+                        ))
                         .expect("subscription"),
                     );
                 }
-                let error = match hub.subscribe(
-                    RequestId::Number(3.into()),
+                let error = match hub.subscribe(subscription_request(
+                    "https://chat.example".to_string(),
+                    3,
                     100,
                     stream_params(),
                     Duration::from_secs(30),
-                    Rc::new(settings()),
-                ) {
+                )) {
                     Ok(_) => panic!("third stream must be rejected"),
                     Err(error) => error,
                 };
@@ -959,25 +1084,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn max_age_marks_truncation_and_still_advances_the_cursor() {
+    async fn reservation_covers_setup_and_is_released_on_drop() {
+        LocalSet::new()
+            .run_until(async {
+                let hub = hub(EventsConfig {
+                    max_streams: 1,
+                    ..config()
+                });
+                let permit = hub.reserve().expect("first reservation");
+                match hub.reserve() {
+                    Ok(_) => panic!("a second setup must be rejected at the cap"),
+                    Err(error) => assert_eq!(error, SubscribeError::TooManyStreams { limit: 1 }),
+                }
+                drop(permit);
+                let _released = hub.reserve().expect("dropping the permit releases it");
+                hub.shutdown();
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn subscribe_binds_the_validated_realm() {
+        LocalSet::new()
+            .run_until(async {
+                let hub = hub(config());
+                let _first = hub
+                    .subscribe(subscription_request(
+                        "https://chat.example".to_string(),
+                        1,
+                        100,
+                        stream_params(),
+                        Duration::from_secs(30),
+                    ))
+                    .expect("first realm");
+                match hub.subscribe(subscription_request(
+                    "https://other.example".to_string(),
+                    2,
+                    100,
+                    stream_params(),
+                    Duration::from_secs(30),
+                )) {
+                    Ok(_) => panic!("a second realm must be rejected"),
+                    Err(error) => assert_eq!(error, SubscribeError::RealmMismatch),
+                }
+                hub.shutdown();
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn max_age_marks_truncation_and_re_anchors_the_cursor() {
         LocalSet::new()
             .run_until(async {
                 let hub = hub(config());
                 let mut params = stream_params();
                 params.max_age_ms = Some(0);
                 let mut subscription = hub
-                    .subscribe(
-                        RequestId::Number(1.into()),
+                    .subscribe(subscription_request(
+                        "https://chat.example".to_string(),
+                        1,
                         100,
                         params,
                         Duration::from_secs(30),
-                        Rc::new(settings()),
-                    )
+                    ))
                     .expect("subscription");
                 let cursor = Rc::clone(&subscription.cursor);
                 let old = Utc::now() - chrono::Duration::seconds(10);
-                hub.dispatch(vec![message(101, old)], &hub.snapshot());
-                assert_eq!(cursor.get(), 101);
+                hub.dispatch(vec![message(101, old)], false, &hub.snapshot());
+                assert_eq!(
+                    cursor.get(),
+                    100,
+                    "the subscription cursor follows the announced safe cursor"
+                );
                 match subscription.rx.try_recv() {
                     Ok(Delivery::Truncated { cursor }) => {
                         assert_eq!(cursor, "v1:https://chat.example|100");
@@ -989,5 +1167,218 @@ mod tests {
                 hub.shutdown();
             })
             .await;
+    }
+
+    #[tokio::test]
+    async fn filtered_old_messages_do_not_truncate() {
+        LocalSet::new()
+            .run_until(async {
+                let hub = hub(config());
+                let mut params = stream_params();
+                params.max_age_ms = Some(0);
+                params.arguments.stream = Some("other".to_string());
+                let mut subscription = hub
+                    .subscribe(subscription_request(
+                        "https://chat.example".to_string(),
+                        1,
+                        100,
+                        params,
+                        Duration::from_secs(30),
+                    ))
+                    .expect("subscription");
+                let cursor = Rc::clone(&subscription.cursor);
+                let old = Utc::now() - chrono::Duration::seconds(10);
+                hub.dispatch(vec![message(101, old)], false, &hub.snapshot());
+                assert_eq!(cursor.get(), 101, "a filtered message still advances");
+                assert!(
+                    subscription.rx.try_recv().is_err(),
+                    "a filtered old message is not a replay gap"
+                );
+                drop(subscription);
+                hub.shutdown();
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn batch_cap_truncation_uses_the_pre_batch_cursor() {
+        LocalSet::new()
+            .run_until(async {
+                let hub = hub(config());
+                let mut subscription = hub
+                    .subscribe(subscription_request(
+                        "https://chat.example".to_string(),
+                        1,
+                        100,
+                        stream_params(),
+                        Duration::from_secs(30),
+                    ))
+                    .expect("subscription");
+                let cursor = Rc::clone(&subscription.cursor);
+                hub.dispatch(
+                    vec![message(101, Utc::now()), message(102, Utc::now())],
+                    true,
+                    &hub.snapshot(),
+                );
+                assert_eq!(cursor.get(), 100);
+                assert!(matches!(
+                    subscription.rx.try_recv(),
+                    Ok(Delivery::Message(ref message)) if message.id == 101
+                ));
+                assert!(matches!(
+                    subscription.rx.try_recv(),
+                    Ok(Delivery::Message(ref message)) if message.id == 102
+                ));
+                match subscription.rx.try_recv() {
+                    Ok(Delivery::Truncated { cursor }) => {
+                        assert_eq!(cursor, "v1:https://chat.example|100");
+                    }
+                    other => panic!("expected a truncated notification, got {other:?}"),
+                }
+                assert_eq!(
+                    hub.snapshot()[0].2,
+                    102,
+                    "the fetch cursor keeps progressing past the announced re-anchor"
+                );
+
+                // A shared fetch that starts behind this subscriber must not
+                // redeliver the re-anchored batch.
+                hub.dispatch(
+                    vec![
+                        message(101, Utc::now()),
+                        message(102, Utc::now()),
+                        message(103, Utc::now()),
+                    ],
+                    false,
+                    &hub.snapshot(),
+                );
+                assert!(matches!(
+                    subscription.rx.try_recv(),
+                    Ok(Delivery::Message(ref message)) if message.id == 103
+                ));
+                assert_eq!(cursor.get(), 103);
+                assert_eq!(hub.snapshot()[0].2, 103);
+
+                drop(subscription);
+                hub.shutdown();
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn heartbeats_never_run_past_queued_events() {
+        LocalSet::new()
+            .run_until(async {
+                let hub = hub(config());
+                let subscription = hub
+                    .subscribe(subscription_request(
+                        "https://chat.example".to_string(),
+                        1,
+                        100,
+                        stream_params(),
+                        Duration::from_millis(20),
+                    ))
+                    .expect("subscription");
+                let (tx, mut rx) = mpsc::channel(1);
+                let writer = tx.clone();
+                let permit = writer.reserve().await.expect("hold stdout");
+                let serving = tokio::task::spawn_local(serve(subscription, tx));
+
+                // Let `serve` block on the active frame, then queue events
+                // while its only writer is blocked.
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let now = Utc::now();
+                hub.dispatch(
+                    vec![message(101, now), message(102, now), message(103, now)],
+                    false,
+                    &hub.snapshot(),
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                drop(permit);
+
+                let mut last_event = 100;
+                let mut events = Vec::new();
+                let mut heartbeats = 0;
+                let mut actives = 0;
+                for _ in 0..16 {
+                    let frame = next_line(&mut rx).await;
+                    match frame["method"].as_str() {
+                        Some(ACTIVE) => {
+                            actives += 1;
+                            assert_eq!(actives, 1, "exactly one active per stream");
+                            assert_eq!(frame["params"]["cursor"], "v1:https://chat.example|100");
+                        }
+                        Some(EVENT) => {
+                            let id = frame["params"]["data"]["message_id"]
+                                .as_i64()
+                                .expect("message id");
+                            assert_eq!(id, last_event + 1, "events stay ordered");
+                            last_event = id;
+                            events.push(id);
+                        }
+                        Some(HEARTBEAT) => {
+                            let cursor = frame["params"]["cursor"].as_str().expect("cursor");
+                            let id = cursor
+                                .rsplit_once('|')
+                                .expect("cursor delimiter")
+                                .1
+                                .parse::<i64>()
+                                .expect("cursor id");
+                            assert!(
+                                id <= last_event,
+                                "heartbeat {id} advertised an event past the delivered {last_event}"
+                            );
+                            heartbeats += 1;
+                        }
+                        other => panic!("unexpected frame method {other:?}: {frame}"),
+                    }
+                    if events.len() == 3 && heartbeats > 0 {
+                        break;
+                    }
+                }
+                assert_eq!(events, vec![101, 102, 103]);
+                assert_eq!(actives, 1, "exactly one active per stream");
+                assert!(heartbeats > 0, "an idle stream must heartbeat");
+
+                serving.abort();
+                let _ = serving.await;
+                hub.shutdown();
+            })
+            .await;
+    }
+
+    #[test]
+    fn backoff_doubles_and_clamps_at_sixty_seconds() {
+        assert_eq!(next_backoff(Duration::from_secs(1)), Duration::from_secs(2));
+        assert_eq!(
+            next_backoff(Duration::from_secs(30)),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            next_backoff(Duration::from_secs(60)),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            next_backoff(Duration::from_secs(90)),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn jitter_stays_within_quarter_bounds() {
+        let base = Duration::from_secs(4);
+        for seed in 0..1024 {
+            let delayed = jittered(seed, base);
+            assert!(
+                delayed >= Duration::from_millis(3_000),
+                "seed {seed} jittered below 75%: {delayed:?}"
+            );
+            assert!(
+                delayed <= Duration::from_millis(5_000),
+                "seed {seed} jittered above 125%: {delayed:?}"
+            );
+            assert_eq!(jittered(seed, base), jittered(seed, base));
+        }
+        assert!(jittered(7, Duration::from_millis(1)) >= Duration::from_millis(1));
     }
 }

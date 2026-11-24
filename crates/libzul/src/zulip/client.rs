@@ -8,8 +8,16 @@ use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
 use serde_json::json;
 use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
 
 const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Messages requested per forward page by [`ZulipClient::messages_after`].
+const MESSAGES_PAGE_SIZE: usize = 1000;
+
+/// Forward pages fetched by [`ZulipClient::messages_after_with_truncation`].
+const MESSAGES_AFTER_MAX_PAGES: usize = 25;
 
 /// Async Zulip REST client using email/API-key basic authentication.
 #[derive(Clone)]
@@ -125,46 +133,28 @@ impl ZulipClient {
             .json::<ZulipApiResponse<MessagesResponse>>()
             .await?
             .into_data()?;
-        Ok(data
-            .messages
-            .iter()
-            .filter_map(|message| message.get("id"))
-            .filter_map(serde_json::Value::as_i64)
-            .max())
+        Ok(newest_integer_id(&data.messages))
     }
 
     /// Fetch messages newer than a known Zulip message ID.
     pub async fn messages_after(&self, anchor_id: i64) -> Result<Vec<ZulipMessage>> {
-        let mut anchor = anchor_id.to_string();
-        let mut messages = Vec::new();
-        let mut seen = HashSet::new();
+        Ok(self.messages_after_with_truncation(anchor_id).await?.0)
+    }
 
-        for _ in 0..25 {
-            let page = self.messages_page(&anchor, None, 0, 1000).await?;
-            if page.is_empty() {
-                break;
-            }
-            let page_len = page.len();
-
-            let mut newest_id = anchor.parse::<i64>().unwrap_or(anchor_id);
-            let mut added_new = false;
-
-            for raw in page {
-                let message = normalize::message(raw).context("normalizing polled messages")?;
-                newest_id = newest_id.max(message.id);
-                if seen.insert(message.id) {
-                    added_new = true;
-                    messages.push(message);
-                }
-            }
-
-            if !added_new || newest_id.to_string() == anchor || page_len < 1000 {
-                break;
-            }
-            anchor = newest_id.to_string();
-        }
-
-        Ok(messages)
+    /// Fetch messages newer than a known Zulip message ID, reporting whether
+    /// the forward pagination limit cut the batch short.
+    ///
+    /// The flag is `true` only when the page limit was reached while the last
+    /// page was full of messages newer than the anchor, so more history exists
+    /// beyond the requested window. A short or empty final page, or a page
+    /// that adds no new messages, is complete for the anchor and reports
+    /// `false`.
+    pub async fn messages_after_with_truncation(
+        &self,
+        anchor_id: i64,
+    ) -> Result<(Vec<ZulipMessage>, bool)> {
+        let source = HttpPageSource { client: self };
+        collect_messages_after(&source, anchor_id, MESSAGES_AFTER_MAX_PAGES).await
     }
 
     #[allow(dead_code)]
@@ -314,12 +304,214 @@ impl ZulipClient {
     }
 }
 
+/// Return the largest integer `id` in a raw message list, ignoring absent or
+/// non-integer IDs.
+fn newest_integer_id(messages: &[serde_json::Value]) -> Option<i64> {
+    messages
+        .iter()
+        .filter_map(|message| message.get("id"))
+        .filter_map(serde_json::Value::as_i64)
+        .max()
+}
+
+type PageFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<serde_json::Value>>> + 'a>>;
+
+/// One source of forward message pages, so pagination can be tested without a
+/// network.
+trait PageSource {
+    /// Fetch the page of messages after `anchor`.
+    fn page<'a>(&'a self, anchor: &'a str) -> PageFuture<'a>;
+}
+
+struct HttpPageSource<'a> {
+    client: &'a ZulipClient,
+}
+
+impl PageSource for HttpPageSource<'_> {
+    fn page<'a>(&'a self, anchor: &'a str) -> PageFuture<'a> {
+        Box::pin(async move {
+            self.client
+                .messages_page(anchor, None, 0, MESSAGES_PAGE_SIZE as u16)
+                .await
+        })
+    }
+}
+
+/// Page forward from `anchor_id` until a short page, no progress, or
+/// `max_pages`.
+///
+/// Returns the collected messages and whether `max_pages` cut the batch short
+/// while the last page was full and still advancing.
+async fn collect_messages_after(
+    source: &impl PageSource,
+    anchor_id: i64,
+    max_pages: usize,
+) -> Result<(Vec<ZulipMessage>, bool)> {
+    let mut anchor = anchor_id.to_string();
+    let mut messages = Vec::new();
+    let mut seen = HashSet::new();
+    let mut truncated = false;
+
+    for page_index in 0..max_pages {
+        let page = source.page(&anchor).await?;
+        if page.is_empty() {
+            break;
+        }
+        let page_len = page.len();
+
+        let mut newest_id = anchor.parse::<i64>().unwrap_or(anchor_id);
+        let mut added_new = false;
+
+        for raw in page {
+            let message = normalize::message(raw).context("normalizing polled messages")?;
+            newest_id = newest_id.max(message.id);
+            if seen.insert(message.id) {
+                added_new = true;
+                messages.push(message);
+            }
+        }
+
+        if !added_new || newest_id.to_string() == anchor || page_len < MESSAGES_PAGE_SIZE {
+            break;
+        }
+        anchor = newest_id.to_string();
+        if page_index + 1 == max_pages {
+            truncated = true;
+        }
+    }
+
+    Ok((messages, truncated))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::cell::RefCell;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn raw_message(id: serde_json::Value) -> serde_json::Value {
+        json!({
+            "id": id,
+            "stream_id": 1,
+            "display_recipient": "core",
+            "subject": "ops",
+            "sender_id": 2,
+            "sender_full_name": "Ada",
+            "sender_email": "ada@example.com",
+            "timestamp": 1_700_000_000,
+            "content": "<p>hello</p>"
+        })
+    }
+
+    fn raw_page(start: i64, len: usize) -> Vec<serde_json::Value> {
+        (start..start + len as i64)
+            .map(|id| raw_message(json!(id)))
+            .collect()
+    }
+
+    struct FakePages {
+        pages: RefCell<Vec<Vec<serde_json::Value>>>,
+        anchors: RefCell<Vec<String>>,
+    }
+
+    impl PageSource for FakePages {
+        fn page<'a>(&'a self, anchor: &'a str) -> PageFuture<'a> {
+            self.anchors.borrow_mut().push(anchor.to_string());
+            let page = self.pages.borrow_mut().remove(0);
+            Box::pin(async move { Ok(page) })
+        }
+    }
+
+    #[test]
+    fn newest_integer_id_ignores_absent_and_non_integer_ids() {
+        let messages = vec![
+            json!({"id": 7}),
+            json!({"id": "12"}),
+            json!({"id": 99}),
+            json!({"other": 1}),
+            json!({"id": 3.5}),
+        ];
+        assert_eq!(newest_integer_id(&messages), Some(99));
+        assert_eq!(newest_integer_id(&[]), None);
+    }
+
+    #[tokio::test]
+    async fn truncation_flag_follows_the_page_cap_boundary() {
+        let full_then_full = FakePages {
+            pages: RefCell::new(vec![
+                raw_page(11, MESSAGES_PAGE_SIZE),
+                raw_page(1011, MESSAGES_PAGE_SIZE),
+            ]),
+            anchors: RefCell::new(Vec::new()),
+        };
+        let (messages, truncated) = collect_messages_after(&full_then_full, 10, 2)
+            .await
+            .expect("full pages");
+        assert!(truncated, "a full final page cut by the cap is truncated");
+        assert_eq!(messages.len(), MESSAGES_PAGE_SIZE * 2);
+        assert_eq!(messages.first().map(|message| message.id), Some(11));
+        assert_eq!(messages.last().map(|message| message.id), Some(2010));
+        assert_eq!(
+            *full_then_full.anchors.borrow(),
+            vec!["10".to_string(), "1010".to_string()]
+        );
+
+        let full_then_short = FakePages {
+            pages: RefCell::new(vec![
+                raw_page(11, MESSAGES_PAGE_SIZE),
+                raw_page(1011, MESSAGES_PAGE_SIZE - 1),
+            ]),
+            anchors: RefCell::new(Vec::new()),
+        };
+        let (messages, truncated) = collect_messages_after(&full_then_short, 10, 2)
+            .await
+            .expect("full then short");
+        assert!(!truncated, "a short final page proves the batch complete");
+        assert_eq!(messages.len(), MESSAGES_PAGE_SIZE * 2 - 1);
+
+        let short = FakePages {
+            pages: RefCell::new(vec![raw_page(11, MESSAGES_PAGE_SIZE - 1)]),
+            anchors: RefCell::new(Vec::new()),
+        };
+        let (_, truncated) = collect_messages_after(&short, 10, 2)
+            .await
+            .expect("short page");
+        assert!(!truncated);
+        assert_eq!(*short.anchors.borrow(), vec!["10".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn latest_message_id_chooses_the_newest_integer_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/messages"))
+            .and(query_param("anchor", "newest"))
+            .and(query_param("num_before", "0"))
+            .and(query_param("num_after", "0"))
+            .and(query_param("include_anchor", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": "success",
+                "msg": "",
+                "messages": [
+                    raw_message(json!(41)),
+                    raw_message(json!("999")),
+                    raw_message(json!(43)),
+                ],
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = ZulipClient::new(
+            server.uri(),
+            "ada@example.com".to_string(),
+            "key".to_string(),
+        );
+        assert_eq!(client.latest_message_id().await.unwrap(), Some(43));
+        server.verify().await;
+    }
 
     #[tokio::test]
     #[ignore = "requires binding a local mock server port"]

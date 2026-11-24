@@ -5,7 +5,7 @@
 //! under a timeout and a concurrency cap, and enqueues complete response lines.
 //! Streaming methods are exempt from both limits through [`is_long_lived`].
 
-use crate::events::{self, PollError};
+use crate::events::{self, EventsError};
 use crate::events_stream::{self, EventsConfig, StreamEnd, StreamHub};
 use crate::protocol::{self, Envelope, RequestId};
 use crate::tools::{self, ToolContext, ToolFailure};
@@ -28,6 +28,9 @@ const DEFAULT_MAX_INFLIGHT: usize = 64;
 #[derive(Debug, Clone, Copy)]
 pub struct ServerConfig {
     /// Maximum time one request may run before it is cancelled with `-32603`.
+    ///
+    /// Streams are exempt from the request timeout, but their setup (including
+    /// the null-cursor newest-message probe) is bounded by this value.
     pub request_timeout: Duration,
     /// Maximum number of concurrent ordinary request tasks.
     pub max_inflight: usize,
@@ -71,6 +74,7 @@ struct StreamTask {
     tools: Rc<ToolContext>,
     hub: Rc<StreamHub>,
     events: EventsConfig,
+    setup_timeout: Duration,
     registry_guard: ActiveGuard,
 }
 
@@ -238,6 +242,7 @@ impl Server {
                 tools,
                 hub: Rc::clone(&self.hub),
                 events: self.config.events,
+                setup_timeout: self.config.request_timeout,
                 registry_guard,
             };
             self.tasks.spawn_local(run_stream(task, params))
@@ -537,20 +542,22 @@ async fn run_stream(task: StreamTask, params: Option<Value>) {
         tools,
         hub,
         events,
+        setup_timeout,
         registry_guard,
     } = task;
     // Kept until the task ends so a duplicate id or cancellation can abort it
     // and release the registry entry.
     let _registry_guard = registry_guard;
 
-    let subscription = match stream_setup(&tools, &hub, &events, &id, params.as_ref()).await {
-        Ok(subscription) => subscription,
-        Err(err) => {
-            let response = protocol::error(Some(&id), err.code, err.message, err.data);
-            let _ = tx.send(protocol::to_line(&response)).await;
-            return;
-        }
-    };
+    let subscription =
+        match stream_setup(&tools, &hub, &events, setup_timeout, &id, params.as_ref()).await {
+            Ok(subscription) => subscription,
+            Err(err) => {
+                let response = protocol::error(Some(&id), err.code, err.message, err.data);
+                let _ = tx.send(protocol::to_line(&response)).await;
+                return;
+            }
+        };
 
     if let StreamEnd::Terminated = events_stream::serve(subscription, tx.clone()).await {
         let result = protocol::success(&id, events_stream::stream_result(&id.to_value()));
@@ -562,6 +569,7 @@ async fn stream_setup(
     tools: &ToolContext,
     hub: &Rc<StreamHub>,
     events: &EventsConfig,
+    setup_timeout: Duration,
     id: &RequestId,
     params: Option<&Value>,
 ) -> Result<events_stream::Subscription, RpcError> {
@@ -572,7 +580,7 @@ async fn stream_setup(
             "events/stream requires a params object",
         )
     })?;
-    let params = events::parse_stream_params(params).map_err(poll_error)?;
+    let params = events::parse_stream_params(params).map_err(events_error)?;
 
     let settings = tools.settings().map_err(|problem| {
         rpc_error(
@@ -580,43 +588,57 @@ async fn stream_setup(
             format!("events/stream failed: {}", tools::one_line(&problem)),
         )
     })?;
-    let realm = events::configured_realm(&settings);
-    let start_cursor = match params.cursor.as_deref() {
-        Some(cursor) => {
-            let (cursor_realm, message_id) = events::parse_cursor(cursor).map_err(poll_error)?;
-            if cursor_realm != realm {
-                return Err(rpc_error(
-                    protocol::INVALID_PARAMS,
-                    "cursor belongs to another realm",
-                ));
-            }
+    let start =
+        events::resolve_start_cursor(&settings, params.cursor.as_deref()).map_err(events_error)?;
+
+    // Reserve the stream slot before any setup work that reaches upstream, so
+    // pending null-cursor setups cannot exceed the stream cap.
+    let permit = hub
+        .reserve()
+        .map_err(|err| rpc_error(protocol::INTERNAL_ERROR, err.message()))?;
+
+    let start_cursor = match start.message_id {
+        Some(message_id) => {
+            settings.require_auth().map_err(stream_auth_error)?;
             message_id
         }
         None => {
             let (base_url, email, api_key) = settings.require_auth().map_err(stream_auth_error)?;
             let client = ZulipClient::new(base_url, email, api_key);
-            client
-                .latest_message_id()
-                .await
-                .map_err(|err| {
-                    rpc_error(
+            match tokio::time::timeout(setup_timeout, client.latest_message_id()).await {
+                Ok(Ok(latest)) => latest.unwrap_or(0),
+                Ok(Err(err)) => {
+                    return Err(rpc_error(
                         protocol::INTERNAL_ERROR,
                         format!(
                             "events/stream failed: {}",
                             tools::one_line(&err.to_string())
                         ),
-                    )
-                })?
-                .unwrap_or(0)
+                    ))
+                }
+                Err(_) => {
+                    return Err(rpc_error(
+                        protocol::INTERNAL_ERROR,
+                        "events/stream setup timed out",
+                    ))
+                }
+            }
         }
     };
-    if params.cursor.is_some() {
-        settings.require_auth().map_err(stream_auth_error)?;
-    }
 
     let heartbeat = events.granted_heartbeat(params.heartbeat_ms);
-    hub.subscribe(id.clone(), start_cursor, params, heartbeat, settings)
-        .map_err(|err| rpc_error(protocol::INTERNAL_ERROR, err.message()))
+    hub.subscribe_with_permit(
+        permit,
+        events_stream::SubscriptionRequest {
+            id: id.clone(),
+            realm: start.realm,
+            start_cursor,
+            params,
+            heartbeat,
+            settings,
+        },
+    )
+    .map_err(|err| rpc_error(protocol::INTERNAL_ERROR, err.message()))
 }
 
 fn stream_auth_error(problem: impl std::fmt::Display) -> RpcError {
@@ -636,20 +658,20 @@ async fn poll_events(tools: &ToolContext, params: Option<&Value>) -> Result<Valu
             "events/poll requires a params object",
         )
     })?;
-    let params = events::parse_poll_params(params).map_err(poll_error)?;
+    let params = events::parse_poll_params(params).map_err(events_error)?;
     let settings = tools.settings().map_err(|problem| {
         rpc_error(
             protocol::INTERNAL_ERROR,
             format!("events/poll failed: {}", tools::one_line(&problem)),
         )
     })?;
-    events::poll(&settings, params).await.map_err(poll_error)
+    events::poll(&settings, params).await.map_err(events_error)
 }
 
-fn poll_error(error: PollError) -> RpcError {
+fn events_error(error: EventsError) -> RpcError {
     let code = match &error {
-        PollError::InvalidParams(_) => protocol::INVALID_PARAMS,
-        PollError::Internal(_) => protocol::INTERNAL_ERROR,
+        EventsError::InvalidParams(_) => protocol::INVALID_PARAMS,
+        EventsError::Internal(_) => protocol::INTERNAL_ERROR,
     };
     rpc_error(code, error.message())
 }

@@ -11,12 +11,13 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 use tokio::task::LocalSet;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+use zul_mcp::events;
 use zul_mcp::events_stream::EventsConfig;
 use zul_mcp::server::{Server, ServerConfig};
 use zul_mcp::tools::ToolContext;
@@ -53,8 +54,17 @@ fn settings(dir: &Path, base_url: &str) -> Rc<Settings> {
 }
 
 fn server_config(poll_ms: u64, heartbeat_ms: u64, max_streams: usize) -> ServerConfig {
+    server_config_with_timeout(poll_ms, heartbeat_ms, max_streams, Duration::from_secs(30))
+}
+
+fn server_config_with_timeout(
+    poll_ms: u64,
+    heartbeat_ms: u64,
+    max_streams: usize,
+    request_timeout: Duration,
+) -> ServerConfig {
     ServerConfig {
-        request_timeout: Duration::from_secs(30),
+        request_timeout,
         max_inflight: 8,
         events: EventsConfig {
             poll_interval: Duration::from_millis(poll_ms),
@@ -120,6 +130,21 @@ fn stream_request(id: Value, cursor: &str, extras: Value) -> String {
     let mut params = extras;
     params["name"] = json!("zulip.message");
     params["cursor"] = json!(cursor);
+    params["_meta"] = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+    });
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "events/stream",
+        "params": params,
+    })
+    .to_string()
+}
+
+fn null_cursor_stream_request(id: Value, extras: Value) -> String {
+    let mut params = extras;
+    params["name"] = json!("zulip.message");
     params["_meta"] = json!({
         "io.modelcontextprotocol/protocolVersion": "2026-07-28",
     });
@@ -271,9 +296,11 @@ async fn active_comes_first_and_events_carry_the_exact_envelope() {
             assert_eq!(active["params"]["heartbeatMs"], 5_000);
             assert_eq!(subscription_id(&active), &json!(1));
 
-            let event = wire
-                .notification("notifications/events/event", &json!(1))
-                .await;
+            let event = wire.next().await;
+            assert_eq!(
+                event["method"], "notifications/events/event",
+                "a normal stream sends exactly one active before its first event: {event}"
+            );
             assert_eq!(event["params"]["eventId"], json!(format!("{base}#101")));
             assert_eq!(event["params"]["name"], "zulip.message");
             assert_eq!(event["params"]["cursor"], json!(cursor(&base, 101)));
@@ -998,7 +1025,7 @@ async fn max_age_announces_truncation_on_a_fresh_active() {
         .run_until(async {
             let (tx, rx) = mpsc::channel(64);
             let tools = Rc::new(ToolContext::with_settings(Rc::clone(&settings)));
-            let mut server = Server::with_context(tx, server_config(30, 5_000, 8), tools);
+            let mut server = Server::with_context(tx, server_config(30, 50, 8), tools);
             let mut wire = Wire::new(rx);
             let start = cursor(&base, 100);
 
@@ -1021,13 +1048,27 @@ async fn max_age_announces_truncation_on_a_fresh_active() {
             );
 
             let after = wire.quiet().await;
+            let mut heartbeats = 0;
             for frame in &after {
-                assert_ne!(
-                    frame.get("method").and_then(Value::as_str),
-                    Some("notifications/events/event"),
-                    "an aged message must not be emitted: {frame}"
-                );
+                match frame.get("method").and_then(Value::as_str) {
+                    Some("notifications/events/heartbeat") => {
+                        heartbeats += 1;
+                        assert_eq!(
+                            frame["params"]["cursor"],
+                            json!(cursor(&base, 100)),
+                            "after re-anchoring, heartbeats must not advertise the post-batch cursor"
+                        );
+                    }
+                    Some("notifications/events/event") => {
+                        panic!("an aged message must not be emitted: {frame}")
+                    }
+                    _ => {}
+                }
             }
+            assert!(
+                heartbeats > 0,
+                "the stream must heartbeat after the truncation re-anchor"
+            );
             server.drain(Duration::from_millis(50)).await;
         })
         .await;
@@ -1068,6 +1109,403 @@ async fn duplicate_stream_id_aborts_the_first_stream_and_answers_once() {
                     "the aborted stream must not emit: {frame}"
                 );
                 assert_ne!(frame["id"], json!(1));
+            }
+            server.drain(Duration::from_millis(50)).await;
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn null_cursor_setup_fails_at_the_stream_cap_before_the_upstream_probe() {
+    let dir = TempDir::new().expect("temp dir");
+    let mock = MockServer::start().await;
+    let latest_calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&latest_calls);
+    mount_with(&mock, move |request: &wiremock::Request| {
+        let anchor = request
+            .url
+            .query_pairs()
+            .find(|(key, _)| key == "anchor")
+            .map(|(_, value)| value.to_string());
+        if anchor.as_deref() == Some("newest") {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+        ResponseTemplate::new(200).set_body_json(json!({
+            "result": "success",
+            "msg": "",
+            "messages": [],
+        }))
+    })
+    .await;
+    let settings = settings(dir.path(), &mock.uri());
+    let base = mock.uri();
+
+    LocalSet::new()
+        .run_until(async {
+            let (tx, rx) = mpsc::channel(64);
+            let tools = Rc::new(ToolContext::with_settings(Rc::clone(&settings)));
+            let mut server = Server::with_context(tx, server_config(5_000, 5_000, 1), tools);
+            let mut wire = Wire::new(rx);
+            let start = cursor(&base, 100);
+
+            server
+                .handle_line(&stream_request(json!(1), &start, json!({})))
+                .await;
+            wire.notification("notifications/events/active", &json!(1))
+                .await;
+
+            server
+                .handle_line(&null_cursor_stream_request(json!(2), json!({})))
+                .await;
+            let response = wire.next().await;
+            assert_eq!(response["id"], json!(2));
+            assert_eq!(response["error"]["code"], json!(-32603));
+            assert!(response["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("too many")));
+            assert_eq!(
+                latest_calls.load(Ordering::SeqCst),
+                0,
+                "an over-cap null-cursor stream must not probe upstream"
+            );
+
+            server.drain(Duration::from_millis(50)).await;
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn stalled_null_cursor_setup_times_out_and_releases_capacity() {
+    let dir = TempDir::new().expect("temp dir");
+    let mock = MockServer::start().await;
+    mount_with(&mock, |request: &wiremock::Request| {
+        let anchor = request
+            .url
+            .query_pairs()
+            .find(|(key, _)| key == "anchor")
+            .map(|(_, value)| value.to_string());
+        if anchor.as_deref() == Some("newest") {
+            return ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(2))
+                .set_body_json(json!({
+                    "result": "success",
+                    "msg": "",
+                    "messages": [],
+                }));
+        }
+        ResponseTemplate::new(200).set_body_json(json!({
+            "result": "success",
+            "msg": "",
+            "messages": [],
+        }))
+    })
+    .await;
+    let settings = settings(dir.path(), &mock.uri());
+    let base = mock.uri();
+
+    LocalSet::new()
+        .run_until(async {
+            let (tx, rx) = mpsc::channel(64);
+            let tools = Rc::new(ToolContext::with_settings(Rc::clone(&settings)));
+            let mut server = Server::with_context(
+                tx,
+                server_config_with_timeout(5_000, 5_000, 1, Duration::from_millis(50)),
+                tools,
+            );
+            let mut wire = Wire::new(rx);
+
+            let started = Instant::now();
+            server
+                .handle_line(&null_cursor_stream_request(json!(1), json!({})))
+                .await;
+            let response = wire.next().await;
+            assert_eq!(response["id"], json!(1));
+            assert_eq!(response["error"]["code"], json!(-32603));
+            assert!(response["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("timed out")));
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "setup must be bounded by the request timeout"
+            );
+
+            // The timed-out setup must have released its reserved slot.
+            server
+                .handle_line(&stream_request(json!(2), &cursor(&base, 100), json!({})))
+                .await;
+            let active = wire
+                .notification("notifications/events/active", &json!(2))
+                .await;
+            assert_eq!(subscription_id(&active), &json!(2));
+
+            server.drain(Duration::from_millis(50)).await;
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn shared_fetch_uses_the_minimum_cursor_and_per_subscriber_filters() {
+    let dir = TempDir::new().expect("temp dir");
+    let mock = MockServer::start().await;
+    let timestamp = now();
+    let calls = mount_after(&mock, move |anchor| {
+        if anchor != 100 {
+            return Vec::new();
+        }
+        vec![
+            message(
+                101,
+                "core",
+                "alpha",
+                "Grace",
+                "grace@example.com",
+                timestamp,
+            ),
+            message(102, "core", "beta", "Grace", "grace@example.com", timestamp),
+            message(103, "core", "alpha", "Bob", "bob@example.com", timestamp),
+        ]
+    })
+    .await;
+    let settings = settings(dir.path(), &mock.uri());
+    let base = mock.uri();
+
+    LocalSet::new()
+        .run_until(async {
+            let (tx, rx) = mpsc::channel(64);
+            let tools = Rc::new(ToolContext::with_settings(Rc::clone(&settings)));
+            let mut server = Server::with_context(tx, server_config(1_000, 200, 8), tools);
+            let mut wire = Wire::new(rx);
+            let start = cursor(&base, 100);
+
+            server
+                .handle_line(&stream_request(
+                    json!(1),
+                    &start,
+                    json!({"arguments": {"stream": "core", "topic": "alpha"}}),
+                ))
+                .await;
+            server
+                .handle_line(&stream_request(
+                    json!(2),
+                    &cursor(&base, 102),
+                    json!({"arguments": {"sender_email": "bob@example.com"}}),
+                ))
+                .await;
+            wire.notification("notifications/events/active", &json!(1))
+                .await;
+            wire.notification("notifications/events/active", &json!(2))
+                .await;
+
+            let first = wire
+                .notification("notifications/events/event", &json!(1))
+                .await;
+            let last = wire
+                .notification("notifications/events/event", &json!(1))
+                .await;
+            let second = wire
+                .notification("notifications/events/event", &json!(2))
+                .await;
+            assert_eq!(first["params"]["data"]["message_id"], 101);
+            assert_eq!(last["params"]["data"]["message_id"], 103);
+            assert_eq!(second["params"]["data"]["message_id"], 103);
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "both subscriptions must share one fetch from the minimum cursor"
+            );
+
+            let mut advanced = false;
+            for _ in 0..20 {
+                let heartbeat = wire
+                    .notification("notifications/events/heartbeat", &json!(2))
+                    .await;
+                if heartbeat["params"]["cursor"] == json!(cursor(&base, 103)) {
+                    advanced = true;
+                    break;
+                }
+            }
+            assert!(
+                advanced,
+                "the second subscription must advance past its filtered 102"
+            );
+
+            server.drain(Duration::from_millis(50)).await;
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn idle_streams_are_exempt_from_the_request_timeout() {
+    let dir = TempDir::new().expect("temp dir");
+    let mock = MockServer::start().await;
+    mount_after(&mock, |_| Vec::new()).await;
+    let settings = settings(dir.path(), &mock.uri());
+    let base = mock.uri();
+
+    LocalSet::new()
+        .run_until(async {
+            let (tx, rx) = mpsc::channel(64);
+            let tools = Rc::new(ToolContext::with_settings(Rc::clone(&settings)));
+            let mut server = Server::with_context(
+                tx,
+                server_config_with_timeout(30_000, 50, 8, Duration::from_millis(50)),
+                tools,
+            );
+            let mut wire = Wire::new(rx);
+            let start = cursor(&base, 100);
+
+            server
+                .handle_line(&stream_request(json!(1), &start, json!({})))
+                .await;
+            wire.notification("notifications/events/active", &json!(1))
+                .await;
+
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let heartbeat = wire
+                .notification("notifications/events/heartbeat", &json!(1))
+                .await;
+            assert_eq!(heartbeat["params"]["cursor"], start);
+
+            let after = wire.quiet().await;
+            for frame in &after {
+                assert_ne!(frame["id"], json!(1), "a stream must not time out: {frame}");
+                assert_ne!(
+                    frame.get("method").and_then(Value::as_str),
+                    Some("notifications/events/error"),
+                    "a stream must not report a request timeout: {frame}"
+                );
+            }
+            server.drain(Duration::from_millis(50)).await;
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn poll_and_stream_agree_that_filtered_old_messages_are_not_truncation() {
+    let dir = TempDir::new().expect("temp dir");
+    let mock = MockServer::start().await;
+    let timestamp = now();
+    mount_after(&mock, move |anchor| {
+        if anchor != 100 {
+            return Vec::new();
+        }
+        vec![
+            message(
+                101,
+                "other",
+                "ops",
+                "Grace",
+                "grace@example.com",
+                timestamp - 3_600,
+            ),
+            message(102, "core", "ops", "Grace", "grace@example.com", timestamp),
+        ]
+    })
+    .await;
+    let settings = settings(dir.path(), &mock.uri());
+    let base = mock.uri();
+
+    let params = events::parse_poll_params(&json!({
+        "name": "zulip.message",
+        "arguments": {"stream": "core"},
+        "cursor": cursor(&base, 100),
+        "maxAgeMs": 60_000,
+    }))
+    .expect("poll params");
+    let poll = events::poll(&settings, params).await.expect("poll result");
+    assert_eq!(poll["truncated"], false);
+    assert_eq!(poll["events"][0]["data"]["message_id"], 102);
+
+    LocalSet::new()
+        .run_until(async {
+            let (tx, rx) = mpsc::channel(64);
+            let tools = Rc::new(ToolContext::with_settings(Rc::clone(&settings)));
+            let mut server = Server::with_context(tx, server_config(30, 5_000, 8), tools);
+            let mut wire = Wire::new(rx);
+
+            server
+                .handle_line(&stream_request(
+                    json!(1),
+                    &cursor(&base, 100),
+                    json!({"arguments": {"stream": "core"}, "maxAgeMs": 60_000}),
+                ))
+                .await;
+            let active = wire.next().await;
+            assert_eq!(active["params"]["truncated"], false);
+            let event = wire.next().await;
+            assert_eq!(event["params"]["data"]["message_id"], 102);
+            for frame in wire.quiet().await {
+                assert_ne!(frame["params"]["truncated"], json!(true), "{frame}");
+            }
+            server.drain(Duration::from_millis(50)).await;
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn poll_and_stream_agree_that_matching_old_messages_are_truncation() {
+    let dir = TempDir::new().expect("temp dir");
+    let mock = MockServer::start().await;
+    let old = now() - 3_600;
+    mount_after(&mock, move |anchor| {
+        if anchor != 100 {
+            return Vec::new();
+        }
+        vec![message(
+            101,
+            "core",
+            "ops",
+            "Grace",
+            "grace@example.com",
+            old,
+        )]
+    })
+    .await;
+    let settings = settings(dir.path(), &mock.uri());
+    let base = mock.uri();
+
+    let params = events::parse_poll_params(&json!({
+        "name": "zulip.message",
+        "arguments": {"stream": "core"},
+        "cursor": cursor(&base, 100),
+        "maxAgeMs": 60_000,
+    }))
+    .expect("poll params");
+    let poll = events::poll(&settings, params).await.expect("poll result");
+    assert_eq!(poll["truncated"], true);
+    assert_eq!(poll["events"], json!([]));
+    assert_eq!(
+        poll["cursor"],
+        json!(cursor(&base, 101)),
+        "poll advances past an aged match"
+    );
+
+    LocalSet::new()
+        .run_until(async {
+            let (tx, rx) = mpsc::channel(64);
+            let tools = Rc::new(ToolContext::with_settings(Rc::clone(&settings)));
+            let mut server = Server::with_context(tx, server_config(30, 5_000, 8), tools);
+            let mut wire = Wire::new(rx);
+
+            server
+                .handle_line(&stream_request(
+                    json!(1),
+                    &cursor(&base, 100),
+                    json!({"arguments": {"stream": "core"}, "maxAgeMs": 60_000}),
+                ))
+                .await;
+            let active = wire.next().await;
+            assert_eq!(active["params"]["truncated"], false);
+            let truncated = wire
+                .notification("notifications/events/active", &json!(1))
+                .await;
+            assert_eq!(truncated["params"]["truncated"], true);
+            for frame in wire.quiet().await {
+                assert_ne!(
+                    frame.get("method").and_then(Value::as_str),
+                    Some("notifications/events/event"),
+                    "{frame}"
+                );
             }
             server.drain(Duration::from_millis(50)).await;
         })
