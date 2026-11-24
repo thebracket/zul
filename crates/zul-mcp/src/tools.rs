@@ -5,6 +5,7 @@
 //! shared by every handler, so a process loads settings and opens the cache at
 //! most once. Tests inject an app pointed at a temporary cache instead.
 
+use crate::protocol;
 use libzul::zulip::models::ZulipMessage;
 use libzul::{App, AuthStatus, Settings};
 use serde_json::{json, Map, Value};
@@ -451,19 +452,23 @@ fn present(value: Option<String>) -> Option<String> {
 
 fn complete_result(structured: Value) -> Value {
     let text = structured.to_string();
-    json!({
-        "resultType": "complete",
-        "content": [{"type": "text", "text": text}],
-        "structuredContent": structured,
-    })
+    let mut body = Map::new();
+    body.insert(
+        "content".to_string(),
+        json!([{"type": "text", "text": text}]),
+    );
+    body.insert("structuredContent".to_string(), structured);
+    protocol::complete_result(body)
 }
 
 fn error_result(message: impl Into<String>) -> Value {
-    json!({
-        "resultType": "complete",
-        "content": [{"type": "text", "text": message.into()}],
-        "isError": true,
-    })
+    let mut body = Map::new();
+    body.insert(
+        "content".to_string(),
+        json!([{"type": "text", "text": message.into()}]),
+    );
+    body.insert("isError".to_string(), json!(true));
+    protocol::complete_result(body)
 }
 
 /// Run one cache operation against the shared app, or report why it is unavailable.
@@ -615,6 +620,10 @@ mod tests {
         assert_eq!(result["resultType"], "complete");
         assert_eq!(result["isError"], true);
         assert!(result.get("structuredContent").is_none());
+        assert!(
+            result.get("ttlMs").is_none() && result.get("cacheScope").is_none(),
+            "tool errors must not carry cache hints: {result}"
+        );
         assert_eq!(result["content"][0]["type"], "text");
     }
 

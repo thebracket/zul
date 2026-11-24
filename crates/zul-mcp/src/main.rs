@@ -30,7 +30,7 @@ const EOF_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn main() -> anyhow::Result<()> {
-    dotenvy::dotenv().ok();
+    load_dotenv();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
@@ -41,6 +41,20 @@ fn main() -> anyhow::Result<()> {
     // read. All frames that matter have already been written by `serve`.
     runtime.shutdown_background();
     result
+}
+
+/// Load `.env` using the repository-wide convention: `ZUL_DOTENV` empty
+/// disables loading, a value selects a path, and unset uses `.env` discovery.
+fn load_dotenv() {
+    match std::env::var("ZUL_DOTENV") {
+        Ok(path) if path.trim().is_empty() => {}
+        Ok(path) => {
+            let _ = dotenvy::from_path(path);
+        }
+        Err(_) => {
+            let _ = dotenvy::dotenv();
+        }
+    }
 }
 
 async fn serve() -> anyhow::Result<()> {
@@ -64,9 +78,7 @@ async fn serve() -> anyhow::Result<()> {
             event = lines.next(&mut stdin) => match event {
                 Ok(Some(ReadEvent::Line(line))) => server.handle_line(&line).await,
                 Ok(Some(ReadEvent::Oversized)) => {
-                    server
-                        .reject("request line exceeds the 1 MiB limit")
-                        .await;
+                    server.reject("request line exceeds the 1 MiB limit");
                 }
                 Ok(None) => break,
                 Err(err) => {
@@ -244,5 +256,63 @@ mod tests {
             _ => panic!("expected the final line"),
         }
         assert!(reader.next(&mut output).await.expect("eof").is_none());
+    }
+
+    #[tokio::test]
+    async fn accepts_the_exact_limit_and_rejects_one_byte_more() {
+        let mut accepted = vec![b'x'; MAX_LINE_BYTES];
+        accepted.push(b'\n');
+        let (mut input, mut output) = tokio::io::duplex(accepted.len() + 16);
+        input.write_all(&accepted).await.expect("write accepted");
+        input.shutdown().await.expect("close accepted");
+
+        let mut reader = LineReader::new();
+        match reader.next(&mut output).await.expect("accepted event") {
+            Some(ReadEvent::Line(line)) => assert_eq!(line.len(), MAX_LINE_BYTES),
+            other => panic!(
+                "expected the exact-limit line to be accepted: {}",
+                kind(&other)
+            ),
+        }
+        assert!(reader.next(&mut output).await.expect("eof").is_none());
+
+        let mut rejected = vec![b'x'; MAX_LINE_BYTES + 1];
+        rejected.push(b'\n');
+        let (mut input, mut output) = tokio::io::duplex(rejected.len() + 16);
+        input.write_all(&rejected).await.expect("write rejected");
+        input.shutdown().await.expect("close rejected");
+
+        let mut reader = LineReader::new();
+        match reader.next(&mut output).await.expect("rejected event") {
+            Some(ReadEvent::Oversized) => {}
+            other => panic!(
+                "expected one byte over the limit to be rejected: {}",
+                kind(&other)
+            ),
+        }
+        assert!(reader.next(&mut output).await.expect("eof").is_none());
+    }
+
+    #[tokio::test]
+    async fn rejects_an_oversized_final_line_at_eof() {
+        let payload = vec![b'x'; MAX_LINE_BYTES + 8];
+        let (mut input, mut output) = tokio::io::duplex(payload.len() + 16);
+        input.write_all(&payload).await.expect("write payload");
+        input.shutdown().await.expect("close payload");
+
+        let mut reader = LineReader::new();
+        match reader.next(&mut output).await.expect("oversized event") {
+            Some(ReadEvent::Oversized) => {}
+            other => panic!("expected an oversized final line at EOF: {}", kind(&other)),
+        }
+        assert!(reader.next(&mut output).await.expect("eof").is_none());
+    }
+
+    fn kind(event: &Option<ReadEvent>) -> &'static str {
+        match event {
+            Some(ReadEvent::Line(_)) => "line",
+            Some(ReadEvent::Oversized) => "oversized",
+            None => "eof",
+        }
     }
 }

@@ -6,7 +6,8 @@
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Child, ChildStderr, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -42,7 +43,14 @@ struct Harness {
 
 impl Harness {
     fn start(dir: &Path) -> Self {
+        Self::start_with_env(dir, &[])
+    }
+
+    fn start_with_env(dir: &Path, environment: &[(&str, &str)]) -> Self {
         let mut command = isolated_command(dir);
+        for (key, value) in environment {
+            command.env(key, value);
+        }
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -252,9 +260,36 @@ fn serves_discovery_tools_and_protocol_errors() {
         "tools/call",
         json!({"name": "sync", "arguments": {}}),
     ));
+    // 16: tools/call without metadata hits the version gate.
+    harness.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 16,
+        "method": "tools/call",
+        "params": {"name": "whoami", "arguments": {}},
+    }));
+    // 17: an unknown method without metadata is still -32601.
+    harness.send(&json!({"jsonrpc": "2.0", "id": 17, "method": "prompts/list"}));
+    // 18: tools/call with an unsupported revision hits the version gate.
+    harness.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 18,
+        "method": "tools/call",
+        "params": {
+            "name": "whoami",
+            "arguments": {},
+            "_meta": {"io.modelcontextprotocol/protocolVersion": "2025-11-25"},
+        },
+    }));
+    // 19: an unknown method with an unsupported revision is also -32601.
+    harness.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 19,
+        "method": "prompts/list",
+        "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": "2025-11-25"}},
+    }));
 
-    let responses = collect(&harness, 14);
-    let responses = by_id(&responses);
+    let raw = collect(&harness, 18);
+    let responses = by_id(&raw);
 
     let discover = responses.get("n:1").expect("discovery response");
     assert_eq!(discover["id"], json!(1));
@@ -358,6 +393,8 @@ fn serves_discovery_tools_and_protocol_errors() {
     assert_eq!(content[0]["type"], "text");
     let structured = &who["structuredContent"];
     assert_eq!(structured["ready"], false);
+    assert!(structured["base_url"].is_null());
+    assert!(structured["email"].is_null());
     assert!(
         structured["problems"]
             .as_array()
@@ -367,8 +404,16 @@ fn serves_discovery_tools_and_protocol_errors() {
     for problem in structured["problems"].as_array().expect("problems") {
         assert!(problem.as_str().is_some_and(|text| !text.is_empty()));
     }
-    assert!(structured["base_url"].is_null() || structured["base_url"].is_string());
-    assert!(structured["email"].is_null() || structured["email"].is_string());
+    assert!(
+        structured["problems"]
+            .as_array()
+            .expect("problems")
+            .iter()
+            .any(|problem| problem
+                .as_str()
+                .is_some_and(|text| text.contains("missing Zulip API key"))),
+        "the missing API key must be named: {structured}"
+    );
     let text = content[0]["text"].as_str().expect("text content");
     let parsed: Value = serde_json::from_str(text).expect("text content is JSON");
     assert_eq!(&parsed, structured);
@@ -402,9 +447,27 @@ fn serves_discovery_tools_and_protocol_errors() {
         .as_str()
         .is_some_and(|text| text.contains("sync failed")));
 
-    for line in responses.keys() {
+    let gate_call = responses.get("n:16").expect("tools/call gate response");
+    assert_eq!(gate_call["error"]["code"], -32022);
+
+    let unknown_without_meta = responses
+        .get("n:17")
+        .expect("unknown method without metadata");
+    assert_eq!(unknown_without_meta["error"]["code"], -32601);
+
+    let gate_call_unsupported = responses
+        .get("n:18")
+        .expect("tools/call unsupported revision");
+    assert_eq!(gate_call_unsupported["error"]["code"], -32022);
+
+    let unknown_unsupported = responses
+        .get("n:19")
+        .expect("unknown method with unsupported revision");
+    assert_eq!(unknown_unsupported["error"]["code"], -32601);
+
+    for (line, value) in &raw {
         assert!(
-            !line.contains("api_key"),
+            !line.contains("api_key") && !value.to_string().contains("api_key"),
             "tool output leaked an API key field: {line}"
         );
     }
@@ -543,4 +606,226 @@ fn exits_promptly_when_stdout_closes() {
     };
     assert!(status.success(), "exit status: {status:?}");
     drop(stdin);
+}
+
+#[test]
+fn zul_dotenv_controls_dotenv_loading() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(
+        dir.path().join(".env"),
+        "ZULIP_BASE_URL=https://dotenv.example\nZULIP_EMAIL=dotenv@example.com\n",
+    )
+    .expect("write dotenv file");
+
+    // Unset ZUL_DOTENV keeps the repository convention: discover `.env` in cwd.
+    let mut loaded = Harness::start(dir.path());
+    loaded.send(&modern(
+        json!(1),
+        "tools/call",
+        json!({"name": "whoami", "arguments": {}}),
+    ));
+    let line = loaded.recv();
+    let response: Value = serde_json::from_str(&line).expect("whoami response is JSON");
+    let structured = &response["result"]["structuredContent"];
+    assert_eq!(structured["base_url"], "https://dotenv.example");
+    assert_eq!(structured["email"], "dotenv@example.com");
+    let (remaining, status, stderr) = loaded.finish();
+    assert!(status.success(), "exit status {status:?}; stderr: {stderr}");
+    assert!(
+        remaining.is_empty(),
+        "unexpected extra stdout: {remaining:?}"
+    );
+
+    // An empty ZUL_DOTENV disables dotenv loading entirely.
+    let mut disabled = Harness::start_with_env(dir.path(), &[("ZUL_DOTENV", "")]);
+    disabled.send(&modern(
+        json!(1),
+        "tools/call",
+        json!({"name": "whoami", "arguments": {}}),
+    ));
+    let line = disabled.recv();
+    let response: Value = serde_json::from_str(&line).expect("whoami response is JSON");
+    let structured = &response["result"]["structuredContent"];
+    assert!(structured["base_url"].is_null());
+    assert!(structured["email"].is_null());
+    let (remaining, status, stderr) = disabled.finish();
+    assert!(status.success(), "exit status {status:?}; stderr: {stderr}");
+    assert!(
+        remaining.is_empty(),
+        "unexpected extra stdout: {remaining:?}"
+    );
+}
+
+#[test]
+fn whoami_with_missing_api_key_reports_it_without_contacting_the_realm() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let base_url = format!(
+        "http://{}",
+        listener.local_addr().expect("listener address")
+    );
+    let mut harness = Harness::start_with_env(
+        dir.path(),
+        &[
+            ("ZULIP_BASE_URL", &base_url),
+            ("ZULIP_EMAIL", "ada@example.com"),
+        ],
+    );
+
+    harness.send(&modern(
+        json!(1),
+        "tools/call",
+        json!({"name": "whoami", "arguments": {}}),
+    ));
+    let line = harness.recv();
+    let response: Value = serde_json::from_str(&line).expect("whoami response is JSON");
+    let structured = &response["result"]["structuredContent"];
+    assert_eq!(structured["ready"], false);
+    assert_eq!(structured["base_url"], base_url);
+    assert_eq!(structured["email"], "ada@example.com");
+    assert!(
+        structured["problems"]
+            .as_array()
+            .expect("problems")
+            .iter()
+            .any(|problem| problem
+                .as_str()
+                .is_some_and(|text| text.contains("missing Zulip API key"))),
+        "the missing API key must be named: {structured}"
+    );
+
+    match listener.accept() {
+        Err(err) if err.kind() == ErrorKind::WouldBlock => {}
+        Ok(_) => panic!("whoami must not contact the realm while auth is incomplete"),
+        Err(err) => panic!("checking for a whoami connection failed: {err}"),
+    }
+
+    let (remaining, status, stderr) = harness.finish();
+    assert!(status.success(), "exit status {status:?}; stderr: {stderr}");
+    assert!(
+        remaining.is_empty(),
+        "unexpected extra stdout lines: {remaining:?}"
+    );
+}
+
+#[test]
+fn whoami_never_leaks_a_configured_api_key_when_the_realm_stalls() {
+    const KEY: &str = "zul-mcp-fake-key-9f3c-DO-NOT-LEAK";
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let base_url = format!(
+        "http://{}",
+        listener.local_addr().expect("listener address")
+    );
+    let mut harness = Harness::start_with_env(
+        dir.path(),
+        &[
+            ("ZULIP_BASE_URL", &base_url),
+            ("ZULIP_EMAIL", "ada@example.com"),
+            ("ZULIP_API_KEY", KEY),
+        ],
+    );
+
+    harness.send(&modern(
+        json!(1),
+        "tools/call",
+        json!({"name": "whoami", "arguments": {}}),
+    ));
+
+    // Hold the accepted connection open without responding, parking whoami.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut connection = None;
+    while Instant::now() < deadline {
+        match listener.accept() {
+            Ok((socket, _)) => {
+                connection = Some(socket);
+                break;
+            }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(err) => panic!("accepting the whoami connection failed: {err}"),
+        }
+    }
+    let connection = connection.expect("whoami should connect to the stalled realm");
+
+    // Another request still completes while whoami is parked.
+    harness.send(&json!({"jsonrpc": "2.0", "id": 2, "method": "server/discover"}));
+    let discover_line = harness.recv();
+    let discover: Value = serde_json::from_str(&discover_line).expect("discovery response is JSON");
+    assert_eq!(discover["id"], 2);
+
+    let started = Instant::now();
+    let (remaining, status, stderr) = harness.finish();
+    assert!(
+        started.elapsed() < SHUTDOWN_TIMEOUT,
+        "closing stdin must abort the parked whoami"
+    );
+    assert!(status.success(), "exit status {status:?}; stderr: {stderr}");
+    assert!(
+        remaining.is_empty(),
+        "the aborted whoami must not answer: {remaining:?}"
+    );
+    for output in std::iter::once(&discover_line).chain(remaining.iter()) {
+        assert!(!output.contains(KEY), "API key leaked to stdout: {output}");
+    }
+    assert!(!stderr.contains(KEY), "API key leaked to stderr: {stderr}");
+    drop(connection);
+}
+
+#[test]
+fn exits_when_the_stdout_queue_saturates() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut command = isolated_command(dir.path());
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn zul-mcp");
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+
+    // More responses than the writer queue (256) and the OS pipe can buffer.
+    // The test deliberately never reads stdout until after the child exits.
+    for id in 0..2000 {
+        writeln!(
+            stdin,
+            "{}",
+            json!({"jsonrpc": "2.0", "id": id, "method": "server/discover"})
+        )
+        .expect("write discovery");
+    }
+    stdin.flush().expect("flush discoveries");
+    drop(stdin);
+
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll child") {
+            break status;
+        }
+        if started.elapsed() > Duration::from_secs(5) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("zul-mcp deadlocked with a saturated stdout queue");
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert!(status.success(), "exit status: {status:?}");
+
+    let mut stderr_text = String::new();
+    let _ = stderr.read_to_string(&mut stderr_text);
+    assert!(
+        stderr_text.contains("stdout writer did not shut down promptly"),
+        "expected the saturated writer to hit its drain timeout; stderr: {stderr_text:?}"
+    );
+    drop(stdout);
+    drop(child);
 }

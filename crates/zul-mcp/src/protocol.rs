@@ -2,10 +2,12 @@
 //!
 //! This module owns the envelope: request IDs that preserve string versus
 //! number identity, success and error responses, the modern `resultType`
-//! contract, and the `params._meta` protocol-version gate. Business logic lives
-//! in [`crate::tools`]; transport and concurrency live in [`crate::server`].
+//! contract, its shared cache hints, and the `params._meta` protocol-version
+//! gate. Business logic lives in [`crate::tools`]; request dispatch and
+//! concurrency live in [`crate::server`]; stdin framing, the bounded line
+//! reader, and the stdout writer live in the `zul-mcp` binary (`main.rs`).
 
-use serde_json::{json, Number, Value};
+use serde_json::{json, Map, Number, Value};
 
 /// The one MCP revision this server implements.
 pub const PROTOCOL_VERSION: &str = "2026-07-28";
@@ -21,8 +23,15 @@ pub const INVALID_REQUEST: i64 = -32600;
 pub const METHOD_NOT_FOUND: i64 = -32601;
 /// JSON-RPC invalid method parameters.
 pub const INVALID_PARAMS: i64 = -32602;
+/// JSON-RPC internal error, used for request timeouts and overload.
+pub const INTERNAL_ERROR: i64 = -32603;
 /// MCP unsupported protocol version.
 pub const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
+
+/// Cache lifetime advertised on cacheable complete results.
+pub const TTL_MS: u64 = 0;
+/// Cache scope advertised on cacheable complete results.
+pub const CACHE_SCOPE: &str = "private";
 
 /// A JSON-RPC request identifier that keeps its original JSON type.
 #[derive(Debug, Clone, PartialEq)]
@@ -206,26 +215,45 @@ pub fn unsupported_version_data(requested: Option<&Value>) -> Value {
     })
 }
 
+/// Build a complete-result object from its body fields.
+pub fn complete_result(mut body: Map<String, Value>) -> Value {
+    body.insert(
+        "resultType".to_string(),
+        Value::String("complete".to_string()),
+    );
+    Value::Object(body)
+}
+
+/// Build a complete result carrying the standard catalog cache hints.
+pub fn complete_cached(mut body: Map<String, Value>) -> Value {
+    body.insert("ttlMs".to_string(), json!(TTL_MS));
+    body.insert("cacheScope".to_string(), json!(CACHE_SCOPE));
+    complete_result(body)
+}
+
 /// Build the single modern discovery result.
 pub fn discover_result() -> Value {
-    json!({
-        "resultType": "complete",
-        "supportedVersions": [PROTOCOL_VERSION],
-        "capabilities": {
-            "tools": {},
-        },
-        "_meta": {
+    let mut body = Map::new();
+    body.insert("supportedVersions".to_string(), json!([PROTOCOL_VERSION]));
+    body.insert("capabilities".to_string(), json!({"tools": {}}));
+    body.insert(
+        "_meta".to_string(),
+        json!({
             "io.modelcontextprotocol/serverInfo": {
                 "name": "zul-mcp",
                 "version": env!("CARGO_PKG_VERSION"),
             },
-        },
-        "instructions": "zul-mcp exposes read-only Zulip tools over MCP 2026-07-28. \
+        }),
+    );
+    body.insert(
+        "instructions".to_string(),
+        json!(
+            "zul-mcp exposes read-only Zulip tools over MCP 2026-07-28. \
     Call tools/list to discover them. Tools may report missing credentials until \
-    Zulip auth is configured; discovery and tools/list do not require it.",
-        "ttlMs": 0,
-        "cacheScope": "private",
-    })
+    Zulip auth is configured; discovery and tools/list do not require it."
+        ),
+    );
+    complete_cached(body)
 }
 
 #[cfg(test)]
@@ -316,7 +344,24 @@ mod tests {
         assert!(result["instructions"]
             .as_str()
             .is_some_and(|text| !text.is_empty()));
-        assert_eq!(result["cacheScope"], "private");
-        assert!(result["ttlMs"].is_number());
+        assert_eq!(result["cacheScope"], CACHE_SCOPE);
+        assert_eq!(result["ttlMs"], TTL_MS);
+    }
+
+    #[test]
+    fn complete_results_share_one_envelope() {
+        let mut body = Map::new();
+        body.insert("value".to_string(), json!(1));
+        let plain = complete_result(body.clone());
+        assert_eq!(plain["resultType"], "complete");
+        assert_eq!(plain["value"], 1);
+        assert!(plain.get("ttlMs").is_none());
+        assert!(plain.get("cacheScope").is_none());
+
+        let cached = complete_cached(body);
+        assert_eq!(cached["resultType"], "complete");
+        assert_eq!(cached["ttlMs"], TTL_MS);
+        assert_eq!(cached["cacheScope"], CACHE_SCOPE);
+        assert_eq!(cached["value"], 1);
     }
 }
