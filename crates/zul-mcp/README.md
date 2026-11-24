@@ -46,6 +46,45 @@ When configuring a client, prefer an absolute binary path: MCP hosts such as
 OpenCode start local servers in the project directory, so a relative path may
 not resolve to this checkout.
 
+## Documentation verification
+
+The tool list, defaults and limits, discovery capabilities, and key-handshake
+behaviour in this README are manually verified against the built binary. They are
+not asserted by `cargo test`; this manual check is the Planner-accepted residual
+for this docs-only unit. Re-run the smoke check and re-read the limits/defaults
+tables whenever the tool catalog, event descriptor, protocol revision, or
+constants change.
+
+Run three NDJSON frames against a throwaway home, with credentials and dotenv
+disabled, so no local configuration is read:
+
+```sh
+zul_mcp=./target/debug/zul-mcp   # or target/release after a release build
+tmp=$(mktemp -d)
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"server/discover"}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}' \
+  '{"jsonrpc":"2.0","id":3,"method":"events/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}' \
+| env -u ZULIP_BASE_URL -u ZULIP_SITE -u ZULIP_EMAIL -u ZULIP_API_KEY \
+    HOME="$tmp" XDG_CONFIG_HOME="$tmp/config" XDG_CACHE_HOME="$tmp/cache" \
+    ZUL_DOTENV= "$zul_mcp" 2>"$tmp/stderr.log"
+cat "$tmp/stderr.log" >&2   # startup/shutdown diagnostics only
+```
+
+The expected stdout is exactly three JSON lines, one result per request id:
+
+- id `1`: discovery capabilities are
+  `{"tools":{},"extensions":{"io.modelcontextprotocol/events":{}}}`.
+- id `2`: `tools/list` returns exactly eight tools: `whoami`, `sync`,
+  `list_streams`, `list_topics`, `read_topic`, `recent`, `search`,
+  `send_message`.
+- id `3`: `events/list` returns one `zulip.message` descriptor with
+  `delivery: ["poll","push"]` and nullable payload `stream`/`topic` fields.
+
+The frame ids and the `_meta` protocol component id are part of the check: the
+responses must echo the ids, and omitting the protocol metadata must fail with
+`-32022`. Diagnostics belong on stderr; stdout must stay pure JSON-RPC.
+
 ## Credentials
 
 `zul-mcp` reuses the same Zulip configuration as `zul-cli`. The simplest setup is:
@@ -250,6 +289,13 @@ The same stream can drive an automation. Create it with OpenCode's
 }
 ```
 
+This automation example is derived from the installed OpenCode 2.3.2 tool and
+schema documentation, not from a live automation run. The `trigger`/`action`
+shape may change with the OpenCode version. Verify the lower-risk
+`opencode_watch_mcp_event` watch path first; create an automation only when
+unattended wake-ups are actually needed, and compare the example with the
+installed version's `automation_create` signature before relying on it.
+
 - The trigger's `args` object is the event type's filter input, the same shape as
   a watch's `arguments`.
 - A prompt action receives the event as untrusted data; after substituting it,
@@ -280,13 +326,13 @@ The same stream can drive an automation. Create it with OpenCode's
 | --- | --- |
 | Name | `zulip.message` |
 | Delivery | `["poll", "push"]` |
-| Description | A message was posted to a stream topic or direct message conversation visible to the configured account |
+| Description | A message was posted to a stream topic or direct message conversation visible to the configured account. Direct messages carry null stream and topic values. |
 
 Filters (`inputSchema`):
 
 | Filter | Type | Meaning |
 | --- | --- | --- |
-| `stream` | string | Exact stream display name |
+| `stream` | string | Exact stream display name; never matches direct messages |
 | `topic` | string | Exact topic; requires `stream` |
 | `sender_email` | string | Case-insensitive sender match |
 | `exclude_self` | boolean, default `true` | Skip messages sent by the configured account |
@@ -297,9 +343,9 @@ Payload (`payloadSchema`):
 | --- | --- | --- |
 | `message_id` | integer | Zulip message ID |
 | `realm` | string (URI) | Configured realm, trailing slash trimmed |
-| `message_type` | `"stream"` or `"private"` | Message kind |
-| `stream` | string or null | Stream name; direct messages use the literal label `"direct message"` |
-| `topic` | string or null | Topic name; null for direct messages |
+| `message_type` | `"stream"` or `"private"` | Message kind; direct messages are `"private"` |
+| `stream` | string or null | Stream display name; `null` for direct messages (there is no synthetic stream label) |
+| `topic` | string or null | Topic name; `null` for direct messages |
 | `sender_name` | string | Sender display name |
 | `sender_email` | string or null | Sender email |
 | `timestamp` | string (RFC 3339) | Zulip message time |
@@ -309,8 +355,10 @@ Payload (`payloadSchema`):
 
 Pull controls (`events/poll`):
 
-- `maxAgeMs`: non-negative integer. Messages older than this are skipped and set
-  `truncated: true`.
+- `maxAgeMs`: non-negative integer. Matching messages older than this are skipped
+  and set `truncated: true`. Poll and push apply the same evaluator: filters are
+  checked before age, so an aged message that would not match the filters does
+  not mark truncation.
 - `maxEvents`: 1–200, default 50. If more matching messages are available, the
   response sets `hasMore: true` and the cursor points at the last returned
   message; poll again with that cursor.
@@ -322,7 +370,8 @@ Push controls (`events/stream`):
 
 - `heartbeatMs`: requested heartbeat interval, clamped to 1000–60000 ms; the
   granted value is reported in the `active` notification. Default 15000 ms.
-- `maxAgeMs` applies to the replay window. `maxEvents` belongs to poll only.
+- `maxAgeMs` applies to the replay window using the same match-then-age
+  evaluator as poll. `maxEvents` belongs to poll only.
 - Subscriptions are demultiplexed by
   `_meta["io.modelcontextprotocol/subscriptionId"]`, which is the exact request
   id (string or number preserved). Notification methods are
@@ -333,15 +382,34 @@ Cursors and gaps:
 - Cursor format: `v1:<realm-url-without-trailing-slash>|<message-id>`. Treat it
   as opaque. A cursor from another realm, or a malformed one, is rejected with
   `-32602`.
-- `truncated` means something was skipped: an aged-out message, or an upstream
-  fetch that hit the 25,000-message batch limit. Poll results expose it as
-  `truncated`; push streams send a fresh `active` notification with
-  `truncated: true` and a safe cursor from before the batch, so the client can
-  replay if it needs the skipped range. A watch reports skipped events in its
-  wake message.
-- The cursor advances past filtered and aged messages, so it never claims
-  unevaluated work. Replaying from an earlier saved cursor can therefore
-  re-deliver matching events; this is the at-least-once trade-off.
+- Event id format: `<realm-url-without-trailing-slash>#<message-id>`. It is
+  stable for a message within a realm; deduplicate by `eventId` (or
+  `data.message_id`).
+- Poll and push share one match-then-age evaluator. `truncated` means something
+  was skipped: a matching message older than `maxAgeMs`, or an upstream fetch
+  that reached its page cap while more history remained. Poll reports it as
+  `truncated: true`; the cursor follows the normal poll rule (the last returned
+  event when `hasMore` is true, otherwise past every evaluated message), so a
+  complete poll does not repeat the truncated batch.
+- Push streams announce truncation with a fresh `active` notification carrying
+  `truncated: true` and a safe cursor from before the batch. `active` and
+  subsequent heartbeats report that re-anchored cursor, while the stream's
+  internal fetch position stays at the last evaluated message. The live stream
+  therefore keeps progressing and does not refetch the same batch.
+- Resuming from the announced cursor can replay matching messages that were
+  already delivered before the truncation. This is at-least-once delivery with
+  no silent gap; when possible, resume a watch from the last event cursor you
+  actually processed. A watch reports skipped events in its wake message.
+- `maxAgeMs: 0` is not a useful watch setting. Any message older than the exact
+  evaluation instant is aged out, so each new batch can emit another truncation
+  re-anchor and replay cycle.
+- The upstream page cap is 25 pages of 1,000 messages (25,000 per fetch), and
+  `truncated` is set only when the cap was reached on a full final page that
+  still advanced: more history may remain. A short final page proves the batch
+  is complete.
+- The server's fetch position advances past filtered and aged messages, so it
+  never claims unevaluated work. Replaying from an earlier saved cursor can
+  therefore re-deliver matching events; this is the at-least-once trade-off.
 
 ## Limitations
 
