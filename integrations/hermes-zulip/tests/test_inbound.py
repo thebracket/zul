@@ -54,11 +54,13 @@ async def test_stream_prefers_plain_text_over_rendered_content(config):
     assert message.text == "plain"
 
 
-async def test_stream_falls_back_to_content_when_plain_text_missing(config):
+async def test_missing_plain_text_is_dropped_instead_of_delivering_rendered_html(config):
     adapter = _adapter(config)
-    message = await _handle(adapter, make_stream_event(
-        plain_text="", content="fallback text", flags=["mentioned"], id=12))
-    assert message.text == "fallback text"
+    assert await _handle(adapter, make_stream_event(
+        id=12, plain_text="", content="<p>fallback text</p>", flags=["mentioned"])) is None
+    assert await _handle(adapter, make_dm_event(
+        id=33, plain_text="", content='<p><img src="image.png"></p>')) is None
+    assert adapter.handled_events == []
 
 
 async def test_self_message_is_ignored(config):

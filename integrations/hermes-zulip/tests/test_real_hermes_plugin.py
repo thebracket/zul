@@ -8,16 +8,15 @@ subprocess so the unit tests' lightweight stub modules never shadow the real
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
 import textwrap
 from pathlib import Path
 
+import hermes_zulip.install as install_module
 import pytest
 
 _HERMES_REPO = os.environ.get("HERMES_REPO")
-_PLUGIN_DIR = Path(__file__).resolve().parents[1] / "python" / "hermes_zulip"
 
 
 @pytest.mark.skipif(not _HERMES_REPO, reason="HERMES_REPO is not set")
@@ -27,10 +26,7 @@ def test_real_hermes_loads_and_registers_plugin(tmp_path):
         pytest.skip("HERMES_REPO does not look like a Hermes checkout")
 
     home = tmp_path / "hermes-home"
-    plugins = home / "plugins"
-    plugins.mkdir(parents=True)
-    shutil.copytree(_PLUGIN_DIR, plugins / "zulip",
-                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    install_module.install_plugin(home)
     (home / "config.yaml").write_text(
         "plugins:\n  enabled:\n    - zulip-platform\n", encoding="utf-8")
 
@@ -55,6 +51,7 @@ def test_real_hermes_loads_and_registers_plugin(tmp_path):
         entry = platform_registry.get("zulip")
         assert entry is not None, "platform was not registered"
         assert entry.adapter_factory is not None
+        assert entry.check_fn() is True
         assert entry.validate_config(PlatformConfig(enabled=True, extra={})) is True
         assert entry.parse_target_ref_fn("stream:core/ops")[0].startswith("zulip:v1:stream:0:")
 
@@ -156,7 +153,10 @@ def test_real_hermes_loads_and_registers_plugin(tmp_path):
     )
     env = {
         **os.environ,
-        "PYTHONPATH": str(repo),
+        "PYTHONPATH": os.pathsep.join((
+            str(repo),
+            str(Path(__file__).resolve().parents[1] / "python"),
+        )),
         "HERMES_HOME": str(home),
         "ZULIP_SITE": "https://chat.example.com",
         "ZULIP_EMAIL": "bot@example.com",

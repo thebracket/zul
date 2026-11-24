@@ -96,7 +96,15 @@ def _redact(text: Any, secret: str | None = None) -> str:
 
 
 def _site_from(extra: dict[str, Any]) -> str:
-    """Resolve the realm URL, accepting both documented spellings."""
+    """Resolve the realm URL with libzul's precedence.
+
+    libzul reads ``ZULIP_BASE_URL`` before ``ZULIP_SITE``, so the adapter does
+    too; ``config.extra["site"]`` is the fallback when neither env var is set.
+    """
+    for name in ("ZULIP_BASE_URL", "ZULIP_SITE"):
+        value = str(get_scoped_secret(name, "") or "").strip()
+        if value:
+            return value
     return (extra_or_secret(extra, "site", "ZULIP_SITE")
             or extra_or_secret(extra, "base_url", "ZULIP_BASE_URL"))
 
@@ -173,17 +181,14 @@ def _missing_config(extra: dict[str, Any]) -> list[str]:
 
 
 def _message_text(event: dict[str, Any]) -> str:
-    """The bridge's extracted text, falling back to the raw ``content`` field.
+    """The bridge's extracted plain text; rendered HTML never reaches the agent.
 
-    ``plain_text`` is libzul's HTML-to-text field.  ``content`` can be rendered
-    through the event payload when the poller asked Zulip for rendered content;
-    it is only a fallback because the plain-text form is what Hermes should see.
+    ``content`` is libzul's ``rendered_html`` fallback for diagnostics only.  A
+    message with no ``plain_text`` (for example an image-only DM) is dropped by
+    the empty-text guards rather than handed to the agent as markup.
     """
     plain = event.get("plain_text")
-    if isinstance(plain, str) and plain.strip():
-        return plain
-    content = event.get("content")
-    return content if isinstance(content, str) else ""
+    return plain if isinstance(plain, str) else ""
 
 
 def _mention_patterns(bot_name: str) -> tuple[re.Pattern[str], ...]:
@@ -579,8 +584,8 @@ def _env_enablement() -> dict | None:
     profile's env at connect time, and ``hermes status`` output must not gain a
     credential copy.  The home channel enables ``deliver=zulip`` cron jobs.
     """
-    site = (str(get_scoped_secret("ZULIP_SITE", "") or "").strip()
-            or str(get_scoped_secret("ZULIP_BASE_URL", "") or "").strip())
+    site = (str(get_scoped_secret("ZULIP_BASE_URL", "") or "").strip()
+            or str(get_scoped_secret("ZULIP_SITE", "") or "").strip())
     email = str(get_scoped_secret("ZULIP_EMAIL", "") or "").strip()
     if not site or not email:
         return None
@@ -676,8 +681,7 @@ async def _standalone_send(pconfig, chat_id: str, message: str, *, thread_id: st
 
     bridge = None
     try:
-        bridge = await asyncio.to_thread(lambda: zul_bridge.Bridge(  # type: ignore[union-attr]
-            **settings))
+        bridge = await asyncio.to_thread(_make_bridge, extra)
     except Exception as exc:
         detail = _redact(exc, settings["api_key"])
         logger.error("[Zulip] standalone send failed: %s", detail)
@@ -691,6 +695,7 @@ async def _standalone_send(pconfig, chat_id: str, message: str, *, thread_id: st
         if exc.delivered_message_ids:
             result["delivered_message_ids"] = list(exc.delivered_message_ids)
             result["partial_overflow"] = True
+            result["delivery"] = "partial"
         return result
     except Exception as exc:
         detail = _redact(exc, settings["api_key"])

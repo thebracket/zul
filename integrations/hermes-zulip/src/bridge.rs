@@ -646,6 +646,7 @@ async fn event_loop(
             match registered {
                 Ok(new_queue) => {
                     queue = Some(new_queue);
+                    failures = 0;
                     queue_errors = 0;
                     backoff = EVENT_BACKOFF_START;
                 }

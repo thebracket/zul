@@ -490,10 +490,14 @@ fn shutdown_deletes_the_queue_and_is_idempotent() {
 }
 
 #[test]
-fn fatal_event_stream_error_is_reported_and_deletes_the_queue() {
+fn persistent_poll_errors_reregister_without_a_fatal_result() {
+    // A successful replacement registration starts a fresh failure budget, so
+    // poll errors replace the queue and the poller keeps retrying instead of
+    // reporting a fatal event-stream error. Registration failures stay fatal
+    // after five attempts (covered above).
     let server = start_server();
-    mount(&server, register_mock("q-fatal").expect(2));
-    mount(&server, failing_events_mock("q-fatal", 5));
+    mount(&server, register_mock("q-fatal"));
+    mount(&server, failing_events_mock("q-fatal", 6).up_to_n_times(6));
     mount(
         &server,
         Mock::given(method("DELETE"))
@@ -502,28 +506,36 @@ fn fatal_event_stream_error_is_reported_and_deletes_the_queue() {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "result": "success",
                 "msg": ""
-            })))
-            .expect(2),
+            }))),
     );
 
     let core = BridgeCore::new(config(&server)).expect("bridge");
-    let error = core
-        .next_event(Duration::from_secs(5))
-        .expect_err("a fatal poller failure reaches the consumer");
-    assert!(error.contains("failed repeatedly"), "message: {error}");
-    assert!(error.contains("event server is down"), "message: {error}");
-
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while core.queue_id().is_some() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    let outcome = core.next_event(Duration::from_secs(1));
     assert!(
-        core.queue_id().is_none(),
-        "the fatal path deletes the queue"
+        matches!(outcome, Ok(None)),
+        "poll errors must not become a fatal event-stream result: {outcome:?}"
     );
 
     core.close();
-    verify(&server);
+
+    let requests = block_on(server.received_requests()).expect("wiremock records requests");
+    let polls = requests
+        .iter()
+        .filter(|request| {
+            request.method.as_str() == "GET" && request.url.path() == "/api/v1/events"
+        })
+        .count();
+    let registrations = requests
+        .iter()
+        .filter(|request| {
+            request.method.as_str() == "POST" && request.url.path() == "/api/v1/register"
+        })
+        .count();
+    assert!(polls >= 6, "expected repeated polls: {polls}");
+    assert!(
+        registrations >= 3,
+        "expected a replacement registration per exhausted queue: {registrations}"
+    );
 }
 
 #[test]
@@ -655,6 +667,73 @@ fn queue_expiry_reregisters_and_keeps_delivering_events() {
         delete_index < register_indices[1],
         "the old queue must be deleted before the replacement is registered"
     );
+}
+
+#[test]
+fn successful_registration_resets_the_failure_budget() {
+    let server = start_server();
+    mount(&server, register_mock("q-old").up_to_n_times(1).expect(1));
+    mount(&server, register_mock("q-new").up_to_n_times(1).expect(1));
+    // Three transient errors exhaust the same-queue budget and force a
+    // replacement registration with three accumulated failures.
+    mount(&server, failing_events_mock("q-old", 3));
+    mount(
+        &server,
+        Mock::given(method("DELETE"))
+            .and(path("/api/v1/events"))
+            .and(body_string_contains("queue_id=q-old"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": "success",
+                "msg": ""
+            })))
+            .expect(1),
+    );
+    // Two further errors would cross the five-failure fatal threshold if the
+    // successful registration had not reset the counter.
+    mount(&server, failing_events_mock("q-new", 2).up_to_n_times(2));
+    mount(
+        &server,
+        Mock::given(method("GET"))
+            .and(path("/api/v1/events"))
+            .and(query_param("queue_id", "q-new"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": "success",
+                "msg": "",
+                "queue_id": "q-new",
+                "events": [
+                    message_event(json!({
+                        "id": 77,
+                        "type": "stream",
+                        "stream_id": 12,
+                        "display_recipient": "core",
+                        "subject": "ops",
+                        "sender_id": 2,
+                        "sender_full_name": "Ada Lovelace",
+                        "sender_email": "ada@example.com",
+                        "timestamp": 1_700_000_000,
+                        "content": "<p>still alive</p>",
+                        "flags": ["read"]
+                    }))
+                ]
+            })))
+            .up_to_n_times(1)
+            .expect(1),
+    );
+    mount(
+        &server,
+        empty_events_mock("q-new", Duration::from_millis(10)),
+    );
+
+    let core = BridgeCore::new(config(&server)).expect("bridge");
+    let event = core
+        .next_event(Duration::from_secs(5))
+        .expect("poller survives two errors after re-registration")
+        .expect("event present");
+    assert_eq!(event["id"], 77);
+    assert_eq!(core.queue_id().as_deref(), Some("q-new"));
+
+    core.close();
+    verify(&server);
 }
 
 #[test]

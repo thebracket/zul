@@ -243,8 +243,8 @@ def test_target_ref_registration_functions():
 
 
 def test_adapter_uses_env_configuration(fake_bridge, config, monkeypatch):
-    monkeypatch.setenv("ZULIP_SITE", "https://chat.example.com")
-    monkeypatch.setenv("ZULIP_BASE_URL", "https://ignored.example.com")
+    monkeypatch.setenv("ZULIP_SITE", "https://ignored.example.com")
+    monkeypatch.setenv("ZULIP_BASE_URL", "https://chat.example.com")
     monkeypatch.setenv("ZULIP_EMAIL", "bot@example.com")
     monkeypatch.setenv("ZULIP_API_KEY", "secret")
     monkeypatch.setenv("ZULIP_REQUIRE_MENTION", "false")
@@ -259,6 +259,18 @@ def test_adapter_uses_env_configuration(fake_bridge, config, monkeypatch):
     assert adapter.allowed_streams == frozenset({"core", "random"})
     assert adapter.max_message_length == 777
     assert adapter.queue_timeout_secs == 15
+
+
+def test_env_enablement_prefers_base_url_over_site(monkeypatch):
+    monkeypatch.setenv("ZULIP_SITE", "https://site.example.com")
+    monkeypatch.setenv("ZULIP_BASE_URL", "https://base.example.com")
+    monkeypatch.setenv("ZULIP_EMAIL", "bot@example.com")
+    assert _env_enablement()["site"] == "https://base.example.com"
+
+
+def test_adapter_site_extra_wins_when_no_env_is_set(config):
+    config.extra["site"] = "https://extra.example.com"
+    assert ZulipAdapter(config).site == "https://extra.example.com"
 
 
 def test_adapter_uses_base_url_alias(fake_bridge, config, monkeypatch):
@@ -401,8 +413,30 @@ async def test_standalone_send_closes_bridge_on_send_error(fake_bridge, monkeypa
     result = await _standalone_send(PlatformConfig(enabled=True, extra={}),
                                     encode_stream("core", "ops", 12), "hello")
     assert "error" in result
+    assert "delivery" not in result
+    assert delivery_state(result) == "uncertain"
     assert "partial_overflow" not in result
     assert "delivered_message_ids" not in result
+    assert fake_bridge.instances[0].close_count == 1
+
+
+async def test_standalone_send_generic_failure_is_uncertain_and_redacted(
+        fake_bridge, monkeypatch):
+    monkeypatch.setenv("ZULIP_SITE", "https://chat.example.com")
+    monkeypatch.setenv("ZULIP_EMAIL", "bot@example.com")
+    monkeypatch.setenv("ZULIP_API_KEY", "secret-key")
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("standalone exploded api_key=secret-key")
+
+    monkeypatch.setattr(adapter_module, "_send_chunks", explode)
+    result = await _standalone_send(PlatformConfig(enabled=True, extra={}),
+                                    encode_stream("core", "ops", 12), "hello")
+    assert "standalone exploded" in result["error"]
+    assert "secret-key" not in result["error"]
+    assert "delivery" not in result
+    assert delivery_state(result) == "uncertain"
+    assert "partial_overflow" not in result
     assert fake_bridge.instances[0].close_count == 1
 
 
@@ -420,6 +454,8 @@ async def test_standalone_send_reports_partial_delivery(fake_bridge, monkeypatch
     bridge = fake_bridge.instances[0]
     assert result["error"]
     assert "retryable" not in result
+    assert result["delivery"] == "partial"
+    assert delivery_state(result) == "partial"
     assert result["partial_overflow"] is True
     assert result["delivered_message_ids"] == [str(bridge.sent[0][4])]
     assert len(bridge.sent) == 1
@@ -460,15 +496,24 @@ def test_real_hermes_delivery_state_reads_the_pre_send_envelope(tmp_path):
         from gateway.config import PlatformConfig
         from gateway.platforms._shared import delivery_state
         from hermes_zulip.adapter import _standalone_send
+        from hermes_zulip.chat_ids import encode_stream
 
-        result = asyncio.run(_standalone_send(
-            PlatformConfig(enabled=True, extra={}),
-            "stream:core/ops", "hello", media_files=["/tmp/image.png"],
+        config = PlatformConfig(enabled=True, extra={
+            "site": "https://chat.example.com",
+            "email": "bot@example.com",
+            "api_key": "secret-key",
+        })
+        media = asyncio.run(_standalone_send(
+            config, "stream:core/ops", "hello", media_files=["/tmp/image.png"],
         ))
-        assert "error" in result, result
-        assert "retryable" not in result, result
-        assert result["delivery"] == "none", result
-        assert delivery_state(result) == "none", result
+        no_topic = asyncio.run(_standalone_send(
+            config, encode_stream("core", "", 12), "hello",
+        ))
+        for label, result in (("media", media), ("no_topic", no_topic)):
+            assert "error" in result, (label, result)
+            assert "retryable" not in result, (label, result)
+            assert result["delivery"] == "none", (label, result)
+            assert delivery_state(result) == "none", (label, result)
         print("ok")
         """
     )

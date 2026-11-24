@@ -10,7 +10,7 @@ author: Zulip Thigy contributors
 homepage: https://github.com/thebracket/zul
 requires_env:
   - name: ZULIP_SITE
-    description: "Zulip realm URL (for example https://chat.example.com); ZULIP_BASE_URL is also accepted"
+    description: "Zulip realm URL (for example https://chat.example.com); ZULIP_BASE_URL is also accepted and wins when both are set"
     prompt: "Zulip site URL"
     url: "https://zulip.com/api/"
     password: false
@@ -25,7 +25,7 @@ requires_env:
     password: true
 optional_env:
   - name: ZULIP_BASE_URL
-    description: "Alias for ZULIP_SITE; ZULIP_SITE wins when both are set"
+    description: "Alias for ZULIP_SITE; ZULIP_BASE_URL wins when both are set"
     prompt: "Zulip site URL"
     password: false
   - name: ZULIP_REQUIRE_MENTION

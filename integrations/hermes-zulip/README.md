@@ -120,7 +120,7 @@ the gateway. See [`.env.example`](.env.example) for a copyable template.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `ZULIP_SITE` | required | Realm URL, e.g. `https://chat.example.com`. `ZULIP_BASE_URL` is an alias; `ZULIP_SITE` wins when both are set. |
+| `ZULIP_SITE` | required | Realm URL, e.g. `https://chat.example.com`. `ZULIP_BASE_URL` is an alias and wins when both are set. |
 | `ZULIP_EMAIL` | required | Email address of the bot account. |
 | `ZULIP_API_KEY` | required | API key of the bot account. |
 | `ZULIP_REQUIRE_MENTION` | `true` | In streams, only messages that mention the bot reach the agent. |
@@ -213,14 +213,17 @@ This is a text-only v1:
   sends; Hermes' normal chunking applies.
 - A queue that Zulip rejects, or that fails three consecutive polls, is deleted
   and re-registered. The replacement starts at a new server cursor, so events
-  produced during that gap are not delivered.
+  produced during that gap are not delivered. A successful replacement restarts
+  the failure budget; a fatal poller error is reported only after five
+  consecutive registration failures.
 - Silent mentions (the no-notification mention form) render without `@`, so
   detection depends on the event-level flags Zulip supplies. If the flags are
   absent, a silent mention is treated as an ordinary message and dropped when
   mentions are required.
 - Event `content` is the rendered content Zulip returns (libzul registers with
-  `apply_markdown=true`), not raw Markdown source. The agent receives
-  `plain_text`; code that inspects `content` should expect HTML-ish rendering.
+  `apply_markdown=true`), not raw Markdown source. It is kept for diagnostics
+  only: the agent never receives it. A message with no `plain_text` (for
+  example an image-only DM) is dropped rather than delivered as markup.
 - Non-message and malformed message events are skipped without stopping the
   poller.
 - One gateway process holds one bridge per bot account (a platform lock keyed by
@@ -276,8 +279,8 @@ integrations/hermes-zulip/.venv/bin/python integrations/hermes-zulip/tests/live_
 
 Pytest collects the adapter tests plus `tests/test_install.py`, which covers
 explicit/`HERMES_HOME`/default home resolution, idempotent re-runs, atomic
-rewrites, installed file contents, absence of credential values, and the module
-entry point.
+rewrites, installed file contents, absence of credential values, the module and
+console-script entry points, and importing the installer without the gateway.
 
 ## Troubleshooting
 
@@ -286,6 +289,7 @@ entry point.
 | `hermes plugins list` shows `zulip-platform` but it fails to load with an import error | The wheel is missing from the environment Hermes runs under. Run `"$HERMES_PY" -c "import zul_bridge"` with the same interpreter and reinstall. |
 | Plugin is discovered but not enabled | `hermes plugins enable zulip-platform`. The enable key is the manifest `name`, not the install directory (`plugins/zulip`). Restart the gateway. |
 | `Zulip is not configured: ... must be set` | Set the named `ZULIP_*` variables in `$HERMES_HOME/.env` (or the profile's env) and restart. `ZULIP_SITE`/`ZULIP_BASE_URL`, `ZULIP_EMAIL`, and `ZULIP_API_KEY` are all required. |
+| `Zulip is not configured` while libzul's own settings exist | libzul's settings presence check cannot read a corrupt settings file, so the credentials look absent. Repair the libzul settings (`~/.config/zul/config.toml` and its secret file), or set the `ZULIP_*` variables explicitly. |
 | No stream traffic reaches the agent | The bot must be subscribed to the stream; `ZULIP_REQUIRE_MENTION` must be satisfied; `ZULIP_ALLOWED_STREAMS` and the user allowlist can filter traffic. Check the gateway log for dropped or malformed events. |
 | Replies work in DMs but not streams | Stream replies need a topic. Use a session that came from a stream message, or target `stream:<name>/<topic>`. |
 | Typing indicator never appears | Expected for targets parsed from a stream name (no numeric stream id). A canonical chat id from an inbound message carries the id and works. |
@@ -318,7 +322,8 @@ bridge.close()
 ```
 
 Explicit constructor arguments override libzul settings; otherwise
-`ZULIP_BASE_URL`/`ZULIP_SITE`, `ZULIP_EMAIL`, and `ZULIP_API_KEY` are read.
+`ZULIP_BASE_URL` (which wins over `ZULIP_SITE`), `ZULIP_EMAIL`, and
+`ZULIP_API_KEY` are read.
 Missing values raise `ValueError` before any network call, and the API key is
 never included in error text. Blocking methods release the GIL. Normalized
 events carry `id`, `kind` (`stream`/`dm`), `stream_id`, `stream`, `topic`,
