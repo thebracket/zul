@@ -13,7 +13,9 @@
 //! and retried with jittered backoff; the poll loop only claims progress after
 //! a successful fetch.
 
-use crate::events::{self, encode_cursor, evaluate, occurrence, PollFilter, StreamParams};
+use crate::events::{
+    self, encode_cursor, evaluate, occurrence, PollFilter, StreamParams, Truncation,
+};
 use crate::protocol::{self, RequestId};
 use crate::tools::one_line;
 use chrono::Utc;
@@ -22,7 +24,7 @@ use libzul::zulip::models::ZulipMessage;
 use libzul::Settings;
 use serde_json::{json, Value};
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -169,8 +171,9 @@ struct Account {
 
 struct Subscriber {
     generation: u64,
-    /// Resume position reported by `active` and heartbeats. A truncation
-    /// re-anchor moves this back to the announced safe cursor.
+    /// Resume position reported by `active` and heartbeats. Aged truncation
+    /// advances it past the skipped message; page-cap truncation moves it back
+    /// to the safe pre-batch position.
     cursor: Rc<Cell<i64>>,
     /// Next message the subscriber still needs. Never regresses, so a
     /// re-anchor does not refetch and redeliver the same batch forever.
@@ -424,8 +427,10 @@ impl StreamHub {
     ///
     /// Evaluation (cursor check, match, age) and queueing happen together, so
     /// a message is enqueued at most once per subscriber. Filtered and aged
-    /// messages still advance the cursor. A truncation re-anchors the
-    /// subscription to the safe pre-batch cursor it announces.
+    /// messages still advance the cursor. An aged truncation announces the
+    /// advanced cursor so a resume makes progress; a page-cap truncation
+    /// re-anchors to the safe pre-batch cursor because matching messages in
+    /// the cut-short batch may still be queued.
     fn dispatch(
         &self,
         messages: Vec<ZulipMessage>,
@@ -449,7 +454,7 @@ impl StreamHub {
             .iter()
             .map(|(key, subscriber)| (key.clone(), subscriber.fetch_cursor.get()))
             .collect();
-        let mut truncated: HashSet<String> = HashSet::new();
+        let mut truncations: HashMap<String, Truncation> = HashMap::new();
         let mut overflowed: Vec<(String, mpsc::Sender<Delivery>)> = Vec::new();
 
         for message in messages {
@@ -471,12 +476,13 @@ impl StreamHub {
                         subscriber.max_age_ms,
                         now_ms,
                     );
-                    if evaluation.advance {
-                        subscriber.fetch_cursor.set(message.id);
-                        subscriber.cursor.set(message.id);
-                    }
-                    if evaluation.truncated {
-                        truncated.insert(key.clone());
+                    // The cursor check above is the only gate: every evaluated
+                    // message advances the fetch position and the announced
+                    // cursor, whether it was delivered, filtered, or aged out.
+                    subscriber.fetch_cursor.set(message.id);
+                    subscriber.cursor.set(message.id);
+                    if evaluation.truncated != Truncation::None {
+                        truncations.insert(key.clone(), evaluation.truncated);
                     }
                     if !evaluation.deliver {
                         continue;
@@ -485,7 +491,7 @@ impl StreamHub {
                         .tx
                         .try_send(Delivery::Message(Rc::clone(&message)))
                     {
-                        Ok(()) => subscriber.cursor.set(message.id),
+                        Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_)) => stale.push(key.clone()),
                         Err(mpsc::error::TrySendError::Closed(_)) => stale.push(key.clone()),
                     }
@@ -505,14 +511,17 @@ impl StreamHub {
             let subscribers = self.subscribers.borrow();
             for (key, subscriber) in subscribers.iter() {
                 if targets.get(key.as_str()) == Some(&subscriber.generation) {
-                    truncated.insert(key.clone());
+                    // Page-cap truncation dominates an aged truncation in the
+                    // same batch: unwritten matching messages may still be
+                    // queued, so only the pre-batch cursor is safe.
+                    truncations.insert(key.clone(), Truncation::PageCap);
                 }
             }
         }
 
-        for key in truncated {
-            let cursor = batch_start.get(&key).copied().unwrap_or(0);
-            self.push_truncated(&key, cursor);
+        for (key, cause) in truncations {
+            let page_cap_cursor = batch_start.get(&key).copied().unwrap_or(0);
+            self.push_truncated(&key, cause, page_cap_cursor);
         }
         for (key, tx) in overflowed {
             self.subscribers.borrow_mut().remove(&key);
@@ -520,19 +529,30 @@ impl StreamHub {
         }
     }
 
-    fn push_truncated(&self, key: &str, cursor_id: i64) {
-        let cursor = encode_cursor(&self.realm(), cursor_id);
-        let mut subscribers = self.subscribers.borrow_mut();
-        let Some(subscriber) = subscribers.get_mut(key) else {
-            return;
+    /// Announce a truncation at the cursor that is safe for its cause.
+    fn push_truncated(&self, key: &str, cause: Truncation, page_cap_cursor: i64) {
+        let (cursor, tx) = {
+            let mut subscribers = self.subscribers.borrow_mut();
+            let Some(subscriber) = subscribers.get_mut(key) else {
+                return;
+            };
+            let cursor_id = match cause {
+                // Matching messages in the cut-short batch may still be queued,
+                // so fall back to the safe pre-batch position. The fetch cursor
+                // stays at the last evaluated message, so the same batch is not
+                // refetched and redelivered forever.
+                Truncation::PageCap => page_cap_cursor,
+                // The announced cursor already advanced past the aged message;
+                // resuming from it does not repeat the same truncation.
+                Truncation::Aged => subscriber.cursor.get(),
+                Truncation::None => return,
+            };
+            subscriber.cursor.set(cursor_id);
+            (
+                encode_cursor(&self.realm(), cursor_id),
+                subscriber.tx.clone(),
+            )
         };
-        // Re-anchor the announced cursor to the safe position, so `active` and
-        // later heartbeats report one resume point. The fetch cursor stays at
-        // the last evaluated message, so the same batch is not refetched and
-        // redelivered forever.
-        subscriber.cursor.set(cursor_id);
-        let tx = subscriber.tx.clone();
-        drop(subscribers);
         match tx.try_send(Delivery::Truncated { cursor }) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -1133,7 +1153,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn max_age_marks_truncation_and_re_anchors_the_cursor() {
+    async fn max_age_marks_truncation_and_advances_the_cursor() {
         LocalSet::new()
             .run_until(async {
                 let hub = hub(config());
@@ -1153,15 +1173,20 @@ mod tests {
                 hub.dispatch(vec![message(101, old)], false, &hub.snapshot());
                 assert_eq!(
                     cursor.get(),
-                    100,
-                    "the subscription cursor follows the announced safe cursor"
+                    101,
+                    "an aged match advances the announced cursor past itself"
                 );
                 match subscription.rx.try_recv() {
                     Ok(Delivery::Truncated { cursor }) => {
-                        assert_eq!(cursor, "v1:https://chat.example|100");
+                        assert_eq!(cursor, "v1:https://chat.example|101");
                     }
                     other => panic!("expected a truncated notification, got {other:?}"),
                 }
+                assert_eq!(
+                    hub.snapshot()[0].2,
+                    101,
+                    "the fetch cursor advances past the aged match"
+                );
                 assert!(hub.subscribers.borrow().contains_key("n:1"));
                 drop(subscription);
                 hub.shutdown();

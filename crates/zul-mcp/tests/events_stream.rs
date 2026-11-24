@@ -999,7 +999,7 @@ async fn the_ninth_stream_is_rejected() {
 }
 
 #[tokio::test]
-async fn max_age_announces_truncation_on_a_fresh_active() {
+async fn max_age_announces_truncation_at_the_aged_cursor() {
     let dir = TempDir::new().expect("temp dir");
     let mock = MockServer::start().await;
     let old = now() - 3_600;
@@ -1021,6 +1021,25 @@ async fn max_age_announces_truncation_on_a_fresh_active() {
     let settings = settings(dir.path(), &mock.uri());
     let base = mock.uri();
 
+    let poll = events::poll(
+        &settings,
+        events::parse_poll_params(&json!({
+            "name": "zulip.message",
+            "cursor": cursor(&base, 100),
+            "maxAgeMs": 60_000,
+        }))
+        .expect("poll params"),
+    )
+    .await
+    .expect("poll result");
+    assert_eq!(poll["truncated"], true);
+    assert_eq!(poll["events"], json!([]));
+    assert_eq!(
+        poll["cursor"],
+        json!(cursor(&base, 101)),
+        "poll's cursor advances past the aged match"
+    );
+
     LocalSet::new()
         .run_until(async {
             let (tx, rx) = mpsc::channel(64);
@@ -1030,7 +1049,11 @@ async fn max_age_announces_truncation_on_a_fresh_active() {
             let start = cursor(&base, 100);
 
             server
-                .handle_line(&stream_request(json!(1), &start, json!({"maxAgeMs": 0})))
+                .handle_line(&stream_request(
+                    json!(1),
+                    &start,
+                    json!({"maxAgeMs": 60_000}),
+                ))
                 .await;
             let active = wire.next().await;
             assert_eq!(active["method"], "notifications/events/active");
@@ -1043,8 +1066,8 @@ async fn max_age_announces_truncation_on_a_fresh_active() {
             assert_eq!(truncated["params"]["truncated"], true);
             assert_eq!(
                 truncated["params"]["cursor"],
-                json!(cursor(&base, 100)),
-                "a truncated active must resume from a safe pre-batch cursor"
+                json!(cursor(&base, 101)),
+                "aged truncation must announce the advanced cursor so a resume progresses"
             );
 
             let after = wire.quiet().await;
@@ -1055,8 +1078,8 @@ async fn max_age_announces_truncation_on_a_fresh_active() {
                         heartbeats += 1;
                         assert_eq!(
                             frame["params"]["cursor"],
-                            json!(cursor(&base, 100)),
-                            "after re-anchoring, heartbeats must not advertise the post-batch cursor"
+                            json!(cursor(&base, 101)),
+                            "heartbeats must report the advanced resume position"
                         );
                     }
                     Some("notifications/events/event") => {
@@ -1067,8 +1090,91 @@ async fn max_age_announces_truncation_on_a_fresh_active() {
             }
             assert!(
                 heartbeats > 0,
-                "the stream must heartbeat after the truncation re-anchor"
+                "the stream must heartbeat after the truncation announcement"
             );
+            server.drain(Duration::from_millis(50)).await;
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn max_age_resume_from_the_announced_cursor_progresses() {
+    let dir = TempDir::new().expect("temp dir");
+    let mock = MockServer::start().await;
+    let old = now() - 3_600;
+    let fresh = now();
+    mount_after(&mock, move |anchor| match anchor {
+        100 => vec![message(
+            101,
+            "core",
+            "ops",
+            "Grace",
+            "grace@example.com",
+            old,
+        )],
+        101 => vec![message(
+            102,
+            "core",
+            "ops",
+            "Grace",
+            "grace@example.com",
+            fresh,
+        )],
+        _ => Vec::new(),
+    })
+    .await;
+    let settings = settings(dir.path(), &mock.uri());
+    let base = mock.uri();
+
+    let poll = events::poll(
+        &settings,
+        events::parse_poll_params(&json!({
+            "name": "zulip.message",
+            "cursor": cursor(&base, 101),
+            "maxAgeMs": 60_000,
+        }))
+        .expect("poll params"),
+    )
+    .await
+    .expect("poll result");
+    assert_eq!(
+        poll["truncated"], false,
+        "resuming past the aged message must not re-truncate"
+    );
+    assert_eq!(poll["events"][0]["data"]["message_id"], 102);
+    assert_eq!(poll["cursor"], json!(cursor(&base, 102)));
+
+    LocalSet::new()
+        .run_until(async {
+            let (tx, rx) = mpsc::channel(64);
+            let tools = Rc::new(ToolContext::with_settings(Rc::clone(&settings)));
+            let mut server = Server::with_context(tx, server_config(30, 5_000, 8), tools);
+            let mut wire = Wire::new(rx);
+            let resume = cursor(&base, 101);
+
+            server
+                .handle_line(&stream_request(
+                    json!(1),
+                    &resume,
+                    json!({"maxAgeMs": 60_000}),
+                ))
+                .await;
+            let active = wire.next().await;
+            assert_eq!(active["method"], "notifications/events/active");
+            assert_eq!(active["params"]["cursor"], resume);
+            assert_eq!(active["params"]["truncated"], false);
+
+            let event = wire.next().await;
+            assert_eq!(event["method"], "notifications/events/event");
+            assert_eq!(event["params"]["data"]["message_id"], 102);
+
+            for frame in wire.quiet().await {
+                assert_ne!(
+                    frame["params"]["truncated"],
+                    json!(true),
+                    "a resumed stream must not repeat the aged truncation: {frame}"
+                );
+            }
             server.drain(Duration::from_millis(50)).await;
         })
         .await;
@@ -1238,6 +1344,71 @@ async fn stalled_null_cursor_setup_times_out_and_releases_capacity() {
                 .await;
             assert_eq!(subscription_id(&active), &json!(2));
 
+            server.drain(Duration::from_millis(50)).await;
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn null_cursor_stream_starts_at_the_newest_message() {
+    let dir = TempDir::new().expect("temp dir");
+    let mock = MockServer::start().await;
+    let timestamp = now();
+    mount_with(&mock, move |request: &wiremock::Request| {
+        let anchor = request
+            .url
+            .query_pairs()
+            .find(|(key, _)| key == "anchor")
+            .map(|(_, value)| value.to_string());
+        let messages = if anchor.as_deref() == Some("newest") {
+            vec![message(
+                777,
+                "core",
+                "ops",
+                "Grace",
+                "grace@example.com",
+                timestamp,
+            )]
+        } else {
+            Vec::new()
+        };
+        ResponseTemplate::new(200).set_body_json(json!({
+            "result": "success",
+            "msg": "",
+            "messages": messages,
+        }))
+    })
+    .await;
+    let settings = settings(dir.path(), &mock.uri());
+    let base = mock.uri();
+
+    LocalSet::new()
+        .run_until(async {
+            let (tx, rx) = mpsc::channel(64);
+            let tools = Rc::new(ToolContext::with_settings(Rc::clone(&settings)));
+            let mut server = Server::with_context(tx, server_config(30, 5_000, 8), tools);
+            let mut wire = Wire::new(rx);
+
+            server
+                .handle_line(&null_cursor_stream_request(json!(1), json!({})))
+                .await;
+            let active = wire
+                .notification("notifications/events/active", &json!(1))
+                .await;
+            assert_eq!(
+                active["params"]["cursor"],
+                json!(cursor(&base, 777)),
+                "a null-cursor stream must start at the resolved newest id, not 0"
+            );
+            assert_eq!(active["params"]["truncated"], false);
+
+            for frame in wire.quiet().await {
+                assert_ne!(
+                    frame.get("method").and_then(Value::as_str),
+                    Some("notifications/events/event"),
+                    "setup must resolve the newest id instead of replaying from 0: {frame}"
+                );
+            }
             server.drain(Duration::from_millis(50)).await;
         })
         .await;
@@ -1500,6 +1671,10 @@ async fn poll_and_stream_agree_that_matching_old_messages_are_truncation() {
                 .notification("notifications/events/active", &json!(1))
                 .await;
             assert_eq!(truncated["params"]["truncated"], true);
+            assert_eq!(
+                truncated["params"]["cursor"], poll["cursor"],
+                "the stream announces the same advanced cursor poll returned"
+            );
             for frame in wire.quiet().await {
                 assert_ne!(
                     frame.get("method").and_then(Value::as_str),

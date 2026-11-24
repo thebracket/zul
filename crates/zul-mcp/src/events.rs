@@ -365,15 +365,27 @@ pub(crate) fn resolve_start_cursor(
     Ok(StartCursor { realm, message_id })
 }
 
+/// Why a replay window is incomplete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Truncation {
+    /// Nothing was skipped: the fetch completed inside the age window.
+    None,
+    /// A matching message aged out; its ID is skipped and the cursor advances
+    /// past it, so a resume does not repeat the same message.
+    Aged,
+    /// The forward page cap cut the fetch short; the announced cursor stays at
+    /// the safe pre-batch position so unwritten messages are not skipped.
+    PageCap,
+}
+
 /// What one fetched message means for one subscription.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Evaluation {
     /// The message should be delivered as an event occurrence.
     pub(crate) deliver: bool,
-    /// The subscription cursor may move past this message.
-    pub(crate) advance: bool,
-    /// The message was skipped for age, so the replay window is incomplete.
-    pub(crate) truncated: bool,
+    /// Why this message was skipped, if it was skipped for age. `PageCap` is
+    /// only reported for a whole batch, never for one message.
+    pub(crate) truncated: Truncation,
 }
 
 /// The single match/age decision shared by poll and push delivery.
@@ -381,7 +393,7 @@ pub(crate) struct Evaluation {
 /// The filter is applied before the age window: an old message the
 /// subscription would never receive does not make the replay look truncated.
 /// The caller only evaluates messages above the subscriber cursor, so every
-/// evaluation advances.
+/// evaluation may advance that cursor.
 pub(crate) fn evaluate(
     message: &ZulipMessage,
     filter: &PollFilter,
@@ -392,8 +404,7 @@ pub(crate) fn evaluate(
     if !matches_message(filter, message, account_email) {
         return Evaluation {
             deliver: false,
-            advance: true,
-            truncated: false,
+            truncated: Truncation::None,
         };
     }
     if let Some(max_age_ms) = max_age_ms {
@@ -401,15 +412,13 @@ pub(crate) fn evaluate(
         if age_ms > max_age_ms {
             return Evaluation {
                 deliver: false,
-                advance: true,
-                truncated: true,
+                truncated: Truncation::Aged,
             };
         }
     }
     Evaluation {
         deliver: true,
-        advance: true,
-        truncated: false,
+        truncated: Truncation::None,
     }
 }
 
@@ -471,10 +480,12 @@ fn poll_batch(
             params.max_age_ms,
             now_ms,
         );
-        if evaluation.advance {
-            last_evaluated = last_evaluated.max(message.id);
+        // The caller skipped anything at or below the anchor, so every
+        // evaluated message can advance the cursor.
+        last_evaluated = last_evaluated.max(message.id);
+        if evaluation.truncated != Truncation::None {
+            truncated = true;
         }
-        truncated |= evaluation.truncated;
         if evaluation.deliver {
             candidates.push(message);
         }

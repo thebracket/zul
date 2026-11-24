@@ -19,6 +19,14 @@ const MESSAGES_PAGE_SIZE: usize = 1000;
 /// Forward pages fetched by [`ZulipClient::messages_after_with_truncation`].
 const MESSAGES_AFTER_MAX_PAGES: usize = 25;
 
+/// Backward pages fetched by [`ZulipClient::recent_messages`] while walking
+/// toward its time cutoff.
+///
+/// Intentionally independent of [`MESSAGES_AFTER_MAX_PAGES`]: the backward walk
+/// stops at the cutoff or a short page, while the forward walk caps a live
+/// cursor window. Both use the same page size.
+const RECENT_MAX_PAGES: usize = 25;
+
 /// Async Zulip REST client using email/API-key basic authentication.
 #[derive(Clone)]
 pub struct ZulipClient {
@@ -78,8 +86,10 @@ impl ZulipClient {
         let mut messages = Vec::new();
         let mut seen = HashSet::new();
 
-        for _ in 0..25 {
-            let page = self.messages_page(&anchor, None, 1000, 0).await?;
+        for _ in 0..RECENT_MAX_PAGES {
+            let page = self
+                .messages_page(&anchor, None, MESSAGES_PAGE_SIZE as u16, 0)
+                .await?;
             if page.is_empty() {
                 break;
             }
@@ -103,7 +113,11 @@ impl ZulipClient {
                 }
             }
 
-            if saw_older_than_cutoff || oldest_id == i64::MAX || !added_new || page_len < 1000 {
+            if saw_older_than_cutoff
+                || oldest_id == i64::MAX
+                || !added_new
+                || page_len < MESSAGES_PAGE_SIZE
+            {
                 break;
             }
             anchor = oldest_id.to_string();
@@ -455,6 +469,26 @@ mod tests {
         assert_eq!(messages.last().map(|message| message.id), Some(2010));
         assert_eq!(
             *full_then_full.anchors.borrow(),
+            vec!["10".to_string(), "1010".to_string()]
+        );
+
+        let duplicate_full_page = FakePages {
+            pages: RefCell::new(vec![
+                raw_page(11, MESSAGES_PAGE_SIZE),
+                raw_page(11, MESSAGES_PAGE_SIZE),
+            ]),
+            anchors: RefCell::new(Vec::new()),
+        };
+        let (messages, truncated) = collect_messages_after(&duplicate_full_page, 10, 2)
+            .await
+            .expect("duplicate full pages");
+        assert!(
+            !truncated,
+            "a full page that adds no new messages is complete, not truncated"
+        );
+        assert_eq!(messages.len(), MESSAGES_PAGE_SIZE);
+        assert_eq!(
+            *duplicate_full_page.anchors.borrow(),
             vec!["10".to_string(), "1010".to_string()]
         );
 
