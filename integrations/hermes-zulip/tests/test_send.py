@@ -97,6 +97,22 @@ async def test_send_converts_exception_and_redacts_secret(config, fake_bridge, m
     assert result.success is False
     assert "secret-key" not in (result.error or "")
     assert "redacted" in (result.error or "")
+    assert result.raw_response is None
+
+
+async def test_send_maps_an_unexpected_chunk_exception_to_a_failure(
+        config, fake_bridge, monkeypatch):
+    adapter = _connected(config, fake_bridge, monkeypatch)
+
+    def explode(*args, **kwargs):
+        raise RuntimeError("unexpected chunk failure api_key=secret-key")
+
+    monkeypatch.setattr("hermes_zulip.adapter._send_chunks", explode)
+    result = await adapter.send(encode_stream("core", "ops", 12), "hello")
+    assert result.success is False
+    assert "unexpected chunk failure" in (result.error or "")
+    assert "secret-key" not in (result.error or "")
+    assert result.raw_response is None
 
 
 async def test_send_marks_partial_delivery_when_a_later_chunk_fails(

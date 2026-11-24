@@ -129,6 +129,14 @@ async def test_connect_cancellation_closes_the_bridge_and_releases_the_lock(
     assert fake_bridge.instances[0].close_count == 1
     assert _lock_identities() == set()
 
+    # The cancelled attempt must not poison the next one.
+    assert await adapter.connect() is True
+    assert len(fake_bridge.instances) == 2
+    assert adapter._bridge is fake_bridge.instances[1]
+    assert adapter._poll_task is not None and not adapter._poll_task.done()
+    await adapter.disconnect()
+    assert fake_bridge.instances[1].close_count == 1
+
 
 async def test_connect_is_idempotent_while_connected(config, fake_bridge, monkeypatch):
     _env(monkeypatch)

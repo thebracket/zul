@@ -192,14 +192,18 @@ def _mention_patterns(bot_name: str) -> tuple[re.Pattern[str], ...]:
     Zulip's event ``plain_text`` is rendered from the message HTML, so a
     mention of "Zulip Bot" arrives as ``@Zulip Bot`` rather than the source
     form ``@**Zulip Bot**``. Both shapes are accepted, plus the silent
-    ``@_**Zulip Bot**`` source form.
+    ``@_**Zulip Bot**`` source form. The rendered form must start a token, so
+    ``me@Zulip Bot.example`` is not a mention; it must also end at a word
+    boundary, so a bot named "Bot" does not match ``@Botanist``. Neither check
+    can separate a longer display name that shares the bot's prefix and
+    continues with a space (``@Zulip Bot Jr``); only event flags can.
     """
     if not bot_name:
         return ()
     escaped = re.escape(bot_name)
     return (
         re.compile(r"@_?\*\*" + escaped + r"\*\*[ \t]*"),
-        re.compile(r"@" + escaped + r"(?!\w)[ \t]*"),
+        re.compile(r"(?<![\w@])@" + escaped + r"(?!\w)[ \t]*"),
     )
 
 
@@ -631,31 +635,42 @@ def _send_chunks(bridge: Any, target: StreamTarget | DMTarget, chunks: list[str]
     return delivered
 
 
+def _pre_send_error(message: str) -> dict[str, Any]:
+    """A standalone failure that provably never left the process.
+
+    ``delivery: "none"`` tells Hermes' ``delivery_state`` this payload is safe to
+    queue for the live adapter's reconnect; omitting ``retryable`` keeps the
+    failed send itself from being retried in place.
+    """
+    return {**send_error(message), "delivery": "none"}
+
+
 async def _standalone_send(pconfig, chat_id: str, message: str, *, thread_id: str | None = None,
                            media_files: list[str] | None = None,
                            force_document: bool = False) -> dict[str, Any]:
     """Out-of-process cron delivery: open a short-lived bridge, send, close."""
     if media_files:
-        return send_error("Zulip is text-only in this adapter version; media delivery is not supported")
+        return _pre_send_error(
+            "Zulip is text-only in this adapter version; media delivery is not supported")
     extra = getattr(pconfig, "extra", None) or {}
     missing = _missing_config(extra)
     if missing:
-        return send_error(
+        return _pre_send_error(
             f"Zulip standalone send: {', '.join(missing)} must be configured")
     try:
         target = _decode_target(chat_id)
     except ValueError:
-        return send_error("Zulip standalone send: invalid chat_id")
+        return _pre_send_error("Zulip standalone send: invalid chat_id")
     if isinstance(target, StreamTarget):
         topic = target.topic or (thread_id or "")
         if not topic:
-            return send_error("Zulip standalone send: a stream target needs a topic")
+            return _pre_send_error("Zulip standalone send: a stream target needs a topic")
         target = StreamTarget(stream_id=target.stream_id, stream=target.stream, topic=topic)
 
     if not (message or "").strip():
-        return send_error("Zulip standalone send: nothing to send")
+        return _pre_send_error("Zulip standalone send: nothing to send")
     if zul_bridge is None:
-        return send_error("Zulip standalone send: the zul_bridge extension is not installed")
+        return _pre_send_error("Zulip standalone send: the zul_bridge extension is not installed")
     settings = _bridge_kwargs(extra)
     chunks = ZulipAdapter.truncate_message(message or "", _max_message_length_from(extra))
 

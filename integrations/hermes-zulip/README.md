@@ -169,8 +169,11 @@ must either carry Zulip's event-level `mentioned`/`wildcard_mentioned` flag or
 contain the rendered mention token `@Bot Name` in the text. The token is
 stripped before the agent sees the message. Silent mentions render without
 `@`, so they are detected only through the event flags; a bot named `Bot` does
-not match `@Botanist` (the token must end at a word boundary). Set
-`ZULIP_REQUIRE_MENTION=false` to accept every subscribed stream message.
+not match `@Botanist`, and the rendered token must start a word, so
+`me@Bot.example` is not a mention. A longer display name that shares the bot's
+name prefix and continues with a space (`@Bot Jr`) cannot be told apart from a
+mention of the bot in plain text; only the event flags can distinguish them.
+Set `ZULIP_REQUIRE_MENTION=false` to accept every subscribed stream message.
 
 **Long replies.** Text is split at `ZULIP_MAX_MESSAGE_LENGTH` (newline, then
 space, then hard split) and sent chunk by chunk in order. If a later chunk

@@ -44,3 +44,15 @@ def seed_extra_from_env(spec: Iterable[tuple[str, str, Callable[[str], Any] | No
 
 def send_error(message: Any, *, nothing_sent: bool = False) -> dict:
     return {"error": str(message), **({"retryable": True} if nothing_sent else {})}
+
+
+DELIVERED, PARTIAL, UNCERTAIN, NONE = "delivered", "partial", "uncertain", "none"
+
+
+def delivery_state(result: Any) -> str:
+    """Mirror of the real helper: an explicit ``delivery`` wins, then ``retryable``."""
+    if not isinstance(result, dict) or not result.get("error"):
+        return DELIVERED
+    if result.get("delivery") in (PARTIAL, UNCERTAIN, NONE):
+        return result["delivery"]
+    return NONE if result.get("retryable") is True else UNCERTAIN

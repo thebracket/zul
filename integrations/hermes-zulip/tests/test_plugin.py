@@ -9,8 +9,10 @@ import textwrap
 from pathlib import Path
 
 import hermes_zulip.adapter as adapter_module
+import pytest
 import yaml
 from gateway.config import PlatformConfig
+from gateway.platforms._shared import delivery_state
 from hermes_zulip.adapter import (
     DEFAULT_MAX_MESSAGE_LENGTH,
     ZulipAdapter,
@@ -25,6 +27,7 @@ from hermes_zulip.adapter import (
 from hermes_zulip.chat_ids import encode_dm, encode_stream
 
 PLUGIN_YAML = Path(__file__).resolve().parents[1] / "python" / "hermes_zulip" / "plugin.yaml"
+_HERMES_REPO = os.environ.get("HERMES_REPO")
 
 
 class RecordingContext:
@@ -35,7 +38,8 @@ class RecordingContext:
         self.kwargs = kwargs
 
 
-def test_register_exposes_platform_contract():
+def test_register_exposes_platform_contract(monkeypatch):
+    monkeypatch.setattr(ZulipAdapter, "MAX_MESSAGE_LENGTH", 12345)
     ctx = RecordingContext()
     register(ctx)
     kwargs = ctx.kwargs
@@ -54,8 +58,8 @@ def test_register_exposes_platform_contract():
     assert kwargs["allow_all_env"] == "ZULIP_ALLOW_ALL_USERS"
     assert kwargs["parse_target_ref_fn"] is not None
     assert kwargs["validate_target_ref_fn"] is not None
-    assert kwargs["max_message_length"] == ZulipAdapter.MAX_MESSAGE_LENGTH
-    assert kwargs["max_message_length"] == DEFAULT_MAX_MESSAGE_LENGTH
+    # The registration derives from the class constant, not the module default.
+    assert kwargs["max_message_length"] == 12345
     assert kwargs["emoji"] == "💬"
     assert kwargs["allow_update_command"] is True
     assert "Markdown" in kwargs["platform_hint"]
@@ -336,6 +340,8 @@ async def test_standalone_send_rejects_media_without_connecting(fake_bridge, mon
     )
     assert result["error"]
     assert "retryable" not in result
+    assert result["delivery"] == "none"
+    assert delivery_state(result) == "none"
     assert "text-only" in result["error"].lower()
     assert fake_bridge.instances == []
 
@@ -348,9 +354,18 @@ async def test_standalone_send_permanent_target_errors_are_not_retryable(fake_br
     invalid = await _standalone_send(pconfig, "telegram:1", "hello")
     assert "invalid chat_id" in invalid["error"]
     assert "retryable" not in invalid
+    assert invalid["delivery"] == "none"
+    assert delivery_state(invalid) == "none"
     empty = await _standalone_send(pconfig, encode_stream("core", "ops", 12), "   ")
     assert "nothing to send" in empty["error"]
     assert "retryable" not in empty
+    assert empty["delivery"] == "none"
+    assert delivery_state(empty) == "none"
+    no_topic = await _standalone_send(pconfig, encode_stream("core", "", 12), "hello")
+    assert "needs a topic" in no_topic["error"]
+    assert "retryable" not in no_topic
+    assert no_topic["delivery"] == "none"
+    assert delivery_state(no_topic) == "none"
     assert fake_bridge.instances == []
 
 
@@ -360,6 +375,8 @@ async def test_standalone_send_reports_missing_config(fake_bridge):
                                     encode_stream("core", "ops", 12), "hello")
     assert "ZULIP_SITE" in result["error"]
     assert "retryable" not in result
+    assert result["delivery"] == "none"
+    assert delivery_state(result) == "none"
     assert fake_bridge.instances == []
 
 
@@ -372,6 +389,8 @@ async def test_standalone_send_redacts_secret_on_constructor_error(fake_bridge, 
                                     encode_stream("core", "ops", 12), "hello")
     assert "error" in result
     assert "secret-key" not in result["error"]
+    assert result["retryable"] is True
+    assert delivery_state(result) == "none"
 
 
 async def test_standalone_send_closes_bridge_on_send_error(fake_bridge, monkeypatch):
@@ -382,6 +401,8 @@ async def test_standalone_send_closes_bridge_on_send_error(fake_bridge, monkeypa
     result = await _standalone_send(PlatformConfig(enabled=True, extra={}),
                                     encode_stream("core", "ops", 12), "hello")
     assert "error" in result
+    assert "partial_overflow" not in result
+    assert "delivered_message_ids" not in result
     assert fake_bridge.instances[0].close_count == 1
 
 
@@ -420,4 +441,53 @@ async def test_standalone_send_without_extension(fake_bridge, monkeypatch):
     result = await _standalone_send(PlatformConfig(enabled=True, extra={}),
                                     encode_stream("core", "ops", 12), "hello")
     assert "zul_bridge" in result["error"]
+    assert "retryable" not in result
+    assert result["delivery"] == "none"
+    assert delivery_state(result) == "none"
     assert fake_bridge.instances == []
+
+
+@pytest.mark.skipif(not _HERMES_REPO, reason="HERMES_REPO is not set")
+def test_real_hermes_delivery_state_reads_the_pre_send_envelope(tmp_path):
+    repo = Path(_HERMES_REPO)
+    if not (repo / "gateway" / "platforms" / "_shared.py").is_file():
+        pytest.skip("HERMES_REPO does not look like a Hermes checkout")
+    integration = Path(__file__).resolve().parents[1]
+    script = textwrap.dedent(
+        """
+        import asyncio
+
+        from gateway.config import PlatformConfig
+        from gateway.platforms._shared import delivery_state
+        from hermes_zulip.adapter import _standalone_send
+
+        result = asyncio.run(_standalone_send(
+            PlatformConfig(enabled=True, extra={}),
+            "stream:core/ops", "hello", media_files=["/tmp/image.png"],
+        ))
+        assert "error" in result, result
+        assert "retryable" not in result, result
+        assert result["delivery"] == "none", result
+        assert delivery_state(result) == "none", result
+        print("ok")
+        """
+    )
+    env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join((str(repo), str(integration / "python"))),
+    }
+    for key in [name for name in env if name.startswith("ZULIP_")]:
+        env.pop(key)
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert completed.returncode == 0, (
+        f"real Hermes delivery_state check failed\nstdout:\n{completed.stdout}"
+        f"\nstderr:\n{completed.stderr}")
+    assert "ok" in completed.stdout

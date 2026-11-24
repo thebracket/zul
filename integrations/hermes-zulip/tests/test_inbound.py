@@ -143,6 +143,22 @@ async def test_require_mention_false_accepts_plain_stream_message(config):
     assert message.text == "no mention"
 
 
+async def test_rendered_mention_needs_a_left_boundary(config):
+    adapter = _adapter(config, require_mention=False, _bot_name="jarvis")
+    message = await _handle(adapter, make_stream_event(
+        id=31, flags=[], plain_text="contact me@jarvis.example now"))
+    assert message is not None
+    assert message.text == "contact me@jarvis.example now"
+
+
+async def test_a_longer_rendered_display_name_is_not_a_mention(config):
+    adapter = _adapter(config, require_mention=False)
+    message = await _handle(adapter, make_stream_event(
+        id=32, flags=[], plain_text="@Zulip Botanist hi"))
+    assert message is not None
+    assert message.text == "@Zulip Botanist hi"
+
+
 async def test_allowed_streams_filter_is_case_insensitive(config):
     adapter = _adapter(config, allowed_streams=frozenset({"core"}))
     assert await _handle(adapter, make_stream_event(id=18, stream="Core", flags=["mentioned"])) is not None
