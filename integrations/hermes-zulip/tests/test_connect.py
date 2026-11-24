@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 
+import pytest
 from gateway.platforms.base import _LOCKS
 from hermes_zulip.adapter import ZulipAdapter
 
@@ -55,6 +57,7 @@ async def test_connect_success_captures_account_and_releases_on_disconnect(
 
 
 async def test_connect_rejects_missing_configuration(config, fake_bridge):
+    fake_bridge.config_status_result = {"base_url": False, "email": False, "api_key": False}
     adapter = ZulipAdapter(config)
     assert await adapter.connect() is False
     assert adapter.fatal_error_code == "config_missing"
@@ -112,6 +115,35 @@ async def test_connect_closes_bridge_and_releases_lock_when_whoami_fails(
     assert _lock_identities() == set()
 
 
+async def test_connect_cancellation_closes_the_bridge_and_releases_the_lock(
+        config, fake_bridge, monkeypatch):
+    _env(monkeypatch)
+    fake_bridge.whoami_gate = threading.Event()
+    adapter = ZulipAdapter(config)
+    task = asyncio.create_task(adapter.connect())
+    assert await _wait_for(fake_bridge.whoami_started.is_set)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    fake_bridge.whoami_gate.set()
+    assert fake_bridge.instances[0].close_count == 1
+    assert _lock_identities() == set()
+
+
+async def test_connect_is_idempotent_while_connected(config, fake_bridge, monkeypatch):
+    _env(monkeypatch)
+    adapter = ZulipAdapter(config)
+    assert await adapter.connect() is True
+    bridge, poll_task = adapter._bridge, adapter._poll_task
+    try:
+        assert await adapter.connect() is True
+        assert len(fake_bridge.instances) == 1
+        assert adapter._bridge is bridge
+        assert adapter._poll_task is poll_task
+    finally:
+        await adapter.disconnect()
+
+
 async def test_connect_returns_false_when_platform_lock_is_held(
         config, fake_bridge, monkeypatch):
     _env(monkeypatch)
@@ -155,5 +187,41 @@ async def test_poll_loop_dispatches_events(config, fake_bridge, monkeypatch):
     try:
         assert await _wait_for(lambda: len(adapter.handled_events) == 1)
         assert adapter.handled_events[0].text == "hi"
+    finally:
+        await adapter.disconnect()
+
+
+async def test_poll_loop_survives_transient_errors_and_drops_malformed_events(
+        config, fake_bridge, monkeypatch):
+    _env(monkeypatch)
+    adapter = ZulipAdapter(config)
+    assert await adapter.connect() is True
+    bridge = fake_bridge.instances[0]
+    original_handle = adapter._handle_event
+
+    async def raising_handle(event):
+        if event.get("id") == 998:
+            raise ValueError("malformed event")
+        await original_handle(event)
+
+    adapter._handle_event = raising_handle
+    bridge.events.put(ValueError("temporary event failure"))
+    bridge.events.put({
+        "id": 998, "kind": "stream", "stream_id": 12, "stream": "core", "topic": "ops",
+        "sender_id": 7, "sender_name": "Ada", "sender_email": "ada@example.com",
+        "plain_text": "bad", "content": "<p>bad</p>", "flags": ["mentioned"],
+        "timestamp": 1760000000, "dm_participants": [],
+    })
+    bridge.events.put({
+        "id": 999, "kind": "stream", "stream_id": 12, "stream": "core", "topic": "ops",
+        "sender_id": 7, "sender_name": "Ada", "sender_email": "ada@example.com",
+        "plain_text": "still here", "content": "<p>still here</p>", "flags": ["mentioned"],
+        "timestamp": 1760000000, "dm_participants": [],
+    })
+    try:
+        assert await _wait_for(lambda: len(adapter.handled_events) == 1, timeout=3.0)
+        assert adapter.handled_events[0].text == "still here"
+        assert adapter._poll_task is not None and not adapter._poll_task.done()
+        assert adapter.fatal_error_code is None
     finally:
         await adapter.disconnect()

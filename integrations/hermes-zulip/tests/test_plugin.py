@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
 
 import hermes_zulip.adapter as adapter_module
 import yaml
 from gateway.config import PlatformConfig
 from hermes_zulip.adapter import (
+    DEFAULT_MAX_MESSAGE_LENGTH,
     ZulipAdapter,
     _env_enablement,
+    _missing_config,
+    _redact,
     _standalone_send,
     check_requirements,
     register,
@@ -47,7 +54,8 @@ def test_register_exposes_platform_contract():
     assert kwargs["allow_all_env"] == "ZULIP_ALLOW_ALL_USERS"
     assert kwargs["parse_target_ref_fn"] is not None
     assert kwargs["validate_target_ref_fn"] is not None
-    assert kwargs["max_message_length"] == 10000
+    assert kwargs["max_message_length"] == ZulipAdapter.MAX_MESSAGE_LENGTH
+    assert kwargs["max_message_length"] == DEFAULT_MAX_MESSAGE_LENGTH
     assert kwargs["emoji"] == "💬"
     assert kwargs["allow_update_command"] is True
     assert "Markdown" in kwargs["platform_hint"]
@@ -79,6 +87,55 @@ def test_check_requirements_matches_extension_presence(monkeypatch):
     assert check_requirements() is True
     monkeypatch.setattr(adapter_module, "zul_bridge", None, raising=False)
     assert check_requirements() is False
+
+
+def test_import_without_the_extension_keeps_discovery_working(tmp_path):
+    integration = Path(__file__).resolve().parents[1]
+    script = textwrap.dedent(
+        """
+        import sys
+
+        class Blocker:
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname == "zul_bridge" or fullname.startswith("zul_bridge."):
+                    raise ImportError("zul_bridge blocked for this test")
+                return None
+
+        sys.meta_path.insert(0, Blocker())
+        import hermes_zulip.adapter as adapter
+        from gateway.config import PlatformConfig
+
+        assert adapter.zul_bridge is None
+        assert adapter.check_requirements() is False
+        assert adapter.validate_config(PlatformConfig(enabled=True, extra={
+            "site": "https://chat.example.com",
+            "email": "bot@example.com",
+            "api_key": "secret",
+        })) is True
+        print("ok")
+        """
+    )
+    env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join((
+            str(integration / "python"),
+            str(integration / "tests" / "hermes_stub"),
+        )),
+    }
+    for key in [name for name in env if name.startswith("ZULIP_")]:
+        env.pop(key)
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert completed.returncode == 0, (
+        f"import without zul_bridge failed\nstdout:\n{completed.stdout}\nstderr:\n{completed.stderr}")
+    assert "ok" in completed.stdout
 
 
 def test_env_enablement_seeds_non_secret_options(monkeypatch):
@@ -151,8 +208,25 @@ def test_validate_config_without_extension_does_not_fall_back(config, monkeypatc
 
 
 def test_validate_config_rejects_missing_site_or_email(config, fake_bridge):
+    fake_bridge.config_status_result = {"base_url": False, "email": False, "api_key": False}
     assert validate_config(config) is False
-    assert fake_bridge.config_status_calls == 0
+    assert fake_bridge.config_status_calls == 1
+
+
+def test_validate_config_accepts_libzul_site_and_email(config, fake_bridge):
+    fake_bridge.config_status_result = {"base_url": True, "email": True, "api_key": True}
+    assert validate_config(config) is True
+
+
+def test_missing_config_returns_the_env_names(config, fake_bridge):
+    fake_bridge.config_status_result = {"base_url": False, "email": False, "api_key": False}
+    assert _missing_config({}) == ["ZULIP_SITE", "ZULIP_EMAIL", "ZULIP_API_KEY"]
+
+    config.extra.update({"site": "https://chat.example.com", "email": "bot@example.com"})
+    assert _missing_config(config.extra) == ["ZULIP_API_KEY"]
+
+    fake_bridge.config_status_result = {"base_url": False, "email": False, "api_key": True}
+    assert _missing_config(config.extra) == []
 
 
 def test_target_ref_registration_functions():
@@ -188,6 +262,16 @@ def test_adapter_uses_base_url_alias(fake_bridge, config, monkeypatch):
     monkeypatch.setenv("ZULIP_EMAIL", "bot@example.com")
     monkeypatch.setenv("ZULIP_API_KEY", "secret")
     assert ZulipAdapter(config).site == "https://base.example.com"
+
+
+def test_adapter_length_limit_is_visible_to_framework_calls(fake_bridge, config, monkeypatch):
+    monkeypatch.setenv("ZULIP_SITE", "https://chat.example.com")
+    monkeypatch.setenv("ZULIP_EMAIL", "bot@example.com")
+    monkeypatch.setenv("ZULIP_API_KEY", "secret")
+    monkeypatch.setenv("ZULIP_MAX_MESSAGE_LENGTH", "777")
+    adapter = ZulipAdapter(config)
+    assert adapter.max_message_length_for_chat("any-chat") == 777
+    assert ZulipAdapter.MAX_MESSAGE_LENGTH == DEFAULT_MAX_MESSAGE_LENGTH
 
 
 async def test_standalone_send_stream_text(fake_bridge, monkeypatch):
@@ -251,15 +335,31 @@ async def test_standalone_send_rejects_media_without_connecting(fake_bridge, mon
         media_files=["/tmp/image.png"],
     )
     assert result["error"]
-    assert result["retryable"] is True
+    assert "retryable" not in result
     assert "text-only" in result["error"].lower()
     assert fake_bridge.instances == []
 
 
+async def test_standalone_send_permanent_target_errors_are_not_retryable(fake_bridge, monkeypatch):
+    monkeypatch.setenv("ZULIP_SITE", "https://chat.example.com")
+    monkeypatch.setenv("ZULIP_EMAIL", "bot@example.com")
+    monkeypatch.setenv("ZULIP_API_KEY", "secret")
+    pconfig = PlatformConfig(enabled=True, extra={})
+    invalid = await _standalone_send(pconfig, "telegram:1", "hello")
+    assert "invalid chat_id" in invalid["error"]
+    assert "retryable" not in invalid
+    empty = await _standalone_send(pconfig, encode_stream("core", "ops", 12), "   ")
+    assert "nothing to send" in empty["error"]
+    assert "retryable" not in empty
+    assert fake_bridge.instances == []
+
+
 async def test_standalone_send_reports_missing_config(fake_bridge):
+    fake_bridge.config_status_result = {"base_url": False, "email": False, "api_key": False}
     result = await _standalone_send(PlatformConfig(enabled=True, extra={}),
                                     encode_stream("core", "ops", 12), "hello")
     assert "ZULIP_SITE" in result["error"]
+    assert "retryable" not in result
     assert fake_bridge.instances == []
 
 
@@ -283,6 +383,33 @@ async def test_standalone_send_closes_bridge_on_send_error(fake_bridge, monkeypa
                                     encode_stream("core", "ops", 12), "hello")
     assert "error" in result
     assert fake_bridge.instances[0].close_count == 1
+
+
+async def test_standalone_send_reports_partial_delivery(fake_bridge, monkeypatch):
+    monkeypatch.setenv("ZULIP_SITE", "https://chat.example.com")
+    monkeypatch.setenv("ZULIP_EMAIL", "bot@example.com")
+    monkeypatch.setenv("ZULIP_API_KEY", "secret")
+    monkeypatch.setenv("ZULIP_MAX_MESSAGE_LENGTH", "10")
+    fake_bridge.send_failures = [None, RuntimeError("second chunk is down")]
+    result = await _standalone_send(
+        PlatformConfig(enabled=True, extra={}),
+        encode_stream("core", "ops", 12),
+        "first part second part third",
+    )
+    bridge = fake_bridge.instances[0]
+    assert result["error"]
+    assert "retryable" not in result
+    assert result["partial_overflow"] is True
+    assert result["delivered_message_ids"] == [str(bridge.sent[0][4])]
+    assert len(bridge.sent) == 1
+    assert bridge.close_count == 1
+
+
+def test_redact_removes_token_pattern_and_url_userinfo_independently():
+    cleaned = _redact("token=abc123 https://user:pass@host/x", "unrelated-secret")
+    assert "abc123" not in cleaned
+    assert "user:pass@" not in cleaned
+    assert "<redacted>" in cleaned
 
 
 async def test_standalone_send_without_extension(fake_bridge, monkeypatch):

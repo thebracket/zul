@@ -127,14 +127,19 @@ def _queue_timeout_from(extra: dict[str, Any]) -> int | None:
     return _as_int(extra_or_secret(extra, "queue_timeout_secs", "ZULIP_QUEUE_TIMEOUT_SECS"))
 
 
+def _bridge_kwargs(extra: dict[str, Any]) -> dict[str, Any]:
+    """Bridge constructor arguments shared by the live and standalone paths."""
+    return {
+        "base_url": str(_site_from(extra) or "").strip(),
+        "email": str(_email_from(extra) or "").strip(),
+        "api_key": str(_api_key_from(extra) or "").strip(),
+        "queue_timeout_secs": _queue_timeout_from(extra),
+    }
+
+
 def _make_bridge(extra: dict[str, Any]):
     """Construct the blocking bridge; split out so tests and callers can fake it."""
-    return zul_bridge.Bridge(  # type: ignore[union-attr]
-        base_url=str(_site_from(extra) or "").strip(),
-        email=str(_email_from(extra) or "").strip(),
-        api_key=str(_api_key_from(extra) or "").strip(),
-        queue_timeout_secs=_queue_timeout_from(extra),
-    )
+    return zul_bridge.Bridge(**_bridge_kwargs(extra))  # type: ignore[union-attr]
 
 
 def _bridge_config_status() -> dict[str, Any]:
@@ -146,6 +151,25 @@ def _bridge_config_status() -> dict[str, Any]:
     except Exception:
         return {}
     return status if isinstance(status, dict) else {}
+
+
+def _missing_config(extra: dict[str, Any]) -> list[str]:
+    """Required env names that neither ``extra``/env nor libzul's settings supply."""
+    values = {
+        "ZULIP_SITE": str(_site_from(extra) or "").strip(),
+        "ZULIP_EMAIL": str(_email_from(extra) or "").strip(),
+        "ZULIP_API_KEY": str(_api_key_from(extra) or "").strip(),
+    }
+    if all(values.values()):
+        return []
+    status = _bridge_config_status()
+    known = {
+        "ZULIP_SITE": "base_url",
+        "ZULIP_EMAIL": "email",
+        "ZULIP_API_KEY": "api_key",
+    }
+    return [name for name, value in values.items()
+            if not value and not status.get(known[name])]
 
 
 def _message_text(event: dict[str, Any]) -> str:
@@ -162,11 +186,21 @@ def _message_text(event: dict[str, Any]) -> str:
     return content if isinstance(content, str) else ""
 
 
-def _mention_pattern(bot_name: str) -> re.Pattern[str] | None:
-    """The rendered Zulip mention token for the bot, e.g. ``@**Bot**``."""
+def _mention_patterns(bot_name: str) -> tuple[re.Pattern[str], ...]:
+    """Mention tokens for the bot in both markdown and rendered plain text.
+
+    Zulip's event ``plain_text`` is rendered from the message HTML, so a
+    mention of "Zulip Bot" arrives as ``@Zulip Bot`` rather than the source
+    form ``@**Zulip Bot**``. Both shapes are accepted, plus the silent
+    ``@_**Zulip Bot**`` source form.
+    """
     if not bot_name:
-        return None
-    return re.compile(r"@_?\*\*" + re.escape(bot_name) + r"\*\*")
+        return ()
+    escaped = re.escape(bot_name)
+    return (
+        re.compile(r"@_?\*\*" + escaped + r"\*\*[ \t]*"),
+        re.compile(r"@" + escaped + r"(?!\w)[ \t]*"),
+    )
 
 
 def _decode_target(chat_id: str) -> StreamTarget | DMTarget:
@@ -183,6 +217,7 @@ def _decode_target(chat_id: str) -> StreamTarget | DMTarget:
 class ZulipAdapter(BasePlatformAdapter):
     """A Hermes gateway adapter for Zulip streams/topics and DMs."""
 
+    MAX_MESSAGE_LENGTH = DEFAULT_MAX_MESSAGE_LENGTH
     splits_long_messages = True
 
     def __init__(self, config):
@@ -200,14 +235,14 @@ class ZulipAdapter(BasePlatformAdapter):
         self._bot_email = self.email.lower()
         self._bot_name = ""
         self._inbound_dedup = MessageDeduplicator(ttl_seconds=INBOUND_DEDUP_TTL_SECONDS)
-        # Inbound stream ids are required for typing notifications; a chat id can
-        # carry 0 when it was parsed from ``stream:name/topic``.
-        self._stream_ids: dict[tuple[str, str], int] = {}
-        self._dm_typing_ids: dict[str, tuple[int, ...]] = {}
 
     @property
     def name(self) -> str:
         return "Zulip"
+
+    def max_message_length_for_chat(self, chat_id: str) -> int:
+        """Honor the env-configured limit on framework paths that budget size."""
+        return self.max_message_length
 
     # -- Connection lifecycle -------------------------------------------------
 
@@ -220,12 +255,8 @@ class ZulipAdapter(BasePlatformAdapter):
             # and lock before building a replacement.
             await self.disconnect()
 
-        missing = [name for name, value in (
-            ("ZULIP_SITE", self.site),
-            ("ZULIP_EMAIL", self.email),
-        ) if not value]
-        if not self.api_key and not _bridge_config_status().get("api_key"):
-            missing.append("ZULIP_API_KEY")
+        extra = getattr(self.config, "extra", {}) or {}
+        missing = _missing_config(extra)
         if missing:
             logger.error("[Zulip] missing configuration: %s", ", ".join(missing))
             self._set_fatal_error(
@@ -241,7 +272,7 @@ class ZulipAdapter(BasePlatformAdapter):
 
         bridge = None
         try:
-            bridge = await asyncio.to_thread(_make_bridge, getattr(self.config, "extra", {}) or {})
+            bridge = await asyncio.to_thread(_make_bridge, extra)
             account = await asyncio.to_thread(bridge.whoami)
         except asyncio.CancelledError:
             if bridge is not None:
@@ -338,11 +369,6 @@ class ZulipAdapter(BasePlatformAdapter):
         if mapping is None:
             return
         text = mapping["text"]
-        if kind == "stream":
-            if mapping["stream_id"]:
-                self._stream_ids[(mapping["stream_name"], mapping["topic"])] = mapping["stream_id"]
-        elif mapping["typing_ids"]:
-            self._dm_typing_ids[mapping["chat_id"]] = mapping["typing_ids"]
 
         built = self.build_source(
             chat_id=mapping["chat_id"],
@@ -375,12 +401,12 @@ class ZulipAdapter(BasePlatformAdapter):
 
         flags = event.get("flags")
         flag_set = set(flags) if isinstance(flags, (list, tuple, set)) else set()
-        pattern = _mention_pattern(self._bot_name)
+        patterns = _mention_patterns(self._bot_name)
         mentioned = bool({"mentioned", "wildcard_mentioned"} & flag_set)
-        token_present = bool(pattern and pattern.search(text))
+        token_present = any(pattern.search(text) for pattern in patterns)
         if self.require_mention and not (mentioned or token_present):
             return None
-        if pattern is not None:
+        for pattern in patterns:
             text = pattern.sub("", text)
         text = text.strip()
         if not text:
@@ -396,9 +422,6 @@ class ZulipAdapter(BasePlatformAdapter):
             "chat_type": "group",
             "thread_id": topic,
             "topic": topic,
-            "stream_name": stream,
-            "stream_id": stream_id,
-            "typing_ids": (),
             "user_id": sender_email or (str(sender_id) if sender_id is not None else None),
             "user_id_alt": str(sender_id) if sender_id is not None else None,
             "user_name": event.get("sender_name"),
@@ -430,7 +453,6 @@ class ZulipAdapter(BasePlatformAdapter):
 
         sender_id = event.get("sender_id")
         sender_email = str(event.get("sender_email") or "")
-        recipient_ids = tuple(recipient_id for recipient_id, _ in recipients if recipient_id > 0)
         return {
             "text": text,
             "chat_id": encode_dm(recipients),
@@ -438,9 +460,6 @@ class ZulipAdapter(BasePlatformAdapter):
             "chat_type": "dm",
             "thread_id": None,
             "topic": None,
-            "stream_name": None,
-            "stream_id": 0,
-            "typing_ids": recipient_ids,
             "user_id": sender_email or (str(sender_id) if sender_id is not None else None),
             "user_id_alt": str(sender_id) if sender_id is not None else None,
             "user_name": event.get("sender_name"),
@@ -469,33 +488,28 @@ class ZulipAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="nothing to send")
         chunks = self.truncate_message(content or "", self.max_message_length)
 
-        message_ids: list[str] = []
         try:
-            for chunk in chunks:
-                if isinstance(target, StreamTarget):
-                    sent_id = await asyncio.to_thread(
-                        bridge.send_stream, target.stream, target.topic, chunk)
-                else:
-                    sent_id = await self._send_dm_chunk(bridge, target, chunk)
-                message_ids.append(str(sent_id))
+            message_ids = await asyncio.to_thread(_send_chunks, bridge, target, chunks)
+        except _ChunkSendError as exc:
+            return self._send_failure_result(exc.cause, exc.delivered_message_ids)
         except Exception as exc:
-            detail = _redact(exc, self.api_key)
-            logger.error("[Zulip] send failed: %s", detail)
-            result = SendResult(success=False, error=detail)
-            if message_ids:
-                result.raw_response = {"delivered_message_ids": message_ids}
-            return result
+            return self._send_failure_result(exc, [])
         return SendResult(
             success=True,
             message_id=message_ids[-1] if message_ids else None,
             continuation_message_ids=tuple(message_ids[:-1]),
         )
 
-    async def _send_dm_chunk(self, bridge: Any, target: DMTarget, chunk: str) -> int:
-        method, recipients = _dm_send_recipients(target)
-        if method == "ids":
-            return await asyncio.to_thread(bridge.send_direct_ids, recipients, chunk)
-        return await asyncio.to_thread(bridge.send_direct_emails, recipients, chunk)
+    def _send_failure_result(self, cause: BaseException, delivered: list[str]) -> SendResult:
+        detail = _redact(cause, self.api_key)
+        logger.error("[Zulip] send failed: %s", detail)
+        result = SendResult(success=False, error=detail)
+        if delivered:
+            result.raw_response = {
+                "delivered_message_ids": delivered,
+                "partial_overflow": True,
+            }
+        return result
 
     async def send_typing(self, chat_id: str, metadata: dict[str, Any] | None = None) -> None:
         await self._send_typing_op(chat_id, "start")
@@ -513,16 +527,13 @@ class ZulipAdapter(BasePlatformAdapter):
             return
         try:
             if isinstance(target, StreamTarget):
-                stream_id = target.stream_id or self._stream_ids.get((target.stream, target.topic), 0)
-                if not stream_id:
+                if not target.stream_id:
                     logger.debug("[Zulip] typing skipped: unknown stream id for %s", target.stream)
                     return
-                await asyncio.to_thread(bridge.typing_stream, stream_id, target.topic, op)
+                await asyncio.to_thread(bridge.typing_stream, target.stream_id, target.topic, op)
             else:
-                recipient_ids = self._dm_typing_ids.get(chat_id)
-                if not recipient_ids:
-                    recipient_ids = tuple(recipient_id for recipient_id, _ in target.recipients
-                                          if recipient_id > 0)
+                recipient_ids = tuple(recipient_id for recipient_id, _ in target.recipients
+                                      if recipient_id > 0)
                 if not recipient_ids:
                     logger.debug("[Zulip] typing skipped: no numeric DM recipients")
                     return
@@ -551,19 +562,10 @@ def check_requirements() -> bool:
 def validate_config(config) -> bool:
     """Whether the profile has enough configuration to connect.
 
-    Site and email may come from env or ``config.extra``.  The API key may live
-    in libzul's own settings file rather than Hermes env; ``config_status()``
-    reports presence only and performs no network access.
+    Site, email, and API key may come from env/``config.extra`` or from
+    libzul's own settings; ``_missing_config`` applies that rule everywhere.
     """
-    extra = getattr(config, "extra", None) or {}
-    site = str(_site_from(extra) or "").strip()
-    email = str(_email_from(extra) or "").strip()
-    if not site or not email:
-        return False
-    if str(_api_key_from(extra) or "").strip():
-        return True
-    status = _bridge_config_status()
-    return bool(status.get("base_url") and status.get("email") and status.get("api_key"))
+    return not _missing_config(getattr(config, "extra", None) or {})
 
 
 def _env_enablement() -> dict | None:
@@ -590,15 +592,6 @@ def _env_enablement() -> dict | None:
     return {"site": site, "email": email, **seeded}
 
 
-def _standalone_kwargs(extra: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "base_url": str(_site_from(extra) or "").strip(),
-        "email": str(_email_from(extra) or "").strip(),
-        "api_key": str(_api_key_from(extra) or "").strip(),
-        "queue_timeout_secs": _queue_timeout_from(extra),
-    }
-
-
 def _dm_send_recipients(target: DMTarget) -> tuple[str, list[Any]]:
     """Choose the bridge DM call: numeric ids when every recipient has one, else emails."""
     recipient_ids = [recipient_id for recipient_id, _ in target.recipients if recipient_id > 0]
@@ -610,19 +603,32 @@ def _dm_send_recipients(target: DMTarget) -> tuple[str, list[Any]]:
     return "emails", emails
 
 
-def _standalone_send_chunks(bridge: Any, target: Any, chunks: list[str]) -> list[str]:
-    message_ids: list[str] = []
+class _ChunkSendError(Exception):
+    """A chunked send failed after zero or more chunks reached the chat."""
+
+    def __init__(self, cause: BaseException, delivered_message_ids: list[str]) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+        self.delivered_message_ids = delivered_message_ids
+
+
+def _send_chunks(bridge: Any, target: StreamTarget | DMTarget, chunks: list[str]) -> list[str]:
+    """Send chunks in order through the bridge, returning the landed message ids."""
+    delivered: list[str] = []
     for chunk in chunks:
-        if isinstance(target, StreamTarget):
-            sent_id = bridge.send_stream(target.stream, target.topic, chunk)
-        else:
-            method, recipients = _dm_send_recipients(target)
-            if method == "ids":
-                sent_id = bridge.send_direct_ids(recipients, chunk)
+        try:
+            if isinstance(target, StreamTarget):
+                sent_id = bridge.send_stream(target.stream, target.topic, chunk)
             else:
-                sent_id = bridge.send_direct_emails(recipients, chunk)
-        message_ids.append(str(sent_id))
-    return message_ids
+                method, recipients = _dm_send_recipients(target)
+                if method == "ids":
+                    sent_id = bridge.send_direct_ids(recipients, chunk)
+                else:
+                    sent_id = bridge.send_direct_emails(recipients, chunk)
+        except Exception as exc:
+            raise _ChunkSendError(exc, delivered) from exc
+        delivered.append(str(sent_id))
+    return delivered
 
 
 async def _standalone_send(pconfig, chat_id: str, message: str, *, thread_id: str | None = None,
@@ -630,49 +636,57 @@ async def _standalone_send(pconfig, chat_id: str, message: str, *, thread_id: st
                            force_document: bool = False) -> dict[str, Any]:
     """Out-of-process cron delivery: open a short-lived bridge, send, close."""
     if media_files:
-        return send_error("Zulip is text-only in this adapter version; media delivery is not supported",
-                          nothing_sent=True)
+        return send_error("Zulip is text-only in this adapter version; media delivery is not supported")
     extra = getattr(pconfig, "extra", None) or {}
-    settings = _standalone_kwargs(extra)
-    if not settings["base_url"] or not settings["email"]:
-        return send_error("Zulip standalone send: ZULIP_SITE and ZULIP_EMAIL must be configured",
-                          nothing_sent=True)
-    if not settings["api_key"] and not _bridge_config_status().get("api_key"):
-        return send_error("Zulip standalone send: ZULIP_API_KEY must be configured",
-                          nothing_sent=True)
+    missing = _missing_config(extra)
+    if missing:
+        return send_error(
+            f"Zulip standalone send: {', '.join(missing)} must be configured")
     try:
         target = _decode_target(chat_id)
     except ValueError:
-        return send_error("Zulip standalone send: invalid chat_id", nothing_sent=True)
+        return send_error("Zulip standalone send: invalid chat_id")
     if isinstance(target, StreamTarget):
         topic = target.topic or (thread_id or "")
         if not topic:
-            return send_error("Zulip standalone send: a stream target needs a topic", nothing_sent=True)
+            return send_error("Zulip standalone send: a stream target needs a topic")
         target = StreamTarget(stream_id=target.stream_id, stream=target.stream, topic=topic)
 
     if not (message or "").strip():
-        return send_error("Zulip standalone send: nothing to send", nothing_sent=True)
-    chunks = ZulipAdapter.truncate_message(message or "", _max_message_length_from(extra))
+        return send_error("Zulip standalone send: nothing to send")
     if zul_bridge is None:
-        return send_error("Zulip standalone send: the zul_bridge extension is not installed",
-                          nothing_sent=True)
+        return send_error("Zulip standalone send: the zul_bridge extension is not installed")
+    settings = _bridge_kwargs(extra)
+    chunks = ZulipAdapter.truncate_message(message or "", _max_message_length_from(extra))
 
     bridge = None
     try:
         bridge = await asyncio.to_thread(lambda: zul_bridge.Bridge(  # type: ignore[union-attr]
             **settings))
-        message_ids = await asyncio.to_thread(_standalone_send_chunks, bridge, target, chunks)
+    except Exception as exc:
+        detail = _redact(exc, settings["api_key"])
+        logger.error("[Zulip] standalone send failed: %s", detail)
+        return send_error(f"Zulip standalone send failed: {detail}", nothing_sent=True)
+    try:
+        message_ids = await asyncio.to_thread(_send_chunks, bridge, target, chunks)
+    except _ChunkSendError as exc:
+        detail = _redact(exc.cause, settings["api_key"])
+        logger.error("[Zulip] standalone send failed: %s", detail)
+        result = send_error(f"Zulip standalone send failed: {detail}")
+        if exc.delivered_message_ids:
+            result["delivered_message_ids"] = list(exc.delivered_message_ids)
+            result["partial_overflow"] = True
+        return result
     except Exception as exc:
         detail = _redact(exc, settings["api_key"])
         logger.error("[Zulip] standalone send failed: %s", detail)
         return send_error(f"Zulip standalone send failed: {detail}")
     finally:
-        if bridge is not None:
-            try:
-                await asyncio.to_thread(bridge.close)
-            except Exception as exc:
-                logger.debug("[Zulip] standalone bridge close failed: %s",
-                             _redact(exc, settings["api_key"]))
+        try:
+            await asyncio.to_thread(bridge.close)
+        except Exception as exc:
+            logger.debug("[Zulip] standalone bridge close failed: %s",
+                         _redact(exc, settings["api_key"]))
     return {
         "success": True,
         "message_id": message_ids[-1] if message_ids else None,
@@ -700,7 +714,7 @@ def register(ctx) -> None:
         allow_all_env="ZULIP_ALLOW_ALL_USERS",
         parse_target_ref_fn=parse_target_ref,
         validate_target_ref_fn=validate_target_ref,
-        max_message_length=DEFAULT_MAX_MESSAGE_LENGTH,
+        max_message_length=ZulipAdapter.MAX_MESSAGE_LENGTH,
         emoji="💬",
         allow_update_command=True,
         platform_hint=(

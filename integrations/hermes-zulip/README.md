@@ -53,7 +53,7 @@ Optional settings:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `ZULIP_REQUIRE_MENTION` | `true` | In streams, only messages that mention the bot reach the agent |
+| `ZULIP_REQUIRE_MENTION` | `true` | In streams, only messages that mention the bot (event flags or rendered `@Bot Name`) reach the agent |
 | `ZULIP_ALLOWED_STREAMS` | empty (all) | Comma-separated stream names, case-insensitive |
 | `ZULIP_ALLOWED_USERS` | empty | Comma-separated user ids/emails allowed to talk to the bot |
 | `ZULIP_ALLOW_ALL_USERS` | false | Allow every Zulip user (overrides the allowlist) |
@@ -64,7 +64,9 @@ Optional settings:
 Restart the gateway after changing env. Streams map to Hermes group sessions
 with the topic as `thread_id`; DMs map to DM sessions. Outbound targets accept a
 canonical chat id, `stream:<name>/<topic>` / `#<name>/<topic>`, or `@<email>`.
-The adapter is text-only in this version: media sends return an error instead of
+Typing notifications need a canonical stream id: a target parsed from
+`stream:<name>/<topic>` carries id 0 and is a documented typing no-op. The
+adapter is text-only in this version: media sends return an error instead of
 uploading.
 
 Run the Python adapter tests (they use a local Hermes stub by default; set
@@ -84,15 +86,19 @@ cargo test --manifest-path integrations/hermes-zulip/Cargo.toml
 ```
 
 Wiremock covers account lookup, stream and direct sends, typing notifications,
-event normalization, long-poll timeout, bounded event delivery and backpressure,
-non-default queue options, queue re-registration, the fatal poller path,
-shutdown queue deletion, and sending while an event long-poll is in flight.
+event normalization (including event-level message flags), long-poll timeout,
+bounded event delivery, backpressure and a dropped consumer, non-default queue
+options, queue re-registration and its delete-before-register order, the fatal
+poller and registration paths, shutdown queue deletion, and sending while an
+event long-poll is in flight.
 
 The committed Python smoke test is not collected by pytest (its name does not
 start with `test_`). It starts a local stdlib HTTP fake Zulip server, imports the
 installed extension, and checks import/version, `whoami`, sending, typing, the
-long-poll timeout, GIL release, close, and the missing-config error. Build and
-install the wheel into a CPython 3.14 environment first:
+long-poll timeout, GIL release while `next_event` waits, in `Bridge()` and in
+`config_status()` against a multi-MB settings file, close, and the
+missing-config error. Build and install the wheel into a CPython 3.14
+environment first:
 
 ```sh
 cd integrations/hermes-zulip
@@ -137,7 +143,8 @@ settings file cannot be loaded, that sanitized cause is appended to the same
 error when explicit values are incomplete. The API key is never included in
 error text.
 
-All blocking methods release the GIL while they wait. One background thread runs
+All blocking methods, including the constructor and `config_status`, release the
+GIL while they wait. One background thread runs
 a current-thread tokio runtime: commands return through oneshot replies, and the
 event poller long-polls `get_events`, retrying the same queue with bounded
 backoff on request errors. A queue that the server rejects as invalid, or that
@@ -159,6 +166,10 @@ Event dictionaries contain `id`, `kind` (`"stream"`/`"dm"`), `stream_id`,
 `plain_text`, `flags`, `timestamp`, `permalink`, and `dm_participants`.
 `content` is the message content carried by the event payload (libzul registers
 with `apply_markdown=true`, so Zulip supplies rendered content); `plain_text` is
-the extracted text. This rendered-content behavior is an accepted limitation;
-consumers that need plain text should read `plain_text`. Non-message and
-malformed message events are skipped without stopping the poller.
+the extracted text. libzul builds both from the same inner `content` field, so
+raw and rendered content are value-identical by construction and no test can
+discriminate between them. This rendered-content behavior is an accepted
+limitation; consumers that need plain text should read `plain_text`. `flags`
+comes from the event-level `flags` array Zulip sends beside `message` (the inner
+form is accepted as a fallback). Non-message and malformed message events are
+skipped without stopping the poller.

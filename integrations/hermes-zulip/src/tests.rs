@@ -349,6 +349,34 @@ fn normalize_event_maps_stream_messages() {
 }
 
 #[test]
+fn normalize_event_prefers_event_level_flags() {
+    let event = json!({
+        "id": 3,
+        "type": "message",
+        "flags": ["mentioned"],
+        "message": {
+            "id": 55,
+            "type": "stream",
+            "stream_id": 12,
+            "display_recipient": "core",
+            "subject": "ops",
+            "sender_id": 2,
+            "sender_full_name": "Ada Lovelace",
+            "sender_email": "ada@example.com",
+            "timestamp": 1_700_000_000,
+            "content": "<p>hello world</p>"
+        }
+    });
+
+    let normalized = normalize_event(&event).expect("stream event");
+    assert_eq!(
+        normalized["flags"],
+        json!(["mentioned"]),
+        "Zulip carries message flags on the event, beside `message`"
+    );
+}
+
+#[test]
 fn normalize_event_maps_direct_messages() {
     let event = message_event(json!({
         "id": 56,
@@ -499,6 +527,35 @@ fn fatal_event_stream_error_is_reported_and_deletes_the_queue() {
 }
 
 #[test]
+fn registration_failures_are_fatal_after_the_limit() {
+    let server = start_server();
+    mount(
+        &server,
+        Mock::given(method("POST"))
+            .and(path("/api/v1/register"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": "error",
+                "msg": "registration is down",
+                "last_event_id": 0
+            })))
+            .expect(5),
+    );
+
+    let core = BridgeCore::new(config(&server)).expect("bridge");
+    let error = core
+        .next_event(Duration::from_secs(5))
+        .expect_err("repeated registration failures are fatal");
+    assert!(
+        error.contains("registration failed repeatedly"),
+        "message: {error}"
+    );
+    assert!(error.contains("registration is down"), "message: {error}");
+
+    core.close();
+    verify(&server);
+}
+
+#[test]
 fn queue_expiry_reregisters_and_keeps_delivering_events() {
     let server = start_server();
     mount(&server, register_mock("q-old").up_to_n_times(1).expect(1));
@@ -573,6 +630,31 @@ fn queue_expiry_reregisters_and_keeps_delivering_events() {
 
     core.close();
     verify(&server);
+
+    let requests = block_on(server.received_requests()).expect("wiremock records requests");
+    let delete_index = requests
+        .iter()
+        .position(|request| {
+            request.method.as_str() == "DELETE"
+                && String::from_utf8_lossy(&request.body).contains("queue_id=q-old")
+        })
+        .expect("the expired queue is deleted");
+    let register_indices = requests
+        .iter()
+        .enumerate()
+        .filter(|(_, request)| {
+            request.method.as_str() == "POST" && request.url.path() == "/api/v1/register"
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert!(
+        register_indices.len() >= 2,
+        "expected the original and replacement registrations: {register_indices:?}"
+    );
+    assert!(
+        delete_index < register_indices[1],
+        "the old queue must be deleted before the replacement is registered"
+    );
 }
 
 #[test]
@@ -715,6 +797,17 @@ fn bounded_event_send_stops_when_shutdown_arrives() {
             .expect("shutdown wakes the sender")
             .expect("sender task");
         assert_eq!(outcome, EventSendOutcome::Stopped);
+    });
+}
+
+#[test]
+fn bounded_event_send_reports_a_dropped_consumer() {
+    block_on(async {
+        let (event_tx, event_rx) = mpsc::sync_channel(1);
+        drop(event_rx);
+        let (_stop_tx, mut stop_rx) = oneshot::channel();
+        let outcome = send_event_bounded(&event_tx, Ok(json!({"id": 1})), &mut stop_rx).await;
+        assert_eq!(outcome, EventSendOutcome::Closed);
     });
 }
 

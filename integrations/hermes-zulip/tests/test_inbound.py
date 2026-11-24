@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import pytest
 from fake_bridge import make_dm_event, make_stream_event
-from gateway.platforms.helpers import carry_inbound_dedup
-from hermes_zulip.adapter import ZulipAdapter
+from hermes_zulip.adapter import INBOUND_DEDUP_TTL_SECONDS, ZulipAdapter
 from hermes_zulip.chat_ids import DMTarget, StreamTarget, decode_chat_id
 
 
@@ -76,13 +75,9 @@ async def test_dedup_by_zulip_message_id(config):
     assert len(adapter.handled_events) == 1
 
 
-async def test_dedup_survives_reconnect_carry(config):
-    old = _adapter(config)
-    assert await _handle(old, make_stream_event(id=88)) is not None
-    new = _adapter(config)
-    carry_inbound_dedup(old, new)
-    assert await _handle(new, make_stream_event(id=88)) is None
-    assert await _handle(new, make_stream_event(id=89)) is not None
+async def test_dedup_ttl_is_pinned_to_ten_minutes(config):
+    adapter = _adapter(config)
+    assert adapter._inbound_dedup._ttl == 600 == INBOUND_DEDUP_TTL_SECONDS
 
 
 async def test_require_mention_default_true_drops_unmentioned(config):
@@ -103,12 +98,27 @@ async def test_require_mention_true_accepts_wildcard_mention(config):
         id=13, flags=["wildcard_mentioned"], plain_text="@all standup")) is not None
 
 
-async def test_require_mention_true_accepts_rendered_token_and_strips_it(config):
+@pytest.mark.parametrize("token", ["@**Zulip Bot**", "@Zulip Bot"])
+async def test_require_mention_true_accepts_mention_token_and_strips_it(config, token):
     adapter = _adapter(config)
     message = await _handle(adapter, make_stream_event(
-        id=14, flags=[], plain_text="@**Zulip Bot** please summarize"))
+        id=14, flags=[], plain_text=f"{token} please summarize"))
     assert message is not None
     assert message.text == "please summarize"
+
+
+async def test_real_bridge_shaped_mention_is_delivered_and_stripped(config):
+    adapter = _adapter(config)
+    message = await _handle(adapter, make_stream_event(
+        id=30,
+        flags=[],
+        content=(
+            '<p>hey <span class="user-mention" data-user-id="1">@Zulip Bot</span> summarize</p>'
+        ),
+        plain_text="hey @Zulip Bot summarize",
+    ))
+    assert message is not None
+    assert message.text == "hey summarize"
 
 
 async def test_silent_mention_token_is_stripped(config):
@@ -119,10 +129,11 @@ async def test_silent_mention_token_is_stripped(config):
     assert message.text == "quiet ping"
 
 
-async def test_mention_only_message_is_dropped_after_stripping(config):
+@pytest.mark.parametrize("token", ["@**Zulip Bot**", "@Zulip Bot"])
+async def test_mention_only_message_is_dropped_after_stripping(config, token):
     adapter = _adapter(config)
     assert await _handle(adapter, make_stream_event(
-        id=16, flags=["mentioned"], plain_text="@**Zulip Bot**")) is None
+        id=16, flags=["mentioned"], plain_text=token)) is None
 
 
 async def test_require_mention_false_accepts_plain_stream_message(config):
@@ -195,17 +206,3 @@ async def test_invalid_kind_is_ignored(config):
     adapter = _adapter(config)
     assert await _handle(adapter, {"id": 25, "kind": "reaction"}) is None
     assert await _handle(adapter, {"kind": "stream"}) is None
-
-
-async def test_inbound_caches_stream_id_for_typing(config):
-    adapter = _adapter(config)
-    await _handle(adapter, make_stream_event(id=26, stream="core", topic="ops", stream_id=12,
-                                             flags=["mentioned"]))
-    assert adapter._stream_ids[("core", "ops")] == 12
-
-
-async def test_inbound_caches_dm_typing_recipients(config):
-    adapter = _adapter(config)
-    await _handle(adapter, make_dm_event(id=27))
-    chat_id = adapter.handled_events[-1].source.chat_id
-    assert adapter._dm_typing_ids[chat_id] == (7,)

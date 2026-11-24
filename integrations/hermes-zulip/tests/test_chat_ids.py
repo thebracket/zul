@@ -59,15 +59,13 @@ def test_dm_round_trip_special_email(email):
     assert decode_chat_id(chat_id) == DMTarget(recipients=((3, email),))
 
 
-def test_dm_accepts_mapping_and_object_recipients():
-    class Participant:
-        def __init__(self, participant_id, email):
-            self.id = participant_id
-            self.email = email
-
-    expected = ((4, "d@example.com"), (5, "e@example.com"))
-    assert decode_chat_id(encode_dm([Participant(4, "d@example.com"),
-                                     {"id": 5, "email": "e@example.com"}])) == DMTarget(expected)
+def test_dm_recipients_must_be_id_email_tuples():
+    with pytest.raises(TypeError):
+        encode_dm([{"id": 5, "email": "e@example.com"}])
+    with pytest.raises(TypeError):
+        encode_dm([("only-email@example.com",)])
+    assert decode_chat_id(encode_dm([(4, "d@example.com")])) == DMTarget(
+        recipients=((4, "d@example.com"),))
 
 
 def test_encode_dm_rejects_empty_recipients():

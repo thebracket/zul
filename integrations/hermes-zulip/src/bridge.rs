@@ -239,10 +239,13 @@ pub(crate) fn normalize_event(event: &Value) -> Option<Value> {
     }
     let raw_message = event.get("message")?.clone();
     let message = normalize::message(raw_message).ok()?;
-    let flags = message
-        .raw_json
+    // Zulip delivers message flags as a sibling of `message` on the event, not
+    // inside the message object. Fall back to the inner object for events from
+    // older callers or fixtures that nest them.
+    let flags = event
         .get("flags")
         .and_then(Value::as_array)
+        .or_else(|| message.raw_json.get("flags").and_then(Value::as_array))
         .map(|flags| {
             flags
                 .iter()

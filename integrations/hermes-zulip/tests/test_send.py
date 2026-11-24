@@ -99,6 +99,20 @@ async def test_send_converts_exception_and_redacts_secret(config, fake_bridge, m
     assert "redacted" in (result.error or "")
 
 
+async def test_send_marks_partial_delivery_when_a_later_chunk_fails(
+        config, fake_bridge, monkeypatch):
+    adapter = _connected(config, fake_bridge, monkeypatch, max_length=10)
+    bridge = fake_bridge.instances[-1]
+    bridge.send_failures = [None, RuntimeError("chunk two is down")]
+    result = await adapter.send(encode_stream("core", "ops", 12), "first part second part third")
+    assert result.success is False
+    assert len(bridge.sent) == 1
+    assert result.raw_response == {
+        "delivered_message_ids": [str(bridge.sent[0][4])],
+        "partial_overflow": True,
+    }
+
+
 async def test_send_before_connect_fails(config):
     adapter = ZulipAdapter(config)
     result = await adapter.send(encode_stream("core", "ops", 12), "hello")
@@ -113,16 +127,15 @@ async def test_send_rejects_invalid_chat_id(config, fake_bridge, monkeypatch):
     assert "chat_id" in (result.error or "").lower()
 
 
-async def test_typing_stream_uses_cached_stream_id(config, fake_bridge, monkeypatch):
+async def test_typing_stream_uses_the_canonical_stream_id(config, fake_bridge, monkeypatch):
     adapter = _connected(config, fake_bridge, monkeypatch)
     bridge = fake_bridge.instances[-1]
-    adapter._stream_ids[("core", "ops")] = 12
-    await adapter.send_typing(encode_stream("core", "ops", 0))
-    await adapter.stop_typing(encode_stream("core", "ops", 0))
+    await adapter.send_typing(encode_stream("core", "ops", 12))
+    await adapter.stop_typing(encode_stream("core", "ops", 12))
     assert bridge.typing == [("stream", 12, "ops", "start"), ("stream", 12, "ops", "stop")]
 
 
-async def test_typing_unknown_stream_is_noop(config, fake_bridge, monkeypatch):
+async def test_typing_unknown_stream_id_is_noop(config, fake_bridge, monkeypatch):
     adapter = _connected(config, fake_bridge, monkeypatch)
     bridge = fake_bridge.instances[-1]
     await adapter.send_typing(encode_stream("unknown", "topic", 0))
@@ -130,23 +143,28 @@ async def test_typing_unknown_stream_is_noop(config, fake_bridge, monkeypatch):
     assert bridge.typing == []
 
 
-async def test_typing_dm_uses_cached_recipient_ids(config, fake_bridge, monkeypatch):
+async def test_typing_dm_uses_the_canonical_recipient_ids(config, fake_bridge, monkeypatch):
     adapter = _connected(config, fake_bridge, monkeypatch)
     bridge = fake_bridge.instances[-1]
     chat_id = encode_dm([(7, "a@example.com"), (8, "b@example.com")])
-    adapter._dm_typing_ids[chat_id] = (7, 8)
     await adapter.send_typing(chat_id)
     await adapter.stop_typing(chat_id)
     assert bridge.typing == [("direct", (7, 8), "start"), ("direct", (7, 8), "stop")]
+
+
+async def test_typing_dm_without_numeric_ids_is_noop(config, fake_bridge, monkeypatch):
+    adapter = _connected(config, fake_bridge, monkeypatch)
+    bridge = fake_bridge.instances[-1]
+    await adapter.send_typing(encode_dm([(0, "a@example.com")]))
+    assert bridge.typing == []
 
 
 async def test_typing_failure_is_swallowed(config, fake_bridge, monkeypatch):
     adapter = _connected(config, fake_bridge, monkeypatch)
     bridge = fake_bridge.instances[-1]
     bridge.typing_error = RuntimeError("typing blocked")
-    adapter._stream_ids[("core", "ops")] = 12
-    await adapter.send_typing(encode_stream("core", "ops", 0))
-    await adapter.stop_typing(encode_stream("core", "ops", 0))
+    await adapter.send_typing(encode_stream("core", "ops", 12))
+    await adapter.stop_typing(encode_stream("core", "ops", 12))
 
 
 async def test_get_chat_info_stream_and_dm(config):

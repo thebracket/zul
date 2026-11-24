@@ -43,22 +43,15 @@ def _encode_component(value: object) -> str:
     return quote(str(value), safe="")
 
 
-def _coerce_recipient(recipient: object) -> tuple[int, str]:
-    """Normalize one recipient entry to ``(numeric id, email)``.
+def _coerce_recipient(recipient: tuple[int, str]) -> tuple[int, str]:
+    """Normalize one ``(numeric id, email)`` recipient pair.
 
-    Accepts ``(id, email)`` pairs, mappings with ``id``/``email`` keys, and
-    objects exposing both attributes (the bridge's participant dictionaries).
     A missing or malformed id becomes ``0``; send paths then fall back to the
     email address.
     """
-    if isinstance(recipient, dict):
-        raw_id = recipient.get("id", 0)
-        email = recipient.get("email", "")
-    elif hasattr(recipient, "id") and hasattr(recipient, "email"):
-        raw_id = recipient.id
-        email = recipient.email
-    else:
-        raw_id, email = recipient  # type: ignore[misc]
+    if not isinstance(recipient, tuple) or len(recipient) != 2:
+        raise TypeError("a Zulip DM recipient must be an (id, email) tuple")
+    raw_id, email = recipient
     try:
         recipient_id = int(raw_id or 0)
     except (TypeError, ValueError):
@@ -80,7 +73,7 @@ def encode_stream(stream: str, topic: str, stream_id: int = 0) -> str:
     ))
 
 
-def encode_dm(recipients: Iterable[object]) -> str:
+def encode_dm(recipients: Iterable[tuple[int, str]]) -> str:
     """Encode one or more DM recipients.
 
     Recipients are sorted by ``(id, email)`` so the same participant set always

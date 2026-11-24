@@ -1,6 +1,8 @@
 /target/
 /integrations/hermes-zulip/target/
 /integrations/hermes-zulip/.venv/
+**/__pycache__/
+*.pyc
 .env
 .env.*
 !.env.example

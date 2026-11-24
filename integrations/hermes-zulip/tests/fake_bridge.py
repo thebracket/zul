@@ -26,14 +26,27 @@ class FakeBridge:
         self.next_message_id = 1000
         self.whoami_result = {"email": email, "full_name": "Zulip Bot"}
         self.whoami_error: BaseException | None = None
+        self.whoami_started = threading.Event()
+        self.whoami_gate: threading.Event | None = None
         self.send_error: BaseException | None = None
+        self.send_failures: list[BaseException | None] = []
         self.typing_error: BaseException | None = None
         self._lock = threading.Lock()
 
     def whoami(self) -> dict[str, str]:
+        self.whoami_started.set()
+        if self.whoami_gate is not None:
+            self.whoami_gate.wait(5)
         if self.whoami_error is not None:
             raise self.whoami_error
         return dict(self.whoami_result)
+
+    def _next_send_failure(self) -> None:
+        failure = self.send_failures.pop(0) if self.send_failures else None
+        if failure is not None:
+            raise failure
+        if self.send_error is not None:
+            raise self.send_error
 
     def _next_id(self) -> int:
         with self._lock:
@@ -42,22 +55,19 @@ class FakeBridge:
             return message_id
 
     def send_stream(self, stream: str, topic: str, content: str) -> int:
-        if self.send_error is not None:
-            raise self.send_error
+        self._next_send_failure()
         message_id = self._next_id()
         self.sent.append(("stream", stream, topic, content, message_id))
         return message_id
 
     def send_direct_ids(self, recipients: list[int], content: str) -> int:
-        if self.send_error is not None:
-            raise self.send_error
+        self._next_send_failure()
         message_id = self._next_id()
         self.sent.append(("direct_ids", tuple(recipients), content, message_id))
         return message_id
 
     def send_direct_emails(self, recipients: list[str], content: str) -> int:
-        if self.send_error is not None:
-            raise self.send_error
+        self._next_send_failure()
         message_id = self._next_id()
         self.sent.append(("direct_emails", tuple(recipients), content, message_id))
         return message_id
@@ -95,7 +105,10 @@ class FakeBridgeModule:
         self.constructor_error: BaseException | None = None
         self.whoami_error: BaseException | None = None
         self.whoami_result: dict[str, str] | None = None
+        self.whoami_started = threading.Event()
+        self.whoami_gate: threading.Event | None = None
         self.send_error: BaseException | None = None
+        self.send_failures: list[BaseException | None] = []
         self.typing_error: BaseException | None = None
         self.config_status_result: dict[str, bool] = {
             "base_url": True, "email": True, "api_key": True,
@@ -111,8 +124,11 @@ class FakeBridgeModule:
             bridge.whoami_error = self.whoami_error
         if self.whoami_result is not None:
             bridge.whoami_result = dict(self.whoami_result)
+        bridge.whoami_started = self.whoami_started
+        bridge.whoami_gate = self.whoami_gate
         if self.send_error is not None:
             bridge.send_error = self.send_error
+        bridge.send_failures = self.send_failures
         if self.typing_error is not None:
             bridge.typing_error = self.typing_error
         self.instances.append(bridge)

@@ -18,6 +18,7 @@ import threading
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 
 def isolate_settings():
@@ -138,6 +139,48 @@ class Server(ThreadingHTTPServer):
         pass
 
 
+def slow_config_path():
+    return Path(os.environ["XDG_CONFIG_HOME"]) / "zul" / "config.toml"
+
+
+def write_slow_config(base_url):
+    """A multi-MB, valid TOML file so ``Settings::load`` takes measurable time."""
+    path = slow_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    filler = ("# " + "x" * 120 + "\n") * 100_000
+    path.write_text(
+        filler
+        + f'[zulip]\nbase_url = "{base_url}"\nemail = "ada@example.com"\n',
+        encoding="utf-8",
+    )
+    return path
+
+
+def gil_witness(label, action):
+    """Run *action* and assert a Python ticker thread ran while it was blocked."""
+    ticks = [0]
+    started = threading.Event()
+    stop = threading.Event()
+
+    def ticker():
+        while not stop.is_set():
+            ticks[0] += 1
+            started.set()
+            time.sleep(0.001)
+
+    thread = threading.Thread(target=ticker, daemon=True)
+    thread.start()
+    assert started.wait(1.0), f"the ticker never started before {label}"
+    before = ticks[0]
+    try:
+        return action()
+    finally:
+        after = ticks[0]
+        stop.set()
+        thread.join(timeout=1.0)
+        assert after > before, f"{label} held the GIL while loading settings"
+
+
 def main():
     assert isinstance(zul_bridge.__version__, str) and zul_bridge.__version__
 
@@ -151,10 +194,16 @@ def main():
     server_thread.start()
     base_url = f"http://127.0.0.1:{server.server_port}"
 
-    bridge = zul_bridge.Bridge(
-        base_url=base_url,
-        email="ada@example.com",
-        api_key="secret",
+    config_path = write_slow_config(base_url)
+    status = gil_witness("config_status", zul_bridge.config_status)
+    assert status["base_url"] is True and status["email"] is True, status
+    bridge = gil_witness(
+        "Bridge()",
+        lambda: zul_bridge.Bridge(
+            base_url=base_url,
+            email="ada@example.com",
+            api_key="secret",
+        ),
     )
     try:
         assert bridge.whoami() == {
@@ -211,6 +260,7 @@ def main():
         "to": ["[7,8]"],
     } in typing_forms, typing_forms
 
+    config_path.unlink()
     try:
         zul_bridge.Bridge()
     except ValueError as exc:
