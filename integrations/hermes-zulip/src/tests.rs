@@ -1,13 +1,30 @@
-use std::time::{Duration, Instant};
+use std::ffi::OsString;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::mpsc;
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use libzul::config::ZulipConfig;
+use libzul::zulip::events::EventQueueOptions;
 use serde_json::json;
+use tokio::sync::oneshot;
 use wiremock::matchers::{body_string_contains, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::bridge::{
-    config_status, merge_config, normalize_event, BridgeConfig, BridgeCore, EventOptions,
+    config_status, merge_config, normalize_event, resolve_config, send_event_bounded, BridgeConfig,
+    BridgeCore, EventOptions, EventSendOutcome,
 };
+
+/// Serialize tests that read or mutate process-wide configuration environment.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
@@ -70,6 +87,75 @@ fn empty_events_mock(queue_id: &str, delay: Duration) -> Mock {
 
 fn message_event(message: serde_json::Value) -> serde_json::Value {
     json!({"id": 3, "type": "message", "message": message})
+}
+
+fn failing_events_mock(queue_id: &str, times: u64) -> Mock {
+    Mock::given(method("GET"))
+        .and(path("/api/v1/events"))
+        .and(query_param("queue_id", queue_id))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+            "result": "error",
+            "msg": "event server is down",
+            "events": []
+        })))
+        .expect(times)
+}
+
+const ISOLATED_ENV_KEYS: [&str; 8] = [
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "ZULIP_BASE_URL",
+    "ZULIP_SITE",
+    "ZULIP_EMAIL",
+    "ZULIP_API_KEY",
+    "ZUL_CACHE",
+];
+
+/// A temporary HOME/XDG environment with all ambient Zulip settings removed.
+struct IsolatedEnv {
+    saved: Vec<(&'static str, Option<OsString>)>,
+    root: PathBuf,
+}
+
+impl IsolatedEnv {
+    fn new(label: &str) -> Self {
+        let saved = ISOLATED_ENV_KEYS
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect();
+        for key in ISOLATED_ENV_KEYS {
+            std::env::remove_var(key);
+        }
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("zul-bridge-{label}-{}-{nanos}", std::process::id()));
+        std::env::set_var("HOME", &root);
+        std::env::set_var("XDG_CONFIG_HOME", root.join(".config"));
+        std::env::set_var("XDG_CACHE_HOME", root.join(".cache"));
+        Self { saved, root }
+    }
+
+    fn write_config(&self, body: &str) {
+        let dir = self.root.join(".config").join("zul");
+        fs::create_dir_all(&dir).expect("config dir");
+        fs::write(dir.join("config.toml"), body).expect("config file");
+    }
+}
+
+impl Drop for IsolatedEnv {
+    fn drop(&mut self) {
+        for (key, value) in &self.saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        let _ = fs::remove_dir_all(&self.root);
+    }
 }
 
 fn wait_for_queue(core: &BridgeCore, expected: &str) {
@@ -351,6 +437,64 @@ fn shutdown_deletes_the_queue_and_is_idempotent() {
     core.close();
     core.close();
 
+    assert!(
+        core.queue_id().is_none(),
+        "close must clear the registered queue id"
+    );
+    let queued_after_close = block_on(server.received_requests())
+        .expect("wiremock records requests")
+        .len();
+    let closed = core
+        .next_event(Duration::from_millis(100))
+        .expect_err("a detached consumer sees the closed queue");
+    assert!(closed.contains("closed"), "message: {closed}");
+
+    std::thread::sleep(Duration::from_millis(150));
+    let queued_later = block_on(server.received_requests())
+        .expect("wiremock records requests")
+        .len();
+    assert_eq!(
+        queued_after_close, queued_later,
+        "no register or events request may arrive after close"
+    );
+
+    verify(&server);
+}
+
+#[test]
+fn fatal_event_stream_error_is_reported_and_deletes_the_queue() {
+    let server = start_server();
+    mount(&server, register_mock("q-fatal").expect(2));
+    mount(&server, failing_events_mock("q-fatal", 5));
+    mount(
+        &server,
+        Mock::given(method("DELETE"))
+            .and(path("/api/v1/events"))
+            .and(body_string_contains("queue_id=q-fatal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": "success",
+                "msg": ""
+            })))
+            .expect(2),
+    );
+
+    let core = BridgeCore::new(config(&server)).expect("bridge");
+    let error = core
+        .next_event(Duration::from_secs(5))
+        .expect_err("a fatal poller failure reaches the consumer");
+    assert!(error.contains("failed repeatedly"), "message: {error}");
+    assert!(error.contains("event server is down"), "message: {error}");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while core.queue_id().is_some() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        core.queue_id().is_none(),
+        "the fatal path deletes the queue"
+    );
+
+    core.close();
     verify(&server);
 }
 
@@ -367,9 +511,21 @@ fn queue_expiry_reregisters_and_keeps_delivering_events() {
             .respond_with(ResponseTemplate::new(400).set_body_json(json!({
                 "result": "error",
                 "msg": "Bad event queue id",
-                "code": "BAD_EVENT_QUEUE_ID"
+                "code": "BAD_EVENT_QUEUE_ID",
+                "events": []
             })))
             .up_to_n_times(1)
+            .expect(1),
+    );
+    mount(
+        &server,
+        Mock::given(method("DELETE"))
+            .and(path("/api/v1/events"))
+            .and(body_string_contains("queue_id=q-old"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": "success",
+                "msg": ""
+            })))
             .expect(1),
     );
     mount(
@@ -456,6 +612,144 @@ fn sends_proceed_while_an_event_long_poll_is_in_flight() {
 }
 
 #[test]
+fn register_request_carries_non_default_event_queue_options() {
+    let server = start_server();
+    mount(
+        &server,
+        Mock::given(method("POST"))
+            .and(path("/api/v1/register"))
+            .and(body_string_contains(
+                "event_types=%5B%22message%22%2C%22heartbeat%22%5D",
+            ))
+            .and(body_string_contains(
+                "narrow=%5B%5B%22channel%22%2C%22core%22%5D%5D",
+            ))
+            .and(body_string_contains("all_public_streams=true"))
+            .and(body_string_contains("idle_queue_timeout=42"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": "success",
+                "msg": "",
+                "queue_id": "q-options",
+                "last_event_id": 0,
+                "event_queue_longpoll_timeout_seconds": 30
+            })))
+            .expect(1),
+    );
+    mount(
+        &server,
+        empty_events_mock("q-options", Duration::from_millis(10)),
+    );
+
+    let config = merge_config(
+        None,
+        &server.uri(),
+        "ada@example.com",
+        "test-key",
+        EventOptions {
+            event_types: Some(vec!["message".to_string(), "heartbeat".to_string()]),
+            narrow: Some(vec![vec!["channel".to_string(), "core".to_string()]]),
+            all_public_streams: true,
+            queue_timeout_secs: Some(42),
+        },
+    )
+    .expect("config");
+    let core = BridgeCore::new(config).expect("bridge");
+    wait_for_queue(&core, "q-options");
+
+    core.close();
+    verify(&server);
+}
+
+#[test]
+fn bounded_event_send_waits_for_the_consumer() {
+    block_on(async {
+        let (event_tx, event_rx) = mpsc::sync_channel(1);
+        event_tx.try_send(Ok(json!({"id": 1}))).expect("queue");
+        let (_stop_tx, mut stop_rx) = oneshot::channel();
+        let sender = tokio::spawn(async move {
+            send_event_bounded(&event_tx, Ok(json!({"id": 2})), &mut stop_rx).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !sender.is_finished(),
+            "a full queue must make the poller wait instead of dropping the event"
+        );
+
+        let first = event_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("first event")
+            .expect("first event is ok");
+        assert_eq!(first["id"], 1);
+
+        let outcome = tokio::time::timeout(Duration::from_secs(2), sender)
+            .await
+            .expect("the sender completes after a drain")
+            .expect("sender task");
+        assert_eq!(outcome, EventSendOutcome::Sent);
+
+        let second = event_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("second event")
+            .expect("second event is ok");
+        assert_eq!(second["id"], 2);
+    });
+}
+
+#[test]
+fn bounded_event_send_stops_when_shutdown_arrives() {
+    block_on(async {
+        let (event_tx, _event_rx) = mpsc::sync_channel(1);
+        event_tx.try_send(Ok(json!({"id": 1}))).expect("queue");
+        let (stop_tx, mut stop_rx) = oneshot::channel();
+        let sender = tokio::spawn(async move {
+            send_event_bounded(&event_tx, Ok(json!({"id": 2})), &mut stop_rx).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!sender.is_finished());
+        stop_tx.send(()).expect("stop");
+
+        let outcome = tokio::time::timeout(Duration::from_secs(2), sender)
+            .await
+            .expect("shutdown wakes the sender")
+            .expect("sender task");
+        assert_eq!(outcome, EventSendOutcome::Stopped);
+    });
+}
+
+#[test]
+fn resolve_config_uses_settings_file_and_environment() {
+    let _lock = lock_env();
+    let env = IsolatedEnv::new("settings");
+    env.write_config(
+        "[zulip]\nbase_url = \"https://file.example.com\"\nemail = \"file@example.com\"\n",
+    );
+    std::env::set_var("ZULIP_API_KEY", "env-key");
+
+    let config =
+        resolve_config("", "", "", None, None, false, None).expect("settings and env fallback");
+    assert_eq!(config.base_url, "https://file.example.com");
+    assert_eq!(config.email, "file@example.com");
+    assert_eq!(config.api_key, "env-key");
+    assert_eq!(config.options.event_types, vec!["message".to_string()]);
+    assert!(config.options.narrow.is_empty());
+}
+
+#[test]
+fn corrupt_settings_are_reported_with_the_missing_config_error() {
+    let _lock = lock_env();
+    let env = IsolatedEnv::new("corrupt");
+    env.write_config("[zulip\nbase_url = ");
+
+    let error =
+        resolve_config("", "", "", None, None, false, None).expect_err("malformed settings");
+    assert!(error.contains("missing Zulip configuration"), "{error}");
+    assert!(error.contains("settings also failed to load"), "{error}");
+    assert!(error.contains("parsing zul config TOML"), "{error}");
+}
+
+#[test]
 fn explicit_config_overrides_loaded_values() {
     let loaded = ZulipConfig {
         base_url: Some("https://env.example.com".to_string()),
@@ -467,15 +761,27 @@ fn explicit_config_overrides_loaded_values() {
         "https://explicit.example.com",
         "explicit@example.com",
         "explicit-key",
-        EventOptions::default(),
+        EventOptions {
+            event_types: Some(vec!["message".to_string(), "heartbeat".to_string()]),
+            narrow: Some(vec![vec!["channel".to_string(), "core".to_string()]]),
+            all_public_streams: true,
+            queue_timeout_secs: Some(42),
+        },
     )
     .expect("merged config");
 
     assert_eq!(config.base_url, "https://explicit.example.com");
     assert_eq!(config.email, "explicit@example.com");
     assert_eq!(config.api_key, "explicit-key");
-    assert_eq!(config.event_types, vec!["message".to_string()]);
-    assert!(config.narrow.is_empty());
+    assert_eq!(
+        config.options,
+        EventQueueOptions {
+            event_types: vec!["message".to_string(), "heartbeat".to_string()],
+            narrow: vec![["channel".to_string(), "core".to_string()]],
+            all_public_streams: true,
+            idle_queue_timeout_secs: Some(42),
+        }
+    );
 }
 
 #[test]
@@ -536,6 +842,7 @@ fn narrow_must_be_operator_operand_pairs() {
 
 #[test]
 fn config_status_reports_presence_only() {
+    let _lock = lock_env();
     let status = config_status();
     for field in ["base_url", "email", "api_key"] {
         assert!(

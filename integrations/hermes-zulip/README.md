@@ -84,8 +84,27 @@ cargo test --manifest-path integrations/hermes-zulip/Cargo.toml
 ```
 
 Wiremock covers account lookup, stream and direct sends, typing notifications,
-event normalization, long-poll timeout, queue re-registration, shutdown queue
-deletion, and sending while an event long-poll is in flight.
+event normalization, long-poll timeout, bounded event delivery and backpressure,
+non-default queue options, queue re-registration, the fatal poller path,
+shutdown queue deletion, and sending while an event long-poll is in flight.
+
+The committed Python smoke test is not collected by pytest (its name does not
+start with `test_`). It starts a local stdlib HTTP fake Zulip server, imports the
+installed extension, and checks import/version, `whoami`, sending, typing, the
+long-poll timeout, GIL release, close, and the missing-config error. Build and
+install the wheel into a CPython 3.14 environment first:
+
+```sh
+cd integrations/hermes-zulip
+uv venv --python 3.14 .venv
+uv pip install --python .venv/bin/python maturin
+.venv/bin/maturin build --release
+uv pip install --python .venv/bin/python target/wheels/zul_bridge-*.whl
+.venv/bin/python tests/python_smoke.py
+```
+
+The smoke test points `HOME`/XDG at a temporary directory and clears `ZULIP_*`,
+so an ambient libzul config cannot change its result.
 
 ## API
 
@@ -113,20 +132,33 @@ bridge.close()
 
 Explicit constructor arguments override libzul settings; otherwise
 `ZULIP_BASE_URL`/`ZULIP_SITE`, `ZULIP_EMAIL`, and `ZULIP_API_KEY` are used.
-Missing required values raise `ValueError` before any network call. The API key
-is never included in error text.
+Missing required values raise `ValueError` before any network call. If libzul's
+settings file cannot be loaded, that sanitized cause is appended to the same
+error when explicit values are incomplete. The API key is never included in
+error text.
 
 All blocking methods release the GIL while they wait. One background thread runs
 a current-thread tokio runtime: commands return through oneshot replies, and the
-event poller long-polls `get_events`, re-registering with bounded backoff after
-request errors. `next_event` is single-consumer (`RuntimeError` after repeated
-poller failures); `close()` stops the poller, deletes the queue best effort, and
-is idempotent.
+event poller long-polls `get_events`, retrying the same queue with bounded
+backoff on request errors. A queue that the server rejects as invalid, or that
+fails three consecutive polls, is deleted best effort and replaced with a fresh
+registration; the replacement starts at a new server cursor, so events produced
+during that gap are not delivered. Five consecutive failures end the poller and
+surface as `RuntimeError` from `next_event`. `next_event` is single-consumer;
+`close()` stops the poller, deletes the queue once, clears the queue id, and
+joins the runtime thread.
+
+Normalized events buffer in a bounded channel of 1024 entries. When a stalled
+consumer fills it, the poller pauses briefly and retries instead of blocking the
+runtime or dropping events; while it is paused no new pages are read, so the
+buffer stays on the Zulip server rather than growing process memory. Draining
+`next_event` resumes delivery.
 
 Event dictionaries contain `id`, `kind` (`"stream"`/`"dm"`), `stream_id`,
 `stream`, `topic`, `sender_id`, `sender_name`, `sender_email`, `content`,
 `plain_text`, `flags`, `timestamp`, `permalink`, and `dm_participants`.
 `content` is the message content carried by the event payload (libzul registers
 with `apply_markdown=true`, so Zulip supplies rendered content); `plain_text` is
-the extracted text. Non-message and malformed message events are skipped without
-stopping the poller.
+the extracted text. This rendered-content behavior is an accepted limitation;
+consumers that need plain text should read `plain_text`. Non-message and
+malformed message events are skipped without stopping the poller.

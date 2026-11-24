@@ -4,7 +4,7 @@
 //! enqueue commands and wait for a oneshot reply; a background task long-polls
 //! the Zulip event queue and pushes normalized events into a std channel.
 
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -18,10 +18,27 @@ use serde_json::{json, Value};
 use tokio::runtime::Builder;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 
+#[cfg(not(test))]
 const EVENT_BACKOFF_START: Duration = Duration::from_millis(100);
+#[cfg(test)]
+const EVENT_BACKOFF_START: Duration = Duration::from_millis(5);
+#[cfg(not(test))]
 const EVENT_BACKOFF_MAX: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const EVENT_BACKOFF_MAX: Duration = Duration::from_millis(20);
 const EVENT_MAX_CONSECUTIVE_FAILURES: u32 = 5;
+/// Consecutive `get_events` errors on one queue before it is replaced.
+const EVENT_MAX_SAME_QUEUE_ERRORS: u32 = 3;
 const QUEUE_DELETE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Number of normalized events the poller may buffer for a stalled consumer.
+///
+/// The poller stops reading from Zulip while the channel is full, leaving the
+/// server-side event queue as the buffer instead of growing process memory.
+const EVENT_QUEUE_CAPACITY: usize = 1024;
+
+/// Pause between attempts to place an event into a full queue.
+const EVENT_SEND_RETRY: Duration = Duration::from_millis(5);
 
 /// Queue-shaping options supplied by the Python constructor.
 #[derive(Default)]
@@ -46,14 +63,8 @@ pub(crate) struct BridgeConfig {
     pub email: String,
     /// Account API key.
     pub api_key: String,
-    /// Event types requested from the queue.
-    pub event_types: Vec<String>,
-    /// Narrow filters for the queue.
-    pub narrow: Vec<[String; 2]>,
-    /// Whether the queue includes all public streams.
-    pub all_public_streams: bool,
-    /// Optional idle queue timeout.
-    pub queue_timeout_secs: Option<u64>,
+    /// Event queue request shape.
+    pub options: EventQueueOptions,
 }
 
 impl std::fmt::Debug for BridgeConfig {
@@ -63,28 +74,16 @@ impl std::fmt::Debug for BridgeConfig {
             .field("base_url", &self.base_url)
             .field("email", &self.email)
             .field("api_key", &"<redacted>")
-            .field("event_types", &self.event_types)
-            .field("narrow", &self.narrow)
-            .field("all_public_streams", &self.all_public_streams)
-            .field("queue_timeout_secs", &self.queue_timeout_secs)
+            .field("options", &self.options)
             .finish()
-    }
-}
-
-impl BridgeConfig {
-    fn event_options(&self) -> EventQueueOptions {
-        EventQueueOptions {
-            event_types: self.event_types.clone(),
-            narrow: self.narrow.clone(),
-            all_public_streams: self.all_public_streams,
-            idle_queue_timeout_secs: self.queue_timeout_secs,
-        }
     }
 }
 
 /// Merge explicit Python arguments over `libzul` settings and environment.
 ///
-/// Missing required values are reported together, before any network call.
+/// Missing required values are reported together, before any network call. A
+/// failed settings load is reported as a sanitized cause instead of being
+/// treated as if no configuration existed.
 pub(crate) fn resolve_config(
     base_url: &str,
     email: &str,
@@ -94,9 +93,9 @@ pub(crate) fn resolve_config(
     all_public_streams: bool,
     queue_timeout_secs: Option<u64>,
 ) -> Result<BridgeConfig, String> {
-    let loaded = Settings::load().ok();
-    merge_config(
-        loaded.as_ref().map(|settings| &settings.zulip),
+    let loaded = Settings::load();
+    let merged = merge_config(
+        loaded.as_ref().ok().map(|settings| &settings.zulip),
         base_url,
         email,
         api_key,
@@ -106,7 +105,46 @@ pub(crate) fn resolve_config(
             all_public_streams,
             queue_timeout_secs,
         },
-    )
+    );
+    match (merged, loaded) {
+        (Ok(config), _) => Ok(config),
+        (Err(message), Ok(_)) => Err(message),
+        (Err(message), Err(load_error)) => {
+            let mut cause = String::new();
+            for entry in load_error.chain() {
+                if !cause.is_empty() {
+                    cause.push_str(": ");
+                }
+                cause.push_str(&entry.to_string());
+            }
+            Err(format!(
+                "{message} (libzul settings also failed to load: {})",
+                sanitize_cause(&cause)
+            ))
+        }
+    }
+}
+
+/// Keep a settings-load failure to one bounded line and never echo a value
+/// that could be the API key.
+fn sanitize_cause(cause: &str) -> String {
+    let kept = cause
+        .lines()
+        .filter(|line| !line.to_ascii_lowercase().contains("api_key"))
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut sanitized = kept.split_whitespace().collect::<Vec<_>>().join(" ");
+    if sanitized.chars().count() > 240 {
+        sanitized = sanitized.chars().take(240).collect::<String>();
+        sanitized.push_str("...");
+    }
+    if sanitized.is_empty() {
+        "unreadable or malformed settings".to_string()
+    } else {
+        sanitized
+    }
 }
 
 pub(crate) fn merge_config(
@@ -114,7 +152,7 @@ pub(crate) fn merge_config(
     base_url: &str,
     email: &str,
     api_key: &str,
-    options: EventOptions,
+    requested: EventOptions,
 ) -> Result<BridgeConfig, String> {
     let base_url = pick(base_url, zulip.and_then(|zulip| zulip.base_url.as_deref()));
     let email = pick(email, zulip.and_then(|zulip| zulip.email.as_deref()));
@@ -137,11 +175,11 @@ pub(crate) fn merge_config(
         ));
     }
 
-    let event_types = match options.event_types {
+    let event_types = match requested.event_types {
         Some(types) if !types.is_empty() => types,
         _ => vec!["message".to_string()],
     };
-    let narrow = match options.narrow {
+    let narrow = match requested.narrow {
         Some(pairs) => pairs
             .into_iter()
             .map(|pair| {
@@ -156,10 +194,12 @@ pub(crate) fn merge_config(
         base_url: base_url.expect("checked above"),
         email: email.expect("checked above"),
         api_key: api_key.expect("checked above"),
-        event_types,
-        narrow,
-        all_public_streams: options.all_public_streams,
-        queue_timeout_secs: options.queue_timeout_secs,
+        options: EventQueueOptions {
+            event_types,
+            narrow,
+            all_public_streams: requested.all_public_streams,
+            idle_queue_timeout_secs: requested.queue_timeout_secs,
+        },
     })
 }
 
@@ -211,12 +251,6 @@ pub(crate) fn normalize_event(event: &Value) -> Option<Value> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let content = message
-        .raw_json
-        .get("content")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
     let kind = match message.message_type {
         ZulipMessageType::Stream => "stream",
         ZulipMessageType::Direct => "dm",
@@ -242,7 +276,7 @@ pub(crate) fn normalize_event(event: &Value) -> Option<Value> {
         "sender_id": message.sender_id,
         "sender_name": message.sender_name,
         "sender_email": message.sender_email,
-        "content": content,
+        "content": message.rendered_html,
         "plain_text": message.plain_text,
         "flags": flags,
         "timestamp": message.timestamp.timestamp(),
@@ -295,13 +329,13 @@ pub(crate) struct BridgeCore {
 impl BridgeCore {
     /// Start the runtime thread and register the event queue.
     pub fn new(config: BridgeConfig) -> Result<Self, String> {
-        let event_options = config.event_options();
+        let event_options = config.options;
         let client = ZulipClient::new(config.base_url, config.email, config.api_key);
         let runtime = Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|err| format!("building tokio runtime: {err}"))?;
-        let (event_tx, event_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::sync_channel(EVENT_QUEUE_CAPACITY);
         let (command_tx, mut command_rx) = tokio_mpsc::unbounded_channel();
         let thread_queue_id = Arc::new(Mutex::new(None));
         let poller_queue_id = Arc::clone(&thread_queue_id);
@@ -542,15 +576,62 @@ async fn execute(client: &ZulipClient, command: Command) {
     }
 }
 
+/// Outcome of offering one event to the Python-facing queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EventSendOutcome {
+    /// The event was queued.
+    Sent,
+    /// The consumer dropped its receiver; the queue is unusable.
+    Closed,
+    /// Shutdown was requested while the queue was full.
+    Stopped,
+}
+
+/// Queue one event without ever blocking the runtime thread.
+///
+/// A full queue means the consumer stopped draining: pause briefly and retry,
+/// which also stops the poller from reading more events and leaves the buffer
+/// on the Zulip server. The event is never dropped silently.
+pub(crate) async fn send_event_bounded(
+    event_tx: &SyncSender<Result<Value, String>>,
+    mut event: Result<Value, String>,
+    stop: &mut oneshot::Receiver<()>,
+) -> EventSendOutcome {
+    loop {
+        match event_tx.try_send(event) {
+            Ok(()) => return EventSendOutcome::Sent,
+            Err(TrySendError::Disconnected(_)) => return EventSendOutcome::Closed,
+            Err(TrySendError::Full(returned)) => {
+                event = returned;
+                let slept = tokio::select! {
+                    _ = &mut *stop => false,
+                    _ = tokio::time::sleep(EVENT_SEND_RETRY) => true,
+                };
+                if !slept {
+                    return EventSendOutcome::Stopped;
+                }
+            }
+        }
+    }
+}
+
+async fn sleep_until_stopped(stop: &mut oneshot::Receiver<()>, backoff: Duration) -> bool {
+    tokio::select! {
+        _ = &mut *stop => false,
+        _ = tokio::time::sleep(backoff) => true,
+    }
+}
+
 async fn event_loop(
     client: ZulipClient,
     options: EventQueueOptions,
-    event_tx: Sender<Result<Value, String>>,
+    event_tx: SyncSender<Result<Value, String>>,
     queue_id: Arc<Mutex<Option<String>>>,
     mut stop: oneshot::Receiver<()>,
 ) {
     let mut queue: Option<EventQueue> = None;
     let mut failures = 0u32;
+    let mut queue_errors = 0u32;
     let mut backoff = EVENT_BACKOFF_START;
 
     loop {
@@ -562,20 +643,25 @@ async fn event_loop(
             match registered {
                 Ok(new_queue) => {
                     queue = Some(new_queue);
+                    queue_errors = 0;
                     backoff = EVENT_BACKOFF_START;
                 }
                 Err(err) => {
                     failures += 1;
                     if failures >= EVENT_MAX_CONSECUTIVE_FAILURES {
-                        let _ = event_tx.send(Err(format!(
+                        let fatal = Err(format!(
                             "Zulip event queue registration failed repeatedly: {err}"
-                        )));
+                        ));
+                        if send_event_bounded(&event_tx, fatal, &mut stop).await
+                            == EventSendOutcome::Stopped
+                        {
+                            return;
+                        }
                         delete_queue(&client, &queue_id).await;
                         return;
                     }
-                    tokio::select! {
-                        _ = &mut stop => return,
-                        _ = tokio::time::sleep(backoff) => {}
+                    if !sleep_until_stopped(&mut stop, backoff).await {
+                        return;
                     }
                     backoff = (backoff * 2).min(EVENT_BACKOFF_MAX);
                     continue;
@@ -592,6 +678,7 @@ async fn event_loop(
         match result {
             Ok(page) => {
                 failures = 0;
+                queue_errors = 0;
                 backoff = EVENT_BACKOFF_START;
                 if page.queue_id != active.queue_id {
                     set_queue_id(&queue_id, &page.queue_id);
@@ -599,30 +686,45 @@ async fn event_loop(
                 }
                 for event in page.events {
                     active.last_event_id = active.last_event_id.max(event.id);
-                    if event.event_type != "message" {
-                        continue;
-                    }
                     let Some(normalized) = normalize_event(&event.raw_json) else {
                         continue;
                     };
-                    if event_tx.send(Ok(normalized)).is_err() {
-                        delete_queue(&client, &queue_id).await;
-                        return;
+                    match send_event_bounded(&event_tx, Ok(normalized), &mut stop).await {
+                        EventSendOutcome::Sent => {}
+                        EventSendOutcome::Stopped => return,
+                        EventSendOutcome::Closed => {
+                            delete_queue(&client, &queue_id).await;
+                            return;
+                        }
                     }
                 }
             }
             Err(err) => {
                 failures += 1;
+                queue_errors += 1;
                 if failures >= EVENT_MAX_CONSECUTIVE_FAILURES {
-                    let _ =
-                        event_tx.send(Err(format!("Zulip event stream failed repeatedly: {err}")));
+                    let fatal = Err(format!("Zulip event stream failed repeatedly: {err}"));
+                    if send_event_bounded(&event_tx, fatal, &mut stop).await
+                        == EventSendOutcome::Stopped
+                    {
+                        return;
+                    }
                     delete_queue(&client, &queue_id).await;
                     return;
                 }
-                queue = None;
-                tokio::select! {
-                    _ = &mut stop => return,
-                    _ = tokio::time::sleep(backoff) => {}
+                // A transient failure keeps the queue and its cursor; retry the
+                // same queue after a bounded backoff. A server-rejected queue,
+                // or one that keeps failing, is replaced after deleting it: the
+                // replacement starts at a fresh server cursor, so events
+                // produced during the gap are not delivered (documented gap).
+                let unusable = err.to_string().contains("BAD_EVENT_QUEUE_ID");
+                if unusable || queue_errors >= EVENT_MAX_SAME_QUEUE_ERRORS {
+                    delete_queue(&client, &queue_id).await;
+                    queue = None;
+                    queue_errors = 0;
+                }
+                if !sleep_until_stopped(&mut stop, backoff).await {
+                    return;
                 }
                 backoff = (backoff * 2).min(EVENT_BACKOFF_MAX);
             }
@@ -653,5 +755,8 @@ async fn delete_queue(client: &ZulipClient, queue_id: &Arc<Mutex<Option<String>>
     let queue = queue_id.lock().ok().and_then(|queue| queue.clone());
     if let Some(queue) = queue {
         let _ = tokio::time::timeout(QUEUE_DELETE_TIMEOUT, client.delete_event_queue(&queue)).await;
+        if let Ok(mut current) = queue_id.lock() {
+            *current = None;
+        }
     }
 }

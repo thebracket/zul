@@ -25,7 +25,9 @@ struct Bridge {
 impl Bridge {
     /// Build a bridge. Explicit arguments override libzul's saved config and
     /// environment before any network request is attempted.
+    // The Python-facing constructor mirrors every optional queue-shaping knob.
     #[new]
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         base_url = "",
         email = "",
@@ -37,6 +39,7 @@ impl Bridge {
         queue_timeout_secs = None
     ))]
     fn new(
+        py: Python<'_>,
         base_url: &str,
         email: &str,
         api_key: &str,
@@ -45,16 +48,19 @@ impl Bridge {
         all_public_streams: bool,
         queue_timeout_secs: Option<u64>,
     ) -> PyResult<Self> {
-        let config = bridge::resolve_config(
-            base_url,
-            email,
-            api_key,
-            event_types,
-            narrow,
-            all_public_streams,
-            queue_timeout_secs,
-        )
-        .map_err(PyValueError::new_err)?;
+        let config = py
+            .detach(|| {
+                bridge::resolve_config(
+                    base_url,
+                    email,
+                    api_key,
+                    event_types,
+                    narrow,
+                    all_public_streams,
+                    queue_timeout_secs,
+                )
+            })
+            .map_err(PyValueError::new_err)?;
         let core = BridgeCore::new(config).map_err(PyRuntimeError::new_err)?;
         Ok(Self { core })
     }
@@ -139,7 +145,7 @@ impl Bridge {
 /// never included.
 #[pyfunction]
 fn config_status(py: Python<'_>) -> PyResult<Py<PyAny>> {
-    let status = bridge::config_status();
+    let status = py.detach(bridge::config_status);
     json_to_py(py, &status)
 }
 
