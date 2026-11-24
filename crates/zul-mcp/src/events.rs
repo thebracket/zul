@@ -12,7 +12,7 @@ use crate::protocol;
 use crate::tools::{cap_text_at, one_line};
 use chrono::Utc;
 use libzul::zulip::client::ZulipClient;
-use libzul::zulip::models::ZulipMessage;
+use libzul::zulip::models::{ZulipMessage, ZulipMessageType};
 use libzul::Settings;
 use serde_json::{json, Map, Value};
 
@@ -597,11 +597,9 @@ fn event_data(message: &ZulipMessage, realm: &str) -> Value {
 }
 
 fn message_type(message: &ZulipMessage) -> &'static str {
-    match message.raw_json.get("type").and_then(Value::as_str) {
-        Some("stream") => "stream",
-        Some("private") => "private",
-        _ if message.stream_id.is_some() => "stream",
-        _ => "private",
+    match message.message_type {
+        ZulipMessageType::Stream => "stream",
+        ZulipMessageType::Direct => "private",
     }
 }
 
@@ -703,9 +701,12 @@ mod tests {
     fn test_message(id: i64, timestamp: chrono::DateTime<Utc>) -> ZulipMessage {
         ZulipMessage {
             id,
+            message_type: ZulipMessageType::Stream,
             stream_id: Some(1),
             stream_name: "core".to_string(),
             topic: "ops".to_string(),
+            dm_conversation_key: None,
+            dm_participants: Vec::new(),
             sender_id: Some(2),
             sender_name: "Grace".to_string(),
             sender_email: Some("grace@example.com".to_string()),

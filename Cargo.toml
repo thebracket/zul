@@ -16,10 +16,11 @@ default-members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 
 [workspace.dependencies]
 anyhow = "1.0"
+arboard = "3.6"
 assert_cmd = "2.0"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
@@ -31,14 +32,14 @@ libzul = { path = "crates/libzul" }
 predicates = "3.1"
 ratatui = "0.30"
 ratatui-image = { version = "11.0", default-features = false, features = ["crossterm", "image-defaults"] }
-reqwest = { version = "0.13", default-features = false, features = ["form", "json", "query", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["form", "json", "multipart", "query", "rustls"] }
 rusqlite = { version = "0.40", features = ["bundled", "chrono"] }
 scraper = "0.24"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"
 tempfile = "3.10"
-tokio = { version = "1.39", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.39", features = ["macros", "rt-multi-thread", "sync", "time"] }
 toml = "1.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2.5"

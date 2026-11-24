@@ -1,9 +1,13 @@
-use crate::zulip::models::{ZulipMessage, ZulipStream, ZulipTopic};
+use crate::zulip::models::{
+    ZulipDirectConversation, ZulipDmParticipant, ZulipMessage, ZulipMessageType, ZulipStream,
+    ZulipTopic,
+};
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeZone, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -33,9 +37,12 @@ CREATE TABLE IF NOT EXISTS zulip_topics (
 
 CREATE TABLE IF NOT EXISTS zulip_messages (
     id INTEGER PRIMARY KEY,
+    message_type TEXT NOT NULL DEFAULT 'stream',
     stream_id INTEGER,
     stream_name TEXT NOT NULL,
     topic TEXT NOT NULL,
+    dm_conversation_key TEXT,
+    dm_participants_json TEXT NOT NULL DEFAULT '[]',
     sender_id INTEGER,
     sender_name TEXT NOT NULL,
     sender_email TEXT,
@@ -157,10 +164,35 @@ impl Cache {
 
     fn migrate(&self) -> Result<()> {
         self.conn.execute_batch(MIGRATION_001)?;
+        self.ensure_column(
+            "zulip_messages",
+            "message_type",
+            "ALTER TABLE zulip_messages ADD COLUMN message_type TEXT NOT NULL DEFAULT 'stream'",
+        )?;
+        self.ensure_column(
+            "zulip_messages",
+            "dm_conversation_key",
+            "ALTER TABLE zulip_messages ADD COLUMN dm_conversation_key TEXT",
+        )?;
+        self.ensure_column(
+            "zulip_messages",
+            "dm_participants_json",
+            "ALTER TABLE zulip_messages ADD COLUMN dm_participants_json TEXT NOT NULL DEFAULT '[]'",
+        )?;
         self.conn.execute(
-            "INSERT OR REPLACE INTO app_metadata (key, value) VALUES ('schema_version', '1')",
+            "INSERT OR REPLACE INTO app_metadata (key, value) VALUES ('schema_version', '2')",
             [],
         )?;
+        Ok(())
+    }
+
+    fn ensure_column(&self, table: &str, column: &str, alter_sql: &str) -> Result<()> {
+        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let columns = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        if !columns.iter().any(|name| name == column) {
+            self.conn.execute(alter_sql, [])?;
+        }
         Ok(())
     }
 
@@ -187,13 +219,17 @@ impl Cache {
         for message in messages {
             self.conn.execute(
                 "INSERT INTO zulip_messages (
-                    id, stream_id, stream_name, topic, sender_id, sender_name, sender_email,
-                    timestamp, rendered_html, plain_text, raw_json, permalink, fetched_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                    id, message_type, stream_id, stream_name, topic, dm_conversation_key,
+                    dm_participants_json, sender_id, sender_name, sender_email, timestamp,
+                    rendered_html, plain_text, raw_json, permalink, fetched_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
                  ON CONFLICT(id) DO UPDATE SET
+                    message_type=excluded.message_type,
                     stream_id=excluded.stream_id,
                     stream_name=excluded.stream_name,
                     topic=excluded.topic,
+                    dm_conversation_key=excluded.dm_conversation_key,
+                    dm_participants_json=excluded.dm_participants_json,
                     sender_id=excluded.sender_id,
                     sender_name=excluded.sender_name,
                     sender_email=excluded.sender_email,
@@ -205,9 +241,12 @@ impl Cache {
                     fetched_at=excluded.fetched_at",
                 params![
                     message.id,
+                    message.message_type.as_str(),
                     message.stream_id,
                     message.stream_name,
                     message.topic,
+                    &message.dm_conversation_key,
+                    serde_json::to_string(&message.dm_participants)?,
                     message.sender_id,
                     message.sender_name,
                     message.sender_email,
@@ -230,6 +269,7 @@ impl Cache {
             "INSERT INTO zulip_topics (stream_id, stream_name, name, message_count, last_message_at)
              SELECT COALESCE(stream_id, 0), stream_name, topic, COUNT(*), MAX(timestamp)
              FROM zulip_messages
+             WHERE message_type = 'stream'
              GROUP BY COALESCE(stream_id, 0), stream_name, topic",
             [],
         )?;
@@ -269,9 +309,11 @@ impl Cache {
     pub fn messages_for_topic(&self, stream: &str, topic: &str) -> Result<Vec<ZulipMessage>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, stream_id, stream_name, topic, sender_id, sender_name, sender_email,
-                    timestamp, rendered_html, plain_text, raw_json, permalink
+                    timestamp, rendered_html, plain_text, raw_json, permalink, message_type,
+                    dm_conversation_key, dm_participants_json
              FROM zulip_messages
              WHERE stream_name = ?1 AND topic = ?2
+                AND message_type = 'stream'
              ORDER BY timestamp ASC, id ASC",
         )?;
         let rows = stmt.query_map(params![stream, topic], message_from_row)?;
@@ -284,7 +326,8 @@ impl Cache {
         let cutoff = (Utc::now() - chrono::Duration::hours(hours)).timestamp();
         let mut stmt = self.conn.prepare(
             "SELECT id, stream_id, stream_name, topic, sender_id, sender_name, sender_email,
-                    timestamp, rendered_html, plain_text, raw_json, permalink
+                    timestamp, rendered_html, plain_text, raw_json, permalink, message_type,
+                    dm_conversation_key, dm_participants_json
              FROM zulip_messages
              WHERE timestamp >= ?1
              ORDER BY timestamp DESC, id DESC",
@@ -301,12 +344,41 @@ impl Cache {
             .map_err(Into::into)
     }
 
+    /// Return cached authored message IDs ordered by least-recently refreshed.
+    pub fn authored_message_ids_for_refresh(
+        &self,
+        sender_email: &str,
+        limit: usize,
+    ) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id
+             FROM zulip_messages
+             WHERE sender_email = ?1
+             ORDER BY fetched_at ASC, timestamp DESC, id DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![sender_email, limit as i64], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Mark cached message IDs as refreshed without changing their content.
+    pub fn mark_messages_refreshed(&self, message_ids: &[i64]) -> Result<()> {
+        let fetched_at = Utc::now().timestamp();
+        for message_id in message_ids {
+            self.conn.execute(
+                "UPDATE zulip_messages SET fetched_at = ?1 WHERE id = ?2",
+                params![fetched_at, message_id],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Search cached messages with SQLite FTS.
     pub fn search_messages(&self, query: &str) -> Result<Vec<ZulipMessage>> {
         let mut stmt = self.conn.prepare(
             "SELECT m.id, m.stream_id, m.stream_name, m.topic, m.sender_id, m.sender_name,
                     m.sender_email, m.timestamp, m.rendered_html, m.plain_text, m.raw_json,
-                    m.permalink
+                    m.permalink, m.message_type, m.dm_conversation_key, m.dm_participants_json
              FROM zulip_messages_fts f
              JOIN zulip_messages m ON m.id = f.rowid
              WHERE zulip_messages_fts MATCH ?1
@@ -326,7 +398,7 @@ impl Cache {
     pub fn stream_activity(&self) -> Result<Vec<StreamActivity>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT stream_name, COUNT(*) FROM zulip_messages GROUP BY stream_name")?;
+            .prepare("SELECT stream_name, COUNT(*) FROM zulip_messages WHERE message_type = 'stream' GROUP BY stream_name")?;
         let rows = stmt.query_map([], |row| {
             Ok(StreamActivity {
                 stream_name: row.get(0)?,
@@ -337,11 +409,150 @@ impl Cache {
         Ok(activity)
     }
 
+    /// Return unread cached message counts grouped by stream.
+    pub fn unread_stream_activity(&self) -> Result<Vec<StreamActivity>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.stream_name, COUNT(*)
+             FROM zulip_messages m
+             LEFT JOIN read_state r ON r.message_id = m.id AND r.read_at IS NOT NULL
+             WHERE m.message_type = 'stream' AND r.message_id IS NULL
+             GROUP BY m.stream_name",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(StreamActivity {
+                stream_name: row.get(0)?,
+                message_count: row.get(1)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Return the number of cached direct messages.
+    pub fn direct_message_count(&self) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM zulip_messages WHERE message_type = 'direct'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// Return the number of unread cached direct messages.
+    pub fn unread_direct_message_count(&self) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM zulip_messages m
+                 LEFT JOIN read_state r ON r.message_id = m.id AND r.read_at IS NOT NULL
+                 WHERE m.message_type = 'direct' AND r.message_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// Return unread message counts keyed by topic name for one stream.
+    pub fn unread_topic_counts(&self, stream: &str) -> Result<BTreeMap<String, i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.topic, COUNT(*)
+             FROM zulip_messages m
+             LEFT JOIN read_state r ON r.message_id = m.id AND r.read_at IS NOT NULL
+             WHERE m.stream_name = ?1
+                AND m.message_type = 'stream'
+                AND r.message_id IS NULL
+             GROUP BY m.topic",
+        )?;
+        let rows = stmt.query_map(params![stream], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<BTreeMap<_, _>>>()?)
+    }
+
+    /// Return unread message counts keyed by direct-conversation key.
+    pub fn unread_direct_conversation_counts(&self) -> Result<BTreeMap<String, i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.dm_conversation_key, COUNT(*)
+             FROM zulip_messages m
+             LEFT JOIN read_state r ON r.message_id = m.id AND r.read_at IS NOT NULL
+             WHERE m.message_type = 'direct'
+                AND m.dm_conversation_key IS NOT NULL
+                AND r.message_id IS NULL
+             GROUP BY m.dm_conversation_key",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<BTreeMap<_, _>>>()?)
+    }
+
+    /// Mark cached message IDs as read.
+    pub fn mark_messages_read(&self, message_ids: &[i64]) -> Result<()> {
+        let read_at = Utc::now().timestamp();
+        for message_id in message_ids {
+            self.conn.execute(
+                "INSERT INTO read_state (message_id, read_at)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(message_id) DO UPDATE SET read_at = excluded.read_at",
+                params![message_id, read_at],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Return the subset of message IDs that have been marked read.
+    pub fn read_message_ids(&self, message_ids: &[i64]) -> Result<BTreeSet<i64>> {
+        let mut read_ids = BTreeSet::new();
+        for message_id in message_ids {
+            let is_read = self
+                .conn
+                .query_row(
+                    "SELECT 1 FROM read_state WHERE message_id = ?1 AND read_at IS NOT NULL",
+                    params![message_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if is_read {
+                read_ids.insert(*message_id);
+            }
+        }
+        Ok(read_ids)
+    }
+
+    /// List cached direct-message conversations.
+    pub fn direct_conversations(&self) -> Result<Vec<ZulipDirectConversation>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT dm_conversation_key, MAX(dm_participants_json), COUNT(*), MAX(timestamp)
+             FROM zulip_messages
+             WHERE message_type = 'direct' AND dm_conversation_key IS NOT NULL
+             GROUP BY dm_conversation_key
+             ORDER BY MAX(timestamp) DESC, lower(MAX(topic))",
+        )?;
+        let rows = stmt.query_map([], direct_conversation_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// List cached messages for a direct-message conversation.
+    pub fn messages_for_direct_conversation(&self, key: &str) -> Result<Vec<ZulipMessage>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, stream_id, stream_name, topic, sender_id, sender_name, sender_email,
+                    timestamp, rendered_html, plain_text, raw_json, permalink, message_type,
+                    dm_conversation_key, dm_participants_json
+             FROM zulip_messages
+             WHERE message_type = 'direct' AND dm_conversation_key = ?1
+             ORDER BY timestamp ASC, id ASC",
+        )?;
+        let rows = stmt.query_map(params![key], message_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     fn search_messages_like(&self, query: &str) -> Result<Vec<ZulipMessage>> {
         let like = format!("%{}%", query);
         let mut stmt = self.conn.prepare(
             "SELECT id, stream_id, stream_name, topic, sender_id, sender_name, sender_email,
-                    timestamp, rendered_html, plain_text, raw_json, permalink
+                    timestamp, rendered_html, plain_text, raw_json, permalink, message_type,
+                    dm_conversation_key, dm_participants_json
              FROM zulip_messages
              WHERE plain_text LIKE ?1 OR sender_name LIKE ?1 OR stream_name LIKE ?1 OR topic LIKE ?1
              ORDER BY timestamp DESC
@@ -476,11 +687,16 @@ fn topic_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ZulipTopic> {
 
 fn message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ZulipMessage> {
     let raw_json: String = row.get(10)?;
+    let message_type = ZulipMessageType::from_cache(row.get::<_, String>(12)?.as_str());
+    let dm_participants_json: String = row.get(14)?;
     Ok(ZulipMessage {
         id: row.get(0)?,
+        message_type,
         stream_id: row.get(1)?,
         stream_name: row.get(2)?,
         topic: row.get(3)?,
+        dm_conversation_key: row.get(13)?,
+        dm_participants: serde_json::from_str(&dm_participants_json).unwrap_or_default(),
         sender_id: row.get(4)?,
         sender_name: row.get(5)?,
         sender_email: row.get(6)?,
@@ -489,6 +705,20 @@ fn message_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ZulipMessage> {
         plain_text: row.get(9)?,
         raw_json: serde_json::from_str(&raw_json).unwrap_or(serde_json::Value::Null),
         permalink: row.get(11)?,
+    })
+}
+
+fn direct_conversation_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<ZulipDirectConversation> {
+    let participants_json: String = row.get(1)?;
+    let last_message_at: Option<i64> = row.get(3)?;
+    Ok(ZulipDirectConversation {
+        key: row.get(0)?,
+        participants: serde_json::from_str::<Vec<ZulipDmParticipant>>(&participants_json)
+            .unwrap_or_default(),
+        message_count: row.get(2)?,
+        last_message_at: last_message_at.map(ts),
     })
 }
 
@@ -516,9 +746,12 @@ mod tests {
         cache
             .upsert_messages(&[ZulipMessage {
                 id: 9,
+                message_type: ZulipMessageType::Stream,
                 stream_id: Some(1),
                 stream_name: "core team".to_string(),
                 topic: "Release".to_string(),
+                dm_conversation_key: None,
+                dm_participants: Vec::new(),
                 sender_id: Some(2),
                 sender_name: "Ada".to_string(),
                 sender_email: Some("ada@example.com".to_string()),
@@ -537,8 +770,194 @@ mod tests {
     }
 
     #[test]
+    fn authored_refresh_queue_rotates_by_fetched_at() {
+        let cache = Cache::in_memory().unwrap();
+        cache
+            .upsert_messages(&[
+                test_message(1, "ada@example.com"),
+                test_message(2, "ada@example.com"),
+                test_message(3, "other@example.com"),
+            ])
+            .unwrap();
+        cache
+            .conn
+            .execute("UPDATE zulip_messages SET fetched_at = 100", [])
+            .unwrap();
+
+        assert_eq!(
+            cache
+                .authored_message_ids_for_refresh("ada@example.com", 10)
+                .unwrap(),
+            [2, 1]
+        );
+
+        cache.mark_messages_refreshed(&[2]).unwrap();
+
+        assert_eq!(
+            cache
+                .authored_message_ids_for_refresh("ada@example.com", 10)
+                .unwrap(),
+            [1, 2]
+        );
+    }
+
+    #[test]
     fn duplicate_hash_is_stable() {
         assert_eq!(send_hash("s", "t", "m"), send_hash("s", "t", "m"));
         assert_ne!(send_hash("s", "t", "m"), send_hash("s", "t", "m2"));
+    }
+
+    #[test]
+    fn direct_conversations_group_and_fetch_messages() {
+        let cache = Cache::in_memory().unwrap();
+        let participants = vec![ZulipDmParticipant {
+            id: Some(7),
+            name: "Ada".to_string(),
+            email: Some("ada@example.com".to_string()),
+        }];
+        cache
+            .upsert_messages(&[
+                direct_message(1, "id:7", participants.clone()),
+                direct_message(2, "id:7", participants.clone()),
+            ])
+            .unwrap();
+
+        let conversations = cache.direct_conversations().unwrap();
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].key, "id:7");
+        assert_eq!(conversations[0].message_count, 2);
+        assert_eq!(cache.direct_message_count().unwrap(), 2);
+        assert_eq!(
+            cache
+                .messages_for_direct_conversation("id:7")
+                .unwrap()
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+    }
+
+    #[test]
+    fn unread_counts_exclude_read_messages() {
+        let cache = Cache::in_memory().unwrap();
+        let participants = vec![ZulipDmParticipant {
+            id: Some(7),
+            name: "Ada".to_string(),
+            email: Some("ada@example.com".to_string()),
+        }];
+        cache
+            .upsert_messages(&[
+                test_message(1, "ada@example.com"),
+                test_message(2, "ada@example.com"),
+                direct_message(10, "id:7", participants.clone()),
+            ])
+            .unwrap();
+
+        assert_eq!(cache.unread_stream_activity().unwrap()[0].message_count, 2);
+        assert_eq!(
+            cache
+                .unread_topic_counts("core team")
+                .unwrap()
+                .get("Release"),
+            Some(&2)
+        );
+        assert_eq!(cache.unread_direct_message_count().unwrap(), 1);
+        assert_eq!(
+            cache
+                .unread_direct_conversation_counts()
+                .unwrap()
+                .get("id:7"),
+            Some(&1)
+        );
+
+        cache.mark_messages_read(&[1, 10]).unwrap();
+
+        assert_eq!(cache.unread_stream_activity().unwrap()[0].message_count, 1);
+        assert_eq!(
+            cache
+                .unread_topic_counts("core team")
+                .unwrap()
+                .get("Release"),
+            Some(&1)
+        );
+        assert_eq!(cache.unread_direct_message_count().unwrap(), 0);
+        assert!(cache
+            .unread_direct_conversation_counts()
+            .unwrap()
+            .get("id:7")
+            .is_none());
+        assert_eq!(cache.read_message_ids(&[1, 2, 10]).unwrap(), [1, 10].into());
+    }
+
+    #[test]
+    fn read_state_persists_after_reopening_cache() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("cache.sqlite");
+        {
+            let cache = Cache::open(&path).unwrap();
+            cache
+                .upsert_messages(&[
+                    test_message(1, "ada@example.com"),
+                    test_message(2, "ada@example.com"),
+                ])
+                .unwrap();
+            cache.mark_messages_read(&[1]).unwrap();
+        }
+
+        let cache = Cache::open(&path).unwrap();
+
+        assert_eq!(cache.read_message_ids(&[1, 2]).unwrap(), [1].into());
+        assert_eq!(
+            cache
+                .unread_topic_counts("core team")
+                .unwrap()
+                .get("Release"),
+            Some(&1)
+        );
+    }
+
+    fn test_message(id: i64, sender_email: &str) -> ZulipMessage {
+        ZulipMessage {
+            id,
+            message_type: ZulipMessageType::Stream,
+            stream_id: Some(1),
+            stream_name: "core team".to_string(),
+            topic: "Release".to_string(),
+            dm_conversation_key: None,
+            dm_participants: Vec::new(),
+            sender_id: Some(2),
+            sender_name: "Ada".to_string(),
+            sender_email: Some(sender_email.to_string()),
+            timestamp: Utc.timestamp_opt(1_700_000_000 + id, 0).unwrap(),
+            rendered_html: format!("<p>message {id}</p>"),
+            plain_text: format!("message {id}"),
+            permalink: Some(format!("https://example/{id}")),
+            raw_json: json!({"id": id}),
+        }
+    }
+
+    fn direct_message(id: i64, key: &str, participants: Vec<ZulipDmParticipant>) -> ZulipMessage {
+        ZulipMessage {
+            id,
+            message_type: ZulipMessageType::Direct,
+            stream_id: None,
+            stream_name: "Direct messages".to_string(),
+            topic: participants
+                .iter()
+                .map(|participant| participant.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            dm_conversation_key: Some(key.to_string()),
+            dm_participants: participants,
+            sender_id: Some(2),
+            sender_name: "Ada".to_string(),
+            sender_email: Some("ada@example.com".to_string()),
+            timestamp: Utc.timestamp_opt(1_700_000_000 + id, 0).unwrap(),
+            rendered_html: format!("<p>dm {id}</p>"),
+            plain_text: format!("dm {id}"),
+            permalink: Some(format!("https://example/{id}")),
+            raw_json: json!({"id": id}),
+        }
     }
 }

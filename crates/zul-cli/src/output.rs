@@ -1,11 +1,16 @@
 use anyhow::Result;
 use libzul::app::{ReplyResult, SyncResult};
 use libzul::digest::Digest;
-use libzul::zulip::models::{ZulipMessage, ZulipStream, ZulipTopic};
+use libzul::zulip::models::{ZulipMessage, ZulipMessageType, ZulipStream, ZulipTopic};
 use serde::Serialize;
 
 pub fn print_json<T: Serialize + ?Sized>(value: &T) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
+    Ok(())
+}
+
+pub fn print_json_line<T: Serialize + ?Sized>(value: &T) -> Result<()> {
+    println!("{}", serde_json::to_string(value)?);
     Ok(())
 }
 
@@ -24,13 +29,13 @@ impl PrintMode {
         }
         if result.offline {
             println!(
-                "Offline cache: {} streams, {} messages in last {}h",
-                result.streams, result.messages, result.hours
+                "Offline cache: {} streams, {} messages in last {}h, {} refreshed authored messages",
+                result.streams, result.messages, result.hours, result.refreshed_messages
             );
         } else {
             println!(
-                "Synced {} streams and {} recent messages ({}h)",
-                result.streams, result.messages, result.hours
+                "Synced {} streams, {} recent messages ({}h), and {} refreshed authored messages",
+                result.streams, result.messages, result.hours, result.refreshed_messages
             );
         }
         Ok(())
@@ -71,10 +76,9 @@ impl PrintMode {
         }
         for message in messages {
             println!(
-                "[{}] #{} > {} | {}: {}",
+                "[{}] {} | {}: {}",
                 message.id,
-                message.stream_name,
-                message.topic,
+                message_destination(message),
                 message.sender_name,
                 message.plain_text
             );
@@ -181,6 +185,14 @@ impl PrintMode {
             }
         }
         Ok(())
+    }
+}
+
+fn message_destination(message: &ZulipMessage) -> String {
+    if message.message_type == ZulipMessageType::Direct {
+        format!("DM: {}", message.topic)
+    } else {
+        format!("#{} > {}", message.stream_name, message.topic)
     }
 }
 

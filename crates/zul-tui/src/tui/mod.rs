@@ -1,16 +1,26 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use ego_tree::NodeRef;
 #[cfg(feature = "tui-images")]
 use image::ImageReader;
 use libzul::app::{App, PollResult};
-use libzul::config::{ImageMode, Settings, ThemeConfig};
+use libzul::config::{
+    CacheConfig, DigestConfig, ImageMode, SafetyConfig, Settings, ThemeConfig, UiConfig,
+    ZulipConfig,
+};
 use libzul::digest::{self, Digest};
-use libzul::zulip::models::{ImageAttachment, ImageBytes, ZulipMessage, ZulipStream, ZulipTopic};
+use libzul::zulip::client::ZulipClient;
+use libzul::zulip::models::{
+    ImageAttachment, ImageBytes, ZulipDirectConversation, ZulipMessage, ZulipMessageType,
+    ZulipStream, ZulipTopic,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -23,12 +33,15 @@ use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
 #[cfg(feature = "tui-images")]
 use ratatui_image::{Resize, StatefulImage};
-use std::collections::{BTreeMap, BTreeSet};
-#[cfg(feature = "tui-images")]
+use scraper::{ElementRef, Html, Node};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Cursor;
 use std::io::{self, Stdout};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const IMAGE_ROWS: u16 = 8;
@@ -57,15 +70,23 @@ enum Mode {
     ConfirmSend,
     Command,
     Auth,
+    Login,
+    Config,
+    Help,
 }
 
 struct TuiState {
     streams: Vec<ZulipStream>,
     topics: Vec<ZulipTopic>,
+    direct_conversations: Vec<ZulipDirectConversation>,
     messages: Vec<ZulipMessage>,
     search_results: Vec<ZulipMessage>,
     digest: Option<Digest>,
-    stream_activity: BTreeMap<String, i64>,
+    stream_unread_counts: BTreeMap<String, i64>,
+    direct_unread_count: i64,
+    topic_unread_counts: BTreeMap<String, i64>,
+    direct_unread_counts: BTreeMap<String, i64>,
+    read_message_ids: BTreeSet<i64>,
     stream_idx: usize,
     topic_idx: usize,
     message_idx: usize,
@@ -73,7 +94,8 @@ struct TuiState {
     focus: Focus,
     mode: Mode,
     input: String,
-    draft: String,
+    draft: TextEditor,
+    form: Option<ConfigForm>,
     status: String,
     last_poll_at: Option<DateTime<Utc>>,
     last_poll_new: usize,
@@ -89,19 +111,413 @@ struct ThreadImageEntry {
     error: Option<String>,
 }
 
+enum ReplyDestination {
+    Stream { stream: String, topic: String },
+    Direct(ZulipDirectConversation),
+}
+
+/// Raw Zulip credentials found in the process environment after dotenv loading.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StartupCredentials {
+    /// Zulip realm base URL from `ZULIP_BASE_URL` or `ZULIP_SITE`.
+    pub base_url: String,
+    /// Zulip email from `ZULIP_EMAIL`.
+    pub email: String,
+    /// Zulip API key from `ZULIP_API_KEY`.
+    pub api_key: String,
+}
+
+impl StartupCredentials {
+    /// Read startup credentials directly from the environment without defaults.
+    pub fn from_env() -> Self {
+        Self {
+            base_url: std::env::var("ZULIP_BASE_URL")
+                .or_else(|_| std::env::var("ZULIP_SITE"))
+                .unwrap_or_default(),
+            email: std::env::var("ZULIP_EMAIL").unwrap_or_default(),
+            api_key: std::env::var("ZULIP_API_KEY").unwrap_or_default(),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        !self.base_url.trim().is_empty()
+            && !self.email.trim().is_empty()
+            && !self.api_key.trim().is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigPurpose {
+    Login,
+    Config,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigField {
+    BaseUrl,
+    Email,
+    ApiKey,
+    CacheTtlMinutes,
+    SyncHours,
+    CachePath,
+    StartView,
+    Theme,
+    Images,
+    ReadOnlyByDefault,
+    ConfirmSends,
+    DigestAliases,
+}
+
+struct FormField {
+    key: ConfigField,
+    label: &'static str,
+    value: String,
+    secret: bool,
+}
+
+struct ConfigForm {
+    purpose: ConfigPurpose,
+    fields: Vec<FormField>,
+    selected: usize,
+    message: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TextEditor {
+    text: String,
+    cursor: usize,
+    preferred_column: Option<usize>,
+}
+
+impl TextEditor {
+    fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.text.clear();
+        self.cursor = 0;
+        self.preferred_column = None;
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        self.text.insert(self.cursor, ch);
+        self.cursor += ch.len_utf8();
+        self.preferred_column = None;
+    }
+
+    fn insert_str(&mut self, text: &str) {
+        self.text.insert_str(self.cursor, text);
+        self.cursor += text.len();
+        self.preferred_column = None;
+    }
+
+    fn insert_newline(&mut self) {
+        self.insert_char('\n');
+    }
+
+    fn backspace(&mut self) {
+        let Some(previous) = self.previous_grapheme_start() else {
+            return;
+        };
+        self.text.replace_range(previous..self.cursor, "");
+        self.cursor = previous;
+        self.preferred_column = None;
+    }
+
+    fn delete(&mut self) {
+        let Some(next) = self.next_grapheme_end() else {
+            return;
+        };
+        self.text.replace_range(self.cursor..next, "");
+        self.preferred_column = None;
+    }
+
+    fn move_left(&mut self) {
+        if let Some(previous) = self.previous_grapheme_start() {
+            self.cursor = previous;
+        }
+        self.preferred_column = None;
+    }
+
+    fn move_right(&mut self) {
+        if let Some(next) = self.next_grapheme_end() {
+            self.cursor = next;
+        }
+        self.preferred_column = None;
+    }
+
+    fn move_home(&mut self) {
+        self.cursor = self.current_line_start();
+        self.preferred_column = None;
+    }
+
+    fn move_end(&mut self) {
+        self.cursor = self.current_line_end();
+        self.preferred_column = None;
+    }
+
+    fn move_up(&mut self) {
+        let line_start = self.current_line_start();
+        if line_start == 0 {
+            self.cursor = 0;
+            self.preferred_column = Some(self.preferred_column.unwrap_or_else(|| self.column()));
+            return;
+        }
+        let preferred = self.preferred_column.unwrap_or_else(|| self.column());
+        let previous_end = line_start.saturating_sub(1);
+        let previous_start = self.text[..previous_end]
+            .rfind('\n')
+            .map(|idx| idx + 1)
+            .unwrap_or(0);
+        self.cursor = self.offset_for_column(previous_start, previous_end, preferred);
+        self.preferred_column = Some(preferred);
+    }
+
+    fn move_down(&mut self) {
+        let line_end = self.current_line_end();
+        if line_end >= self.text.len() {
+            self.preferred_column = Some(self.preferred_column.unwrap_or_else(|| self.column()));
+            return;
+        }
+        let preferred = self.preferred_column.unwrap_or_else(|| self.column());
+        let next_start = line_end + 1;
+        let next_end = self.text[next_start..]
+            .find('\n')
+            .map(|idx| next_start + idx)
+            .unwrap_or(self.text.len());
+        self.cursor = self.offset_for_column(next_start, next_end, preferred);
+        self.preferred_column = Some(preferred);
+    }
+
+    fn previous_grapheme_start(&self) -> Option<usize> {
+        self.text[..self.cursor]
+            .grapheme_indices(true)
+            .last()
+            .map(|(idx, _)| idx)
+    }
+
+    fn next_grapheme_end(&self) -> Option<usize> {
+        self.text[self.cursor..]
+            .graphemes(true)
+            .next()
+            .map(|grapheme| self.cursor + grapheme.len())
+    }
+
+    fn current_line_start(&self) -> usize {
+        self.text[..self.cursor]
+            .rfind('\n')
+            .map(|idx| idx + 1)
+            .unwrap_or(0)
+    }
+
+    fn current_line_end(&self) -> usize {
+        self.text[self.cursor..]
+            .find('\n')
+            .map(|idx| self.cursor + idx)
+            .unwrap_or(self.text.len())
+    }
+
+    fn column(&self) -> usize {
+        display_width(&self.text[self.current_line_start()..self.cursor])
+    }
+
+    fn offset_for_column(&self, line_start: usize, line_end: usize, target_column: usize) -> usize {
+        let line = &self.text[line_start..line_end];
+        let mut width = 0usize;
+        let mut offset = line_start;
+        for (idx, grapheme) in line.grapheme_indices(true) {
+            let grapheme_width = display_width(grapheme);
+            if width + grapheme_width > target_column {
+                break;
+            }
+            width += grapheme_width;
+            offset = line_start + idx + grapheme.len();
+            if width == target_column {
+                break;
+            }
+        }
+        offset
+    }
+}
+
+impl ConfigForm {
+    fn login(settings: &Settings) -> Self {
+        Self::login_with_values(
+            settings.zulip.base_url.clone().unwrap_or_default(),
+            settings.zulip.email.clone().unwrap_or_default(),
+            String::new(),
+        )
+    }
+
+    fn login_from_startup(credentials: &StartupCredentials) -> Self {
+        Self::login_with_values(
+            credentials.base_url.clone(),
+            credentials.email.clone(),
+            credentials.api_key.clone(),
+        )
+    }
+
+    fn login_with_values(base_url: String, email: String, api_key: String) -> Self {
+        Self {
+            purpose: ConfigPurpose::Login,
+            fields: vec![
+                FormField::new(ConfigField::BaseUrl, "Base URL", base_url),
+                FormField::new(ConfigField::Email, "Email", email),
+                FormField::secret(ConfigField::ApiKey, "API key", api_key),
+            ],
+            selected: 0,
+            message: "Enter Zulip credentials, then press Ctrl-S to save.".to_string(),
+        }
+    }
+
+    fn config(settings: &Settings) -> Self {
+        Self {
+            purpose: ConfigPurpose::Config,
+            fields: vec![
+                FormField::new(
+                    ConfigField::BaseUrl,
+                    "Base URL",
+                    settings.zulip.base_url.clone().unwrap_or_default(),
+                ),
+                FormField::new(
+                    ConfigField::Email,
+                    "Email",
+                    settings.zulip.email.clone().unwrap_or_default(),
+                ),
+                FormField::secret(ConfigField::ApiKey, "API key", String::new()),
+                FormField::new(
+                    ConfigField::CacheTtlMinutes,
+                    "Cache TTL minutes",
+                    settings.cache.ttl_minutes.to_string(),
+                ),
+                FormField::new(
+                    ConfigField::SyncHours,
+                    "Sync hours",
+                    settings.cache.default_sync_hours.to_string(),
+                ),
+                FormField::new(
+                    ConfigField::CachePath,
+                    "Cache path",
+                    settings
+                        .cache
+                        .path
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default(),
+                ),
+                FormField::new(
+                    ConfigField::StartView,
+                    "Start view",
+                    settings.ui.start_view.clone(),
+                ),
+                FormField::new(ConfigField::Theme, "Theme", settings.ui.theme.clone()),
+                FormField::new(
+                    ConfigField::Images,
+                    "Images",
+                    image_mode_value(settings.ui.images).to_string(),
+                ),
+                FormField::new(
+                    ConfigField::ReadOnlyByDefault,
+                    "Read only by default",
+                    settings.safety.read_only_by_default.to_string(),
+                ),
+                FormField::new(
+                    ConfigField::ConfirmSends,
+                    "Confirm sends",
+                    settings.safety.require_confirmation_for_sends.to_string(),
+                ),
+                FormField::new(
+                    ConfigField::DigestAliases,
+                    "Digest aliases",
+                    settings.digest.aliases.join(", "),
+                ),
+            ],
+            selected: 0,
+            message: "Edit values, then press Ctrl-S to save. Blank API key keeps the current key."
+                .to_string(),
+        }
+    }
+
+    fn selected_field_mut(&mut self) -> Option<&mut FormField> {
+        self.fields.get_mut(self.selected)
+    }
+
+    fn selected_field(&self) -> Option<&FormField> {
+        self.fields.get(self.selected)
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        self.selected = move_index(self.selected, self.fields.len(), delta);
+    }
+
+    fn value(&self, key: ConfigField) -> &str {
+        self.fields
+            .iter()
+            .find(|field| field.key == key)
+            .map(|field| field.value.as_str())
+            .unwrap_or("")
+    }
+}
+
+impl FormField {
+    fn new(key: ConfigField, label: &'static str, value: String) -> Self {
+        Self {
+            key,
+            label,
+            value,
+            secret: false,
+        }
+    }
+
+    fn secret(key: ConfigField, label: &'static str, value: String) -> Self {
+        Self {
+            key,
+            label,
+            value,
+            secret: true,
+        }
+    }
+
+    fn display_value(&self) -> String {
+        if self.secret && !self.value.is_empty() {
+            "*".repeat(self.value.graphemes(true).count())
+        } else {
+            self.value.clone()
+        }
+    }
+}
+
 impl TuiState {
     fn load(app: &App) -> Result<Self> {
+        Self::load_inner(app, None)
+    }
+
+    fn load_for_startup(app: &App, credentials: &StartupCredentials) -> Result<Self> {
+        Self::load_inner(app, Some(credentials))
+    }
+
+    fn load_inner(app: &App, startup_credentials: Option<&StartupCredentials>) -> Result<Self> {
         let mut state = Self {
             streams: app.streams()?,
             topics: Vec::new(),
+            direct_conversations: Vec::new(),
             messages: Vec::new(),
             search_results: Vec::new(),
             digest: None,
-            stream_activity: app
-                .stream_activity()?
+            stream_unread_counts: app
+                .unread_stream_activity()?
                 .into_iter()
                 .map(|activity| (activity.stream_name, activity.message_count))
                 .collect(),
+            direct_unread_count: app.unread_direct_message_count()?,
+            topic_unread_counts: BTreeMap::new(),
+            direct_unread_counts: BTreeMap::new(),
+            read_message_ids: BTreeSet::new(),
             stream_idx: 0,
             topic_idx: 0,
             message_idx: 0,
@@ -109,7 +525,8 @@ impl TuiState {
             focus: Focus::Streams,
             mode: Mode::Browser,
             input: String::new(),
-            draft: String::new(),
+            draft: TextEditor::default(),
+            form: None,
             status: "cache ready".to_string(),
             last_poll_at: None,
             last_poll_new: 0,
@@ -120,13 +537,32 @@ impl TuiState {
         state.reload_topics(app)?;
         state.reload_messages(app)?;
         state.select_latest_message();
+        state.mark_selected_thread_read_if_at_end(app)?;
+        if let Some(credentials) =
+            startup_credentials.filter(|credentials| !credentials.is_complete())
+        {
+            state.form = Some(ConfigForm::login_from_startup(credentials));
+            state.mode = Mode::Login;
+            state.status = "credentials required".to_string();
+        } else if !app.settings().auth_problems().is_empty() {
+            state.form = Some(ConfigForm::login(app.settings()));
+            state.mode = Mode::Login;
+            state.status = "credentials required".to_string();
+        }
         Ok(state)
     }
 
     fn selected_stream(&self) -> Option<&str> {
+        if self.selected_direct_messages() {
+            return None;
+        }
         self.streams
             .get(self.stream_idx)
             .map(|stream| stream.name.as_str())
+    }
+
+    fn selected_direct_messages(&self) -> bool {
+        self.stream_idx == self.streams.len()
     }
 
     fn selected_topic(&self) -> Option<&str> {
@@ -135,21 +571,53 @@ impl TuiState {
             .map(|topic| topic.name.as_str())
     }
 
+    fn selected_direct_conversation(&self) -> Option<&ZulipDirectConversation> {
+        self.selected_direct_messages()
+            .then(|| self.direct_conversations.get(self.topic_idx))
+            .flatten()
+    }
+
+    fn middle_len(&self) -> usize {
+        if self.selected_direct_messages() {
+            self.direct_conversations.len()
+        } else {
+            self.topics.len()
+        }
+    }
+
     fn reload_topics(&mut self, app: &App) -> Result<()> {
-        self.topics = match self.selected_stream() {
-            Some(stream) => app.topics(stream)?,
-            None => Vec::new(),
-        };
-        self.topic_idx = self.topic_idx.min(self.topics.len().saturating_sub(1));
+        if self.selected_direct_messages() {
+            self.topics = Vec::new();
+            self.direct_conversations = app.direct_conversations()?;
+            self.topic_unread_counts.clear();
+            self.direct_unread_counts = app.unread_direct_conversation_counts()?;
+        } else {
+            self.direct_conversations = Vec::new();
+            self.topics = match self.selected_stream() {
+                Some(stream) => app.topics(stream)?,
+                None => Vec::new(),
+            };
+            self.topic_unread_counts = match self.selected_stream() {
+                Some(stream) => app.unread_topic_counts(stream)?,
+                None => BTreeMap::new(),
+            };
+            self.direct_unread_counts.clear();
+        }
+        self.topic_idx = self.topic_idx.min(self.middle_len().saturating_sub(1));
         Ok(())
     }
 
     fn reload_messages(&mut self, app: &App) -> Result<()> {
-        self.messages = match (self.selected_stream(), self.selected_topic()) {
-            (Some(stream), Some(topic)) => app.topic(stream, topic)?,
-            _ => Vec::new(),
+        self.messages = if let Some(conversation) = self.selected_direct_conversation() {
+            app.direct_conversation(&conversation.key)?
+        } else {
+            match (self.selected_stream(), self.selected_topic()) {
+                (Some(stream), Some(topic)) => app.topic(stream, topic)?,
+                _ => Vec::new(),
+            }
         };
         self.message_idx = self.message_idx.min(self.messages.len().saturating_sub(1));
+        self.refresh_message_read_status(app)?;
         Ok(())
     }
 
@@ -160,21 +628,24 @@ impl TuiState {
     fn move_selection(&mut self, delta: isize, app: &App) -> Result<()> {
         match self.focus {
             Focus::Streams => {
-                self.stream_idx = move_index(self.stream_idx, self.streams.len(), delta);
+                self.stream_idx = move_index(self.stream_idx, self.streams.len() + 1, delta);
                 self.topic_idx = 0;
                 self.message_idx = 0;
                 self.reload_topics(app)?;
                 self.reload_messages(app)?;
                 self.select_latest_message();
+                self.mark_selected_thread_read_if_at_end(app)?;
             }
             Focus::Topics => {
-                self.topic_idx = move_index(self.topic_idx, self.topics.len(), delta);
+                self.topic_idx = move_index(self.topic_idx, self.middle_len(), delta);
                 self.message_idx = 0;
                 self.reload_messages(app)?;
                 self.select_latest_message();
+                self.mark_selected_thread_read_if_at_end(app)?;
             }
             Focus::Thread => {
                 self.message_idx = move_index(self.message_idx, self.messages.len(), delta);
+                self.mark_selected_thread_read_if_at_end(app)?;
             }
         }
         Ok(())
@@ -184,36 +655,54 @@ impl TuiState {
         self.messages.is_empty() || self.message_idx >= self.messages.len().saturating_sub(1)
     }
 
-    fn refresh_from_cache(&mut self, app: &App, follow_if_was_at_end: bool) -> Result<()> {
+    fn refresh_from_cache(&mut self, app: &App) -> Result<()> {
         let selected_stream = self.selected_stream().map(ToString::to_string);
         let selected_topic = self.selected_topic().map(ToString::to_string);
+        let selected_direct = self.selected_direct_messages();
+        let selected_direct_key = self
+            .selected_direct_conversation()
+            .map(|conversation| conversation.key.clone());
         let selected_message_id = self
             .messages
             .get(self.message_idx)
             .map(|message| message.id);
 
         self.streams = app.streams()?;
-        self.stream_activity = app
-            .stream_activity()?
+        self.stream_unread_counts = app
+            .unread_stream_activity()?
             .into_iter()
             .map(|activity| (activity.stream_name, activity.message_count))
             .collect();
+        self.direct_unread_count = app.unread_direct_message_count()?;
 
-        self.stream_idx = selected_stream
-            .as_ref()
-            .and_then(|name| self.streams.iter().position(|stream| &stream.name == name))
-            .unwrap_or_else(|| self.stream_idx.min(self.streams.len().saturating_sub(1)));
+        self.stream_idx = if selected_direct {
+            self.streams.len()
+        } else {
+            selected_stream
+                .as_ref()
+                .and_then(|name| self.streams.iter().position(|stream| &stream.name == name))
+                .unwrap_or_else(|| self.stream_idx.min(self.streams.len()))
+        };
 
         self.reload_topics(app)?;
-        self.topic_idx = selected_topic
-            .as_ref()
-            .and_then(|name| self.topics.iter().position(|topic| &topic.name == name))
-            .unwrap_or_else(|| self.topic_idx.min(self.topics.len().saturating_sub(1)));
+        self.topic_idx = if selected_direct {
+            selected_direct_key
+                .as_ref()
+                .and_then(|key| {
+                    self.direct_conversations
+                        .iter()
+                        .position(|conversation| &conversation.key == key)
+                })
+                .unwrap_or_else(|| self.topic_idx.min(self.middle_len().saturating_sub(1)))
+        } else {
+            selected_topic
+                .as_ref()
+                .and_then(|name| self.topics.iter().position(|topic| &topic.name == name))
+                .unwrap_or_else(|| self.topic_idx.min(self.middle_len().saturating_sub(1)))
+        };
 
         self.reload_messages(app)?;
-        if follow_if_was_at_end {
-            self.message_idx = self.messages.len().saturating_sub(1);
-        } else if let Some(message_id) = selected_message_id {
+        if let Some(message_id) = selected_message_id {
             self.message_idx = self
                 .messages
                 .iter()
@@ -222,8 +711,54 @@ impl TuiState {
         } else {
             self.message_idx = self.message_idx.min(self.messages.len().saturating_sub(1));
         }
+        self.refresh_message_read_status(app)?;
+        self.mark_selected_thread_read_if_at_end(app)?;
 
         Ok(())
+    }
+
+    fn refresh_unread_counts(&mut self, app: &App) -> Result<()> {
+        self.stream_unread_counts = app
+            .unread_stream_activity()?
+            .into_iter()
+            .map(|activity| (activity.stream_name, activity.message_count))
+            .collect();
+        self.direct_unread_count = app.unread_direct_message_count()?;
+        if self.selected_direct_messages() {
+            self.topic_unread_counts.clear();
+            self.direct_unread_counts = app.unread_direct_conversation_counts()?;
+        } else {
+            self.direct_unread_counts.clear();
+            self.topic_unread_counts = match self.selected_stream() {
+                Some(stream) => app.unread_topic_counts(stream)?,
+                None => BTreeMap::new(),
+            };
+        }
+        Ok(())
+    }
+
+    fn refresh_message_read_status(&mut self, app: &App) -> Result<()> {
+        let message_ids = self
+            .messages
+            .iter()
+            .map(|message| message.id)
+            .collect::<Vec<_>>();
+        self.read_message_ids = app.read_message_ids(&message_ids)?;
+        Ok(())
+    }
+
+    fn mark_selected_thread_read_if_at_end(&mut self, app: &App) -> Result<()> {
+        if !self.thread_at_end() {
+            return Ok(());
+        }
+        let message_ids = self
+            .messages
+            .iter()
+            .map(|message| message.id)
+            .collect::<Vec<_>>();
+        app.mark_messages_read(&message_ids)?;
+        self.refresh_message_read_status(app)?;
+        self.refresh_unread_counts(app)
     }
 
     fn focus_left(&mut self) {
@@ -244,21 +779,30 @@ impl TuiState {
 }
 
 pub async fn run(app: App) -> Result<()> {
+    run_with_startup_credentials(app, StartupCredentials::from_env()).await
+}
+
+/// Run the TUI using an already captured startup credential snapshot.
+pub async fn run_with_startup_credentials(
+    app: App,
+    startup_credentials: StartupCredentials,
+) -> Result<()> {
     let theme = TuiTheme::resolve(app.settings())?;
     let mut terminal = setup_terminal()?;
     let image_picker = detect_image_picker(app.settings());
-    let result = run_loop(&mut terminal, app, theme, image_picker).await;
+    let result = run_loop(&mut terminal, app, theme, image_picker, startup_credentials).await;
     restore_terminal(&mut terminal)?;
     result
 }
 
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    app: App,
-    theme: TuiTheme,
-    image_picker: Option<ImagePicker>,
+    mut app: App,
+    mut theme: TuiTheme,
+    mut image_picker: Option<ImagePicker>,
+    startup_credentials: StartupCredentials,
 ) -> Result<()> {
-    let mut state = TuiState::load(&app)?;
+    let mut state = TuiState::load_for_startup(&app, &startup_credentials)?;
     let (poll_tx, poll_rx) = mpsc::channel();
     let (image_tx, image_rx) = mpsc::channel();
     let mut next_poll_at = Instant::now() + POLL_INTERVAL;
@@ -267,71 +811,91 @@ async fn run_loop(
     loop {
         drain_poll_events(&poll_rx, &mut poll_inflight, &mut state, &app)?;
         drain_image_events(&image_rx, &mut state, image_picker.as_ref());
-        if !app.offline() && !poll_inflight && Instant::now() >= next_poll_at {
+        if state.mode != Mode::Login
+            && !app.offline()
+            && !poll_inflight
+            && Instant::now() >= next_poll_at
+        {
             state.status = "polling Zulip...".to_string();
             spawn_poll(app.settings().clone(), app.offline(), poll_tx.clone());
             poll_inflight = true;
             next_poll_at = Instant::now() + POLL_INTERVAL;
         }
-        maybe_spawn_selected_image_fetch(
-            &mut state,
-            &app,
-            image_tx.clone(),
-            image_picker.as_ref().is_some(),
-        );
+        if state.mode != Mode::Login {
+            maybe_spawn_selected_image_fetch(
+                &mut state,
+                &app,
+                image_tx.clone(),
+                image_picker.as_ref().is_some(),
+            );
+        }
 
         terminal.draw(|frame| draw(frame, &mut state, &app, &theme, image_picker.as_ref()))?;
         if !event::poll(Duration::from_millis(150))? {
             continue;
         }
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
-        if handle_key(key, &mut state, &app).await? {
-            break;
+        match event::read()? {
+            Event::Key(key) => {
+                if handle_key(key, &mut state, &mut app, &mut theme, &mut image_picker).await? {
+                    break;
+                }
+            }
+            Event::Paste(text) => handle_paste(text, &mut state),
+            _ => {}
         }
     }
     Ok(())
 }
 
-async fn handle_key(key: KeyEvent, state: &mut TuiState, app: &App) -> Result<bool> {
+async fn handle_key(
+    key: KeyEvent,
+    state: &mut TuiState,
+    app: &mut App,
+    theme: &mut TuiTheme,
+    image_picker: &mut Option<ImagePicker>,
+) -> Result<bool> {
     match state.mode {
         Mode::SearchInput | Mode::Command | Mode::Composer => {
             return handle_input_key(key, state, app).await;
         }
-        Mode::SearchResults | Mode::Digest | Mode::Auth => {
+        Mode::SearchResults | Mode::Digest | Mode::Auth | Mode::Help => {
             return handle_scrollable_mode_key(key, state);
+        }
+        Mode::Login | Mode::Config => {
+            return handle_config_key(key, state, app, theme, image_picker).await;
         }
         Mode::ConfirmSend => {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    let Some(stream) = state.selected_stream().map(ToString::to_string) else {
-                        state.status = "no stream selected".to_string();
+                    let Some(destination) = selected_reply_destination(state) else {
+                        state.status = "no conversation selected".to_string();
                         state.mode = Mode::Browser;
                         return Ok(false);
                     };
-                    let Some(topic) = state.selected_topic().map(ToString::to_string) else {
-                        state.status = "no topic selected".to_string();
-                        state.mode = Mode::Browser;
-                        return Ok(false);
+                    let draft = state.draft.as_str().to_string();
+                    let send_result = match destination {
+                        ReplyDestination::Stream { stream, topic } => {
+                            app.reply(&stream, &topic, &draft, false, true).await
+                        }
+                        ReplyDestination::Direct(conversation) => {
+                            app.reply_direct(&conversation, &draft, false, true).await
+                        }
                     };
-                    let draft = state.draft.clone();
-                    match app.reply(&stream, &topic, &draft, false, true).await {
+                    match send_result {
                         Ok(_) => {
-                            let was_at_end = state.thread_at_end();
                             match app.poll_new_messages().await {
                                 Ok(result) => {
-                                    state.refresh_from_cache(app, true)?;
+                                    state.refresh_from_cache(app)?;
                                     state.last_poll_at = Some(Utc::now());
                                     state.last_poll_new = result.new_messages;
                                     state.poll_error = None;
-                                    state.status =
-                                        format!("sent draft; {} new messages", result.new_messages);
+                                    state.status = format!(
+                                        "sent draft; {} new messages, {} refreshed",
+                                        result.new_messages, result.refreshed_messages
+                                    );
                                 }
                                 Err(err) => {
-                                    if was_at_end {
-                                        state.refresh_from_cache(app, true)?;
-                                    }
+                                    state.refresh_from_cache(app)?;
                                     state.status = format!("sent draft; refresh failed: {err}");
                                 }
                             }
@@ -385,8 +949,7 @@ async fn handle_key(key: KeyEvent, state: &mut TuiState, app: &App) -> Result<bo
         }
         KeyCode::Char('R') => match app.sync(app.settings().cache.default_sync_hours).await {
             Ok(sync) => {
-                let was_at_end = state.thread_at_end();
-                state.refresh_from_cache(app, was_at_end)?;
+                state.refresh_from_cache(app)?;
                 state.status = format!("synced {} messages", sync.messages);
             }
             Err(err) => state.status = format!("sync failed: {err}"),
@@ -402,6 +965,18 @@ async fn handle_key(key: KeyEvent, state: &mut TuiState, app: &App) -> Result<bo
         KeyCode::Char('a') => {
             state.popup_scroll = 0;
             state.mode = Mode::Auth;
+        }
+        KeyCode::Char('c') => {
+            state.form = Some(ConfigForm::config(app.settings()));
+            state.popup_scroll = 0;
+            state.mode = Mode::Config;
+        }
+        KeyCode::Char('?') => {
+            state.popup_scroll = 0;
+            state.mode = Mode::Help;
+        }
+        KeyCode::Char('L') => {
+            logout(state, app, theme, image_picker)?;
         }
         KeyCode::Char('d') => {
             state.digest = Some(digest::build_digest(
@@ -427,13 +1002,15 @@ fn drain_poll_events(
         *poll_inflight = false;
         match event {
             Ok(result) => {
-                let was_at_end = state.thread_at_end();
-                state.refresh_from_cache(app, was_at_end)?;
+                state.refresh_from_cache(app)?;
                 state.last_poll_at = Some(Utc::now());
                 state.last_poll_new = result.new_messages;
                 state.poll_error = None;
                 if result.new_messages > 0 {
                     state.status = format!("{} new messages", result.new_messages);
+                } else if result.refreshed_messages > 0 {
+                    state.status =
+                        format!("{} authored messages refreshed", result.refreshed_messages);
                 } else if state.status == "polling Zulip..." {
                     state.status = "no new messages".to_string();
                 }
@@ -461,15 +1038,33 @@ fn detect_image_picker(settings: &Settings) -> Option<ImagePicker> {
     if settings.ui.images != ImageMode::Auto {
         return None;
     }
-    let Ok(picker) = Picker::from_query_stdio() else {
+    let Ok(mut picker) = Picker::from_query_stdio() else {
         return None;
     };
+    if terminal_env_prefers_iterm2_protocol(
+        std::env::var("TERM_PROGRAM").ok().as_deref(),
+        std::env::var("LC_TERMINAL").ok().as_deref(),
+        std::env::var("ITERM_SESSION_ID").ok().as_deref(),
+    ) {
+        picker.set_protocol_type(ProtocolType::Iterm2);
+    }
     (picker.protocol_type() != ProtocolType::Halfblocks).then_some(picker)
 }
 
 #[cfg(not(feature = "tui-images"))]
 fn detect_image_picker(_settings: &Settings) -> Option<ImagePicker> {
     None
+}
+
+#[cfg(feature = "tui-images")]
+fn terminal_env_prefers_iterm2_protocol(
+    term_program: Option<&str>,
+    lc_terminal: Option<&str>,
+    iterm_session_id: Option<&str>,
+) -> bool {
+    term_program.is_some_and(|value| value.contains("iTerm"))
+        || lc_terminal.is_some_and(|value| value.contains("iTerm"))
+        || iterm_session_id.is_some_and(|value| !value.is_empty())
 }
 
 #[cfg(feature = "tui-images")]
@@ -562,11 +1157,33 @@ fn maybe_spawn_selected_image_fetch(
 }
 
 async fn handle_input_key(key: KeyEvent, state: &mut TuiState, app: &App) -> Result<bool> {
-    let target = if state.mode == Mode::Composer {
-        &mut state.draft
-    } else {
-        &mut state.input
-    };
+    if state.mode == Mode::Composer {
+        match key.code {
+            KeyCode::Esc => state.mode = Mode::Browser,
+            KeyCode::Backspace => state.draft.backspace(),
+            KeyCode::Delete => state.draft.delete(),
+            KeyCode::Left => state.draft.move_left(),
+            KeyCode::Right => state.draft.move_right(),
+            KeyCode::Up => state.draft.move_up(),
+            KeyCode::Down => state.draft.move_down(),
+            KeyCode::Home => state.draft.move_home(),
+            KeyCode::End => state.draft.move_end(),
+            KeyCode::Enter => state.draft.insert_newline(),
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if !state.draft.as_str().trim().is_empty() {
+                    state.mode = Mode::ConfirmSend;
+                }
+            }
+            KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                paste_from_clipboard(state, app).await;
+            }
+            KeyCode::Char(c) => state.draft.insert_char(c),
+            _ => {}
+        }
+        return Ok(false);
+    }
+
+    let target = &mut state.input;
     match key.code {
         KeyCode::Esc => state.mode = Mode::Browser,
         KeyCode::Backspace => {
@@ -580,20 +1197,375 @@ async fn handle_input_key(key: KeyEvent, state: &mut TuiState, app: &App) -> Res
                 state.mode = Mode::SearchResults;
             }
             Mode::Command => run_command(state, app).await?,
-            Mode::Composer => {
-                target.push('\n');
-            }
             _ => {}
         },
-        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if state.mode == Mode::Composer && !state.draft.trim().is_empty() {
-                state.mode = Mode::ConfirmSend;
-            }
-        }
         KeyCode::Char(c) => target.push(c),
         _ => {}
     }
     Ok(false)
+}
+
+fn handle_paste(text: String, state: &mut TuiState) {
+    if state.mode == Mode::Composer {
+        state.draft.insert_str(&text);
+    }
+}
+
+async fn paste_from_clipboard(state: &mut TuiState, app: &App) {
+    match clipboard_payload() {
+        Ok(ClipboardPayload::Image {
+            filename,
+            content_type,
+            bytes,
+        }) => match app.upload_file_bytes(&filename, &content_type, bytes).await {
+            Ok(uploaded) => {
+                let markdown = App::uploaded_file_markdown(&uploaded);
+                state.draft.insert_str(&markdown);
+                state.status = format!("pasted image {}", uploaded.filename);
+            }
+            Err(err) => state.status = format!("image paste failed: {err}"),
+        },
+        Ok(ClipboardPayload::Text(text)) => {
+            state.draft.insert_str(&text);
+            state.status = "pasted text".to_string();
+        }
+        Err(err) => state.status = format!("paste failed: {err}"),
+    }
+}
+
+enum ClipboardPayload {
+    Image {
+        filename: String,
+        content_type: String,
+        bytes: Vec<u8>,
+    },
+    Text(String),
+}
+
+fn clipboard_payload() -> Result<ClipboardPayload> {
+    let mut clipboard = arboard::Clipboard::new().context("opening clipboard")?;
+    if let Ok(image) = clipboard.get_image() {
+        return Ok(ClipboardPayload::Image {
+            filename: "clipboard.png".to_string(),
+            content_type: "image/png".to_string(),
+            bytes: encode_clipboard_image_png(&image)?,
+        });
+    }
+    let text = clipboard.get_text().context("reading clipboard text")?;
+    Ok(ClipboardPayload::Text(text))
+}
+
+fn encode_clipboard_image_png(image: &arboard::ImageData<'_>) -> Result<Vec<u8>> {
+    let Some(buffer) = image::RgbaImage::from_raw(
+        image.width as u32,
+        image.height as u32,
+        image.bytes.to_vec(),
+    ) else {
+        anyhow::bail!("clipboard image bytes did not match dimensions");
+    };
+    let mut bytes = Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(buffer)
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .context("encoding clipboard image")?;
+    Ok(bytes.into_inner())
+}
+
+async fn handle_config_key(
+    key: KeyEvent,
+    state: &mut TuiState,
+    app: &mut App,
+    theme: &mut TuiTheme,
+    image_picker: &mut Option<ImagePicker>,
+) -> Result<bool> {
+    let Some(form) = state.form.as_mut() else {
+        state.form = Some(if state.mode == Mode::Login {
+            ConfigForm::login(app.settings())
+        } else {
+            ConfigForm::config(app.settings())
+        });
+        return Ok(false);
+    };
+    match key.code {
+        KeyCode::Esc => {
+            if form.purpose == ConfigPurpose::Login {
+                form.message = "Credentials are required before opening the browser.".to_string();
+            } else {
+                state.mode = Mode::Browser;
+                state.popup_scroll = 0;
+            }
+        }
+        KeyCode::Tab | KeyCode::Down => form.move_selection(1),
+        KeyCode::BackTab | KeyCode::Up => form.move_selection(-1),
+        KeyCode::Right => cycle_theme_field(form, app.settings(), 1),
+        KeyCode::Left => cycle_theme_field(form, app.settings(), -1),
+        KeyCode::Backspace => {
+            if let Some(field) = form.selected_field_mut() {
+                field.value.pop();
+            }
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(field) = form.selected_field_mut() {
+                field.value.clear();
+            }
+        }
+        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Err(err) = save_config_form(state, app, theme, image_picker).await {
+                if let Some(form) = state.form.as_mut() {
+                    form.message = format!("Save failed: {err}");
+                } else {
+                    state.status = format!("save failed: {err}");
+                }
+            }
+        }
+        KeyCode::Enter => {
+            if let Err(err) = save_config_form(state, app, theme, image_picker).await {
+                if let Some(form) = state.form.as_mut() {
+                    form.message = format!("Save failed: {err}");
+                } else {
+                    state.status = format!("save failed: {err}");
+                }
+            }
+        }
+        KeyCode::Char(c) => {
+            if let Some(field) = form.selected_field_mut() {
+                field.value.push(c);
+            }
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+async fn save_config_form(
+    state: &mut TuiState,
+    app: &mut App,
+    theme: &mut TuiTheme,
+    image_picker: &mut Option<ImagePicker>,
+) -> Result<()> {
+    let form = state
+        .form
+        .as_ref()
+        .context("configuration form is not active")?;
+    let purpose = form.purpose;
+    let mut settings = app.settings().clone();
+    let base_url = required_value(form, ConfigField::BaseUrl, "base URL")?
+        .trim_end_matches('/')
+        .to_string();
+    let email = required_value(form, ConfigField::Email, "email")?;
+    let api_key_input = form.value(ConfigField::ApiKey).trim().to_string();
+    let current_api_key = settings.zulip.api_key.clone().unwrap_or_default();
+    let api_key = if api_key_input.is_empty() && purpose == ConfigPurpose::Config {
+        current_api_key
+    } else {
+        api_key_input.clone()
+    };
+    if api_key.trim().is_empty() {
+        anyhow::bail!("API key is required");
+    }
+
+    settings.zulip = ZulipConfig {
+        base_url: Some(base_url),
+        email: Some(email),
+        api_key: Some(api_key.clone()),
+    };
+
+    if purpose == ConfigPurpose::Config {
+        settings.cache = CacheConfig {
+            ttl_minutes: positive_i64(form.value(ConfigField::CacheTtlMinutes), "cache TTL")?,
+            default_sync_hours: positive_i64(form.value(ConfigField::SyncHours), "sync hours")?,
+            path: optional_path(form.value(ConfigField::CachePath)),
+        };
+        settings.ui = UiConfig {
+            start_view: nonempty_or_default(form.value(ConfigField::StartView), "streams"),
+            theme: nonempty_or_default(form.value(ConfigField::Theme), "zenburn"),
+            images: parse_image_mode(form.value(ConfigField::Images))?,
+        };
+        settings.safety = SafetyConfig {
+            read_only_by_default: parse_bool(
+                form.value(ConfigField::ReadOnlyByDefault),
+                "read only by default",
+            )?,
+            require_confirmation_for_sends: parse_bool(
+                form.value(ConfigField::ConfirmSends),
+                "confirm sends",
+            )?,
+        };
+        settings.digest = DigestConfig {
+            aliases: split_aliases(form.value(ConfigField::DigestAliases)),
+        };
+    }
+
+    validate_credentials(&settings, app.offline()).await?;
+    settings.save_without_secret()?;
+    if purpose == ConfigPurpose::Login || !api_key_input.is_empty() {
+        settings.save_api_key(&api_key)?;
+    }
+    reload_app(state, app, theme, image_picker, "configuration saved")?;
+    Ok(())
+}
+
+fn reload_app(
+    state: &mut TuiState,
+    app: &mut App,
+    theme: &mut TuiTheme,
+    image_picker: &mut Option<ImagePicker>,
+    status: &str,
+) -> Result<()> {
+    let offline = app.offline();
+    let settings = Settings::load()?;
+    *app = App::open(settings, offline)?;
+    *theme = TuiTheme::resolve(app.settings())?;
+    *image_picker = detect_image_picker(app.settings());
+    *state = TuiState::load(app)?;
+    state.status = status.to_string();
+    Ok(())
+}
+
+fn logout(
+    state: &mut TuiState,
+    app: &mut App,
+    theme: &mut TuiTheme,
+    image_picker: &mut Option<ImagePicker>,
+) -> Result<()> {
+    let mut settings = app.settings().clone();
+    settings.clear_local_auth()?;
+    reload_app(state, app, theme, image_picker, "local credentials cleared")?;
+    if app.settings().auth_problems().is_empty() && env_auth_present() {
+        state.status =
+            "local credentials cleared; environment credentials are still active".to_string();
+    }
+    Ok(())
+}
+
+async fn validate_credentials(settings: &Settings, offline: bool) -> Result<()> {
+    let (base_url, email, api_key) = settings.require_auth()?;
+    if offline {
+        return Ok(());
+    }
+    ZulipClient::new(base_url, email, api_key)
+        .current_user()
+        .await
+        .context("validating Zulip credentials")?;
+    Ok(())
+}
+
+fn required_value(form: &ConfigForm, field: ConfigField, label: &str) -> Result<String> {
+    let value = form.value(field).trim();
+    if value.is_empty() {
+        anyhow::bail!("{label} is required");
+    }
+    Ok(value.to_string())
+}
+
+fn positive_i64(value: &str, label: &str) -> Result<i64> {
+    let parsed = value
+        .trim()
+        .parse::<i64>()
+        .with_context(|| format!("{label} must be a number"))?;
+    if parsed <= 0 {
+        anyhow::bail!("{label} must be greater than zero");
+    }
+    Ok(parsed)
+}
+
+fn optional_path(value: &str) -> Option<PathBuf> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+}
+
+fn nonempty_or_default(value: &str, default: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        default.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn parse_bool(value: &str, label: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Ok(true),
+        "false" | "no" | "off" | "0" => Ok(false),
+        _ => anyhow::bail!("{label} must be true or false"),
+    }
+}
+
+fn parse_image_mode(value: &str) -> Result<ImageMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "auto" => Ok(ImageMode::Auto),
+        "placeholder" | "placeholders" => Ok(ImageMode::Placeholder),
+        "off" | "none" => Ok(ImageMode::Off),
+        _ => anyhow::bail!("images must be auto, placeholder, or off"),
+    }
+}
+
+fn image_mode_value(mode: ImageMode) -> &'static str {
+    match mode {
+        ImageMode::Auto => "auto",
+        ImageMode::Placeholder => "placeholder",
+        ImageMode::Off => "off",
+    }
+}
+
+fn split_aliases(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|alias| !alias.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn cycle_theme_field(form: &mut ConfigForm, settings: &Settings, delta: isize) {
+    if form.purpose != ConfigPurpose::Config
+        || form
+            .selected_field()
+            .map(|field| field.key != ConfigField::Theme)
+            .unwrap_or(true)
+    {
+        return;
+    }
+    let options = theme_options(settings);
+    if options.is_empty() {
+        return;
+    }
+    let current = form.value(ConfigField::Theme).trim();
+    let current_idx = options
+        .iter()
+        .position(|option| option == current)
+        .or_else(|| {
+            options
+                .iter()
+                .position(|option| option.eq_ignore_ascii_case(current))
+        })
+        .unwrap_or(0);
+    let next_idx = wrap_index(current_idx, options.len(), delta);
+    if let Some(field) = form.selected_field_mut() {
+        field.value = options[next_idx].clone();
+    }
+}
+
+fn theme_options(settings: &Settings) -> Vec<String> {
+    let mut options = TuiTheme::builtin_names()
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<Vec<_>>();
+    for name in settings.themes.keys() {
+        if !options
+            .iter()
+            .any(|option| option.eq_ignore_ascii_case(name))
+        {
+            options.push(name.clone());
+        }
+    }
+    options
+}
+
+fn env_auth_present() -> bool {
+    std::env::var_os("ZULIP_BASE_URL").is_some()
+        || std::env::var_os("ZULIP_SITE").is_some()
+        || std::env::var_os("ZULIP_EMAIL").is_some()
+        || std::env::var_os("ZULIP_API_KEY").is_some()
 }
 
 async fn run_command(state: &mut TuiState, app: &App) -> Result<()> {
@@ -637,6 +1609,60 @@ async fn run_command(state: &mut TuiState, app: &App) -> Result<()> {
     }
     state.input.clear();
     Ok(())
+}
+
+fn selected_reply_destination(state: &TuiState) -> Option<ReplyDestination> {
+    if let Some(conversation) = state.selected_direct_conversation() {
+        return Some(ReplyDestination::Direct(conversation.clone()));
+    }
+    Some(ReplyDestination::Stream {
+        stream: state.selected_stream()?.to_string(),
+        topic: state.selected_topic()?.to_string(),
+    })
+}
+
+fn selected_destination_label(state: &TuiState) -> String {
+    if let Some(conversation) = state.selected_direct_conversation() {
+        format!("DM: {}", direct_conversation_label(conversation))
+    } else {
+        match (state.selected_stream(), state.selected_topic()) {
+            (Some(stream), Some(topic)) => format!("#{stream} > {topic}"),
+            (Some(stream), None) => format!("#{stream} > no topic"),
+            _ => "no conversation".to_string(),
+        }
+    }
+}
+
+fn message_destination_label(message: &ZulipMessage) -> String {
+    if message.message_type == ZulipMessageType::Direct {
+        format!("DM: {}", direct_message_label(message))
+    } else {
+        format!("#{} > {}", message.stream_name, message.topic)
+    }
+}
+
+fn direct_message_label(message: &ZulipMessage) -> String {
+    if message.dm_participants.is_empty() {
+        return message.topic.clone();
+    }
+    message
+        .dm_participants
+        .iter()
+        .map(|participant| participant.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn direct_conversation_label(conversation: &ZulipDirectConversation) -> String {
+    if conversation.participants.is_empty() {
+        return "Direct message".to_string();
+    }
+    conversation
+        .participants
+        .iter()
+        .map(|participant| participant.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn handle_scrollable_mode_key(key: KeyEvent, state: &mut TuiState) -> Result<bool> {
@@ -687,9 +1713,14 @@ fn draw(
     draw_status(frame, outer[1], state, app, theme);
 
     match state.mode {
-        Mode::SearchInput | Mode::Command | Mode::Composer | Mode::ConfirmSend | Mode::Auth => {
-            draw_overlay(frame, state, app, theme);
-        }
+        Mode::SearchInput
+        | Mode::Command
+        | Mode::Composer
+        | Mode::ConfirmSend
+        | Mode::Auth
+        | Mode::Login
+        | Mode::Config
+        | Mode::Help => draw_overlay(frame, state, app, theme),
         Mode::SearchResults => draw_search_results(frame, state, theme),
         Mode::Digest => draw_digest(frame, state, theme),
         Mode::Browser => {}
@@ -698,25 +1729,31 @@ fn draw(
 
 fn draw_streams(frame: &mut Frame<'_>, area: Rect, state: &TuiState, theme: &TuiTheme) {
     let content_height = list_content_height(area);
-    let start = visible_start(state.stream_idx, state.streams.len(), content_height);
+    let item_count = state.streams.len() + 1;
+    let start = visible_start(state.stream_idx, item_count, content_height);
     let active = state.focus == Focus::Streams;
-    let items = state
-        .streams
-        .iter()
-        .enumerate()
+    let items = (0..item_count)
         .skip(start)
         .take(content_height)
-        .map(|(idx, stream)| {
-            let count = state
-                .stream_activity
-                .get(&stream.name)
-                .copied()
-                .unwrap_or(0);
+        .map(|idx| {
+            let (count, name) = if idx == state.streams.len() {
+                (state.direct_unread_count, "Direct messages".to_string())
+            } else {
+                let stream = &state.streams[idx];
+                (
+                    state
+                        .stream_unread_counts
+                        .get(&stream.name)
+                        .copied()
+                        .unwrap_or(0),
+                    stream.name.clone(),
+                )
+            };
             selected_item(
                 idx == state.stream_idx,
                 active,
                 theme,
-                &format!("{count:>4}  {}", stream.name),
+                &format!("{count:>4}  {name}"),
             )
         })
         .collect::<Vec<_>>();
@@ -730,27 +1767,70 @@ fn draw_streams(frame: &mut Frame<'_>, area: Rect, state: &TuiState, theme: &Tui
 
 fn draw_topics(frame: &mut Frame<'_>, area: Rect, state: &TuiState, theme: &TuiTheme) {
     let content_height = list_content_height(area);
-    let start = visible_start(state.topic_idx, state.topics.len(), content_height);
+    let item_count = state.middle_len();
+    let start = visible_start(state.topic_idx, item_count, content_height);
     let active = state.focus == Focus::Topics;
-    let items = state
-        .topics
-        .iter()
-        .enumerate()
-        .skip(start)
-        .take(content_height)
-        .map(|(idx, topic)| {
-            selected_item(
-                idx == state.topic_idx,
-                active,
-                theme,
-                &format!("{}  {}", topic.message_count, topic.name),
-            )
-        })
-        .collect::<Vec<_>>();
+    let items = if state.selected_direct_messages() {
+        state
+            .direct_conversations
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(content_height)
+            .map(|(idx, conversation)| {
+                selected_item(
+                    idx == state.topic_idx,
+                    active,
+                    theme,
+                    &format!(
+                        "{}  {}",
+                        state
+                            .direct_unread_counts
+                            .get(&conversation.key)
+                            .copied()
+                            .unwrap_or(0),
+                        direct_conversation_label(conversation)
+                    ),
+                )
+            })
+            .collect::<Vec<_>>()
+    } else {
+        state
+            .topics
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(content_height)
+            .map(|(idx, topic)| {
+                selected_item(
+                    idx == state.topic_idx,
+                    active,
+                    theme,
+                    &format!(
+                        "{}  {}",
+                        state
+                            .topic_unread_counts
+                            .get(&topic.name)
+                            .copied()
+                            .unwrap_or(0),
+                        topic.name
+                    ),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
     frame.render_widget(
         List::new(items)
             .style(Style::default().fg(theme.text).bg(theme.background))
-            .block(block("Topics", active, theme)),
+            .block(block(
+                if state.selected_direct_messages() {
+                    "Participants"
+                } else {
+                    "Topics"
+                },
+                active,
+                theme,
+            )),
         area,
     );
 }
@@ -767,14 +1847,16 @@ fn draw_thread(
     let active = state.focus == Focus::Thread;
     let width = area.width.saturating_sub(4).max(1) as usize;
     let image_slot_rows = image_slot_rows(app.settings().ui.images, image_picker.is_some());
+    let now = Utc::now();
     let all_lines = thread_lines(
         &state.messages,
         state.message_idx,
         width,
-        active,
         theme,
         app,
         image_slot_rows,
+        now,
+        &state.read_message_ids,
     );
     let selected_line = selected_message_line_start(&state.messages, state.message_idx, width, app);
     let start = visible_line_start(selected_line, all_lines.len(), content_height);
@@ -893,7 +1975,7 @@ fn selected_image_label_line_start(
         return None;
     }
     let preceding = selected_message_line_start(messages, selected_idx, width, app);
-    Some(preceding + 1 + wrap_text(&message.plain_text, width).len())
+    Some(preceding + 1 + message_body_line_count(message, width) + reaction_line_count(message))
 }
 
 fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &TuiState, app: &App, theme: &TuiTheme) {
@@ -931,7 +2013,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &TuiState, app: &App, t
         "poll pending".to_string()
     };
     let text = format!(
-        "{} | {} | {} | {} | {}{} | j/k h/l / r R : d o y q | {}",
+        "{} | {} | {} | {} | {}{} | ? c L j/k h/l / r R : d o y q | {}",
         account, realm, sync, poll, offline, draft, state.status
     );
     frame.render_widget(
@@ -941,14 +2023,17 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, state: &TuiState, app: &App, t
 }
 
 fn draw_overlay(frame: &mut Frame<'_>, state: &TuiState, app: &App, theme: &TuiTheme) {
-    let area = centered_rect(70, 55, frame.area());
+    let area = if matches!(state.mode, Mode::Config | Mode::Help) {
+        centered_rect(82, 78, frame.area())
+    } else {
+        centered_rect(70, 55, frame.area())
+    };
     frame.render_widget(Clear, area);
     let text = match state.mode {
         Mode::SearchInput => format!("Search cached messages\n\n{}", state.input),
         Mode::Command => format!("Command palette\n\n{}", state.input),
         Mode::Composer => {
-            let stream = state.selected_stream().unwrap_or("no stream");
-            let topic = state.selected_topic().unwrap_or("no topic");
+            let destination = selected_destination_label(state);
             let realm = app
                 .settings()
                 .zulip
@@ -962,16 +2047,15 @@ fn draw_overlay(frame: &mut Frame<'_>, state: &TuiState, app: &App, theme: &TuiT
                 .as_deref()
                 .unwrap_or("no account");
             format!(
-                "Reply draft\nRealm: {realm}\nAccount: {account}\nDestination: #{stream} > {topic}\n\n{}\n\nCtrl-S previews send, Esc cancels",
-                state.draft
+                "Reply draft\nRealm: {realm}\nAccount: {account}\nDestination: {destination}\n\n{}\n\nCtrl-S previews send, Esc cancels",
+                state.draft.as_str()
             )
         }
         Mode::ConfirmSend => {
-            let stream = state.selected_stream().unwrap_or("no stream");
-            let topic = state.selected_topic().unwrap_or("no topic");
+            let destination = selected_destination_label(state);
             format!(
-                "Send this draft?\nDestination: #{stream} > {topic}\n\n{}\n\nPress y to send, n to cancel",
-                state.draft
+                "Send this draft?\nDestination: {destination}\n\n{}\n\nPress y to send, n to cancel",
+                state.draft.as_str()
             )
         }
         Mode::Auth => {
@@ -987,8 +2071,15 @@ fn draw_overlay(frame: &mut Frame<'_>, state: &TuiState, app: &App, theme: &TuiT
             } else {
                 "missing"
             };
-            format!("Auth/config status\n\nRealm: {realm}\nAccount: {account}\nAPI key: {secret}\nCache: {}", app.settings().paths.cache_file.display())
+            format!(
+                "Auth/config status\n\nRealm: {realm}\nAccount: {account}\nAPI key: {secret}\nConfig: {}\nSecret: {}\nCache: {}",
+                app.settings().paths.config_file.display(),
+                app.settings().paths.secret_file.display(),
+                app.settings().paths.cache_file.display()
+            )
         }
+        Mode::Login | Mode::Config => form_overlay_text(state),
+        Mode::Help => help_text(app),
         _ => String::new(),
     };
     frame.render_widget(
@@ -999,12 +2090,163 @@ fn draw_overlay(frame: &mut Frame<'_>, state: &TuiState, app: &App, theme: &TuiT
             .wrap(Wrap { trim: false }),
         area,
     );
+    if let Some((x, y)) = overlay_cursor_position(state, area) {
+        frame.set_cursor_position((x, y));
+    }
+}
+
+fn overlay_cursor_position(state: &TuiState, area: Rect) -> Option<(u16, u16)> {
+    match state.mode {
+        Mode::SearchInput | Mode::Command => {
+            input_cursor_position(area, 2, state.input.lines().next().unwrap_or(""))
+        }
+        Mode::Composer => draft_cursor_position(area, state.draft.as_str(), state.draft.cursor),
+        Mode::Login | Mode::Config => form_cursor_position(area, state.form.as_ref()?),
+        _ => None,
+    }
+}
+
+fn form_overlay_text(state: &TuiState) -> String {
+    let Some(form) = &state.form else {
+        return String::new();
+    };
+    let title = match form.purpose {
+        ConfigPurpose::Login => "Login",
+        ConfigPurpose::Config => "Configuration",
+    };
+    let mut text = format!("{title}\n{}\n\n", form.message);
+    for (idx, field) in form.fields.iter().enumerate() {
+        let marker = if idx == form.selected { ">" } else { " " };
+        text.push_str(&format!(
+            "{marker} {:<22} {}\n",
+            field.label,
+            field.display_value()
+        ));
+    }
+    text.push_str("\nTab/Shift-Tab moves fields, Ctrl-U clears a field, Ctrl-S saves, Esc closes.");
+    if form.purpose == ConfigPurpose::Config {
+        text.push_str(
+            "\nLeft/Right cycles the Theme field. Images accepts auto, placeholder, or off. Booleans accept true/false.",
+        );
+    }
+    text
+}
+
+fn help_text(app: &App) -> String {
+    let env_note = if env_auth_present() {
+        "\nEnvironment credentials are set, so logout only clears local files."
+    } else {
+        ""
+    };
+    format!(
+        "Keys\n\n\
+         ?  Show this help\n\
+         c  Edit configuration\n\
+         L  Logout and clear local credentials\n\
+         a  Show auth/config status\n\
+         q  Quit from the browser, close overlays elsewhere\n\n\
+         Navigation\n\n\
+         j/k or Up/Down  Move selection\n\
+         h/l or Left/Right  Move between panes\n\n\
+         Messages\n\n\
+         /  Search cached messages\n\
+         r  Reply to selected topic\n\
+         R  Sync recent messages\n\
+         d  Build digest\n\
+         o or y  Show selected message permalink\n\
+         : or Ctrl-P  Command palette\n\n\
+         Editing\n\n\
+         Tab/Shift-Tab  Move form fields\n\
+         Ctrl-U  Clear current form field\n\
+         Ctrl-S  Save draft or form\n\
+         Esc  Cancel overlay\n\n\
+         Config file: {}\n\
+         Secret file: {}\n\
+         Cache file: {}{}",
+        app.settings().paths.config_file.display(),
+        app.settings().paths.secret_file.display(),
+        app.settings().paths.cache_file.display(),
+        env_note
+    )
+}
+
+fn form_cursor_position(area: Rect, form: &ConfigForm) -> Option<(u16, u16)> {
+    let field = form.selected_field()?;
+    let line_index = 3 + form.selected;
+    let label_width = 25;
+    let inner = overlay_inner_area(area)?;
+    let x_offset = (label_width + display_width(&field.display_value()))
+        .min(inner.width.saturating_sub(1) as usize) as u16;
+    let y_offset = (line_index as u16).min(inner.height.saturating_sub(1));
+    Some((
+        inner.x.saturating_add(x_offset),
+        inner.y.saturating_add(y_offset),
+    ))
+}
+
+fn draft_cursor_position(area: Rect, draft: &str, cursor: usize) -> Option<(u16, u16)> {
+    let inner = overlay_inner_area(area)?;
+    let width = inner.width.max(1) as usize;
+    let mut visual_line_index = 5usize;
+    let cursor_x;
+    let cursor = cursor.min(draft.len());
+    let prefix = &draft[..cursor];
+    let mut lines = prefix.split('\n').peekable();
+
+    loop {
+        let Some(line) = lines.next() else {
+            cursor_x = 0;
+            break;
+        };
+        let widths = wrapped_line_widths(line, width);
+        if lines.peek().is_some() {
+            visual_line_index += widths.len();
+        } else {
+            visual_line_index += widths.len().saturating_sub(1);
+            cursor_x = widths.last().copied().unwrap_or(0);
+            break;
+        }
+    }
+
+    Some((
+        inner
+            .x
+            .saturating_add(cursor_x.min(inner.width.saturating_sub(1) as usize) as u16),
+        inner
+            .y
+            .saturating_add((visual_line_index as u16).min(inner.height.saturating_sub(1))),
+    ))
+}
+
+fn input_cursor_position(area: Rect, line_index: usize, text: &str) -> Option<(u16, u16)> {
+    let inner = overlay_inner_area(area)?;
+    let x_offset = display_width(text).min(inner.width.saturating_sub(1) as usize) as u16;
+    let y_offset = (line_index as u16).min(inner.height.saturating_sub(1));
+    Some((
+        inner.x.saturating_add(x_offset),
+        inner.y.saturating_add(y_offset),
+    ))
+}
+
+fn overlay_inner_area(area: Rect) -> Option<Rect> {
+    let width = area.width.checked_sub(2)?;
+    let height = area.height.checked_sub(2)?;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some(Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width,
+        height,
+    })
 }
 
 fn draw_search_results(frame: &mut Frame<'_>, state: &TuiState, theme: &TuiTheme) {
     let area = centered_rect(86, 76, frame.area());
     frame.render_widget(Clear, area);
     let content_height = list_content_height(area);
+    let now = Utc::now();
     let start = state
         .popup_scroll
         .min(state.search_results.len().saturating_sub(content_height));
@@ -1016,11 +2258,11 @@ fn draw_search_results(frame: &mut Frame<'_>, state: &TuiState, theme: &TuiTheme
         .map(|message| {
             ListItem::new(Line::from(vec![
                 Span::styled(
-                    format!("[{}] ", message.id),
+                    format!("{} ", fuzzy_time_ago(message.timestamp, now)),
                     Style::default().fg(theme.message_id),
                 ),
                 Span::styled(
-                    format!("#{} > {} | ", message.stream_name, message.topic),
+                    format!("{} | ", message_destination_label(message)),
                     Style::default().fg(theme.inactive_title),
                 ),
                 Span::styled(
@@ -1062,16 +2304,20 @@ fn draw_digest(frame: &mut Frame<'_>, state: &TuiState, theme: &TuiTheme) {
         lines.push(Line::from("Unanswered questions"));
         for item in digest.unanswered_questions.iter().take(8) {
             lines.push(Line::from(format!(
-                "[{}] #{} > {} | {}",
-                item.id, item.stream, item.topic, item.text
+                "[{}] {} | {}",
+                item.id,
+                digest_item_destination(item),
+                item.text
             )));
         }
         lines.push(Line::from(""));
         lines.push(Line::from("Attention items"));
         for item in digest.likely_attention_items.iter().take(12) {
             lines.push(Line::from(format!(
-                "[{}] #{} > {} | {}",
-                item.id, item.stream, item.topic, item.text
+                "[{}] {} | {}",
+                item.id,
+                digest_item_destination(item),
+                item.text
             )));
         }
     }
@@ -1141,25 +2387,44 @@ impl TuiTheme {
     fn resolve(settings: &Settings) -> Result<Self> {
         let name = settings.ui.theme.trim();
         let theme_name = if name.is_empty() { "zenburn" } else { name };
-        let mut theme = if theme_name.eq_ignore_ascii_case("zenburn") {
-            Self::zenburn()
+        let mut theme = if let Some(theme) = Self::builtin(theme_name) {
+            theme
         } else if settings.themes.contains_key(theme_name) {
             Self::zenburn()
         } else {
             anyhow::bail!("unknown TUI theme '{theme_name}'");
         };
 
-        if let Some(config) = settings.themes.get(theme_name).or_else(|| {
-            if theme_name.eq_ignore_ascii_case("zenburn") {
-                settings.themes.get("zenburn")
-            } else {
-                None
-            }
-        }) {
+        if let Some(config) = settings.themes.get(theme_name) {
             theme.apply_config(config)?;
         }
 
         Ok(theme)
+    }
+
+    fn builtin(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "zenburn" => Some(Self::zenburn()),
+            "solarized-dark" => Some(Self::solarized_dark()),
+            "gruvbox-dark" => Some(Self::gruvbox_dark()),
+            "dracula" => Some(Self::dracula()),
+            "nord" => Some(Self::nord()),
+            "catppuccin-mocha" => Some(Self::catppuccin_mocha()),
+            "tokyo-night" => Some(Self::tokyo_night()),
+            _ => None,
+        }
+    }
+
+    fn builtin_names() -> &'static [&'static str] {
+        &[
+            "zenburn",
+            "solarized-dark",
+            "gruvbox-dark",
+            "dracula",
+            "nord",
+            "catppuccin-mocha",
+            "tokyo-night",
+        ]
     }
 
     fn zenburn() -> Self {
@@ -1178,6 +2443,120 @@ impl TuiTheme {
             status_fg: rgb(0x3f, 0x3f, 0x3f),
             status_bg: rgb(0xd0, 0xbf, 0x8f),
             modal_text: rgb(0xdc, 0xdc, 0xcc),
+        }
+    }
+
+    fn solarized_dark() -> Self {
+        Self {
+            background: rgb(0x00, 0x2b, 0x36),
+            text: rgb(0x83, 0x94, 0x96),
+            pane_border: rgb(0x58, 0x6e, 0x75),
+            active_title: rgb(0xb5, 0x89, 0x00),
+            inactive_title: rgb(0x26, 0x8b, 0xd2),
+            active_selection_fg: rgb(0x00, 0x2b, 0x36),
+            active_selection_bg: rgb(0x93, 0xa1, 0xa1),
+            inactive_selection_fg: rgb(0x93, 0xa1, 0xa1),
+            inactive_selection_bg: rgb(0x07, 0x36, 0x42),
+            message_id: rgb(0x2a, 0xa1, 0x98),
+            sender: rgb(0x85, 0x99, 0x00),
+            status_fg: rgb(0x00, 0x2b, 0x36),
+            status_bg: rgb(0xb5, 0x89, 0x00),
+            modal_text: rgb(0x93, 0xa1, 0xa1),
+        }
+    }
+
+    fn gruvbox_dark() -> Self {
+        Self {
+            background: rgb(0x28, 0x28, 0x28),
+            text: rgb(0xeb, 0xdb, 0xb2),
+            pane_border: rgb(0x66, 0x5c, 0x54),
+            active_title: rgb(0xfa, 0xbd, 0x2f),
+            inactive_title: rgb(0x83, 0xa5, 0x98),
+            active_selection_fg: rgb(0x28, 0x28, 0x28),
+            active_selection_bg: rgb(0xd7, 0x99, 0x21),
+            inactive_selection_fg: rgb(0xeb, 0xdb, 0xb2),
+            inactive_selection_bg: rgb(0x3c, 0x38, 0x36),
+            message_id: rgb(0x8e, 0xc0, 0x7c),
+            sender: rgb(0xb8, 0xbb, 0x26),
+            status_fg: rgb(0x28, 0x28, 0x28),
+            status_bg: rgb(0xfe, 0x80, 0x19),
+            modal_text: rgb(0xeb, 0xdb, 0xb2),
+        }
+    }
+
+    fn dracula() -> Self {
+        Self {
+            background: rgb(0x28, 0x2a, 0x36),
+            text: rgb(0xf8, 0xf8, 0xf2),
+            pane_border: rgb(0x62, 0x72, 0xa4),
+            active_title: rgb(0xff, 0x79, 0xc6),
+            inactive_title: rgb(0x8b, 0xe9, 0xfd),
+            active_selection_fg: rgb(0x28, 0x2a, 0x36),
+            active_selection_bg: rgb(0xbd, 0x93, 0xf9),
+            inactive_selection_fg: rgb(0xf8, 0xf8, 0xf2),
+            inactive_selection_bg: rgb(0x44, 0x47, 0x5a),
+            message_id: rgb(0x8b, 0xe9, 0xfd),
+            sender: rgb(0x50, 0xfa, 0x7b),
+            status_fg: rgb(0x28, 0x2a, 0x36),
+            status_bg: rgb(0xff, 0xb8, 0x6c),
+            modal_text: rgb(0xf8, 0xf8, 0xf2),
+        }
+    }
+
+    fn nord() -> Self {
+        Self {
+            background: rgb(0x2e, 0x34, 0x40),
+            text: rgb(0xd8, 0xde, 0xe9),
+            pane_border: rgb(0x4c, 0x56, 0x6a),
+            active_title: rgb(0x88, 0xc0, 0xd0),
+            inactive_title: rgb(0x81, 0xa1, 0xc1),
+            active_selection_fg: rgb(0x2e, 0x34, 0x40),
+            active_selection_bg: rgb(0xa3, 0xbe, 0x8c),
+            inactive_selection_fg: rgb(0xe5, 0xe9, 0xf0),
+            inactive_selection_bg: rgb(0x3b, 0x42, 0x52),
+            message_id: rgb(0x8f, 0xbc, 0xbb),
+            sender: rgb(0xa3, 0xbe, 0x8c),
+            status_fg: rgb(0x2e, 0x34, 0x40),
+            status_bg: rgb(0xeb, 0xcb, 0x8b),
+            modal_text: rgb(0xe5, 0xe9, 0xf0),
+        }
+    }
+
+    fn catppuccin_mocha() -> Self {
+        Self {
+            background: rgb(0x1e, 0x1e, 0x2e),
+            text: rgb(0xcd, 0xd6, 0xf4),
+            pane_border: rgb(0x6c, 0x70, 0x86),
+            active_title: rgb(0xf5, 0xc2, 0xe7),
+            inactive_title: rgb(0x89, 0xb4, 0xfa),
+            active_selection_fg: rgb(0x1e, 0x1e, 0x2e),
+            active_selection_bg: rgb(0xa6, 0xe3, 0xa1),
+            inactive_selection_fg: rgb(0xcd, 0xd6, 0xf4),
+            inactive_selection_bg: rgb(0x31, 0x32, 0x44),
+            message_id: rgb(0x94, 0xe2, 0xd5),
+            sender: rgb(0xa6, 0xe3, 0xa1),
+            status_fg: rgb(0x1e, 0x1e, 0x2e),
+            status_bg: rgb(0xfa, 0xe3, 0xb0),
+            modal_text: rgb(0xcd, 0xd6, 0xf4),
+        }
+    }
+
+    fn tokyo_night() -> Self {
+        Self {
+            background: rgb(0x1a, 0x1b, 0x26),
+            text: rgb(0xc0, 0xca, 0xf5),
+            pane_border: rgb(0x56, 0x5f, 0x89),
+            active_title: rgb(0x7a, 0xdc, 0xa7),
+            inactive_title: rgb(0x7a, 0xa2, 0xf7),
+            active_selection_fg: rgb(0x1a, 0x1b, 0x26),
+            active_selection_bg: rgb(0xe0, 0xaf, 0x68),
+            inactive_selection_fg: rgb(0xc0, 0xca, 0xf5),
+            inactive_selection_bg: rgb(0x24, 0x28, 0x3b),
+            message_id: rgb(0x7d, 0xcf, 0xf3),
+            sender: rgb(0x9e, 0xce, 0x6a),
+            status_fg: rgb(0x1a, 0x1b, 0x26),
+            status_bg: rgb(0xbb, 0x9a, 0xf7),
+            modal_text: rgb(0xc0, 0xca, 0xf5),
         }
     }
 
@@ -1259,23 +2638,50 @@ fn pane_percentages(focus: Focus) -> [u16; 3] {
     }
 }
 
-fn thread_lines<'a>(
-    messages: &'a [ZulipMessage],
+#[derive(Clone)]
+struct StyledSegment {
+    text: String,
+    style: Style,
+}
+
+struct StyledWord {
+    text: String,
+    style: Style,
+    space_before: bool,
+}
+
+struct ReactionSummary {
+    display: String,
+    count: usize,
+}
+
+fn thread_lines(
+    messages: &[ZulipMessage],
     selected_idx: usize,
     width: usize,
-    active: bool,
     theme: &TuiTheme,
     app: &App,
     image_slot_rows: u16,
-) -> Vec<Line<'a>> {
+    now: DateTime<Utc>,
+    read_message_ids: &BTreeSet<i64>,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for (idx, message) in messages.iter().enumerate() {
         let selected = idx == selected_idx;
-        let selection_style = selection_style(selected, active, theme);
-        let header_style = selection_style.unwrap_or_else(|| Style::default().bg(theme.background));
+        let unread = !read_message_ids.contains(&message.id);
+        let header_style = Style::default().bg(theme.background);
+        let marker_style = Style::default().fg(theme.text).bg(theme.background);
+        let selection_marker = if selected {
+            " > "
+        } else if unread {
+            " * "
+        } else {
+            "   "
+        };
         lines.push(Line::from(vec![
+            Span::styled(selection_marker, marker_style),
             Span::styled(
-                format!("[{}]", message.id),
+                fuzzy_time_ago(message.timestamp, now),
                 header_style.fg(theme.message_id),
             ),
             Span::raw(" "),
@@ -1285,19 +2691,24 @@ fn thread_lines<'a>(
             ),
         ]));
 
-        for wrapped in wrap_text(&message.plain_text, width) {
-            let style = selection_style
-                .unwrap_or_else(|| Style::default().fg(theme.text).bg(theme.background));
-            lines.push(Line::from(Span::styled(wrapped, style)));
+        let body_style = Style::default().fg(theme.text).bg(theme.background);
+        for line in message_body_lines(message, width, body_style) {
+            lines.push(line);
         }
+
+        let reaction_style = Style::default()
+            .fg(theme.inactive_title)
+            .bg(theme.background);
+        if let Some(line) = reaction_line(message, reaction_style) {
+            lines.push(line);
+        }
+
         if app.settings().ui.images != ImageMode::Off {
             let attachments = app.image_attachments(message);
             for (image_idx, attachment) in attachments.iter().enumerate() {
-                let style = selection_style.unwrap_or_else(|| {
-                    Style::default()
-                        .fg(theme.inactive_title)
-                        .bg(theme.background)
-                });
+                let style = Style::default()
+                    .fg(theme.inactive_title)
+                    .bg(theme.background);
                 lines.push(Line::from(Span::styled(
                     format!("[image: {}]", attachment.label()),
                     style,
@@ -1306,8 +2717,7 @@ fn thread_lines<'a>(
                     for _ in 0..image_slot_rows {
                         lines.push(Line::from(Span::styled(
                             "",
-                            selection_style
-                                .unwrap_or_else(|| Style::default().bg(theme.background)),
+                            Style::default().bg(theme.background),
                         )));
                     }
                 }
@@ -1315,23 +2725,546 @@ fn thread_lines<'a>(
         }
         lines.push(Line::from(Span::styled(
             "",
-            selection_style.unwrap_or_else(|| Style::default().bg(theme.background)),
+            Style::default().bg(theme.background),
         )));
     }
 
     lines
 }
 
-fn selection_style(selected: bool, active: bool, theme: &TuiTheme) -> Option<Style> {
-    if !selected {
+fn message_body_lines(message: &ZulipMessage, width: usize, style: Style) -> Vec<Line<'static>> {
+    let mut segments = html_segments(&message.rendered_html, style);
+    if segments
+        .iter()
+        .all(|segment| segment.text.trim().is_empty())
+    {
+        segments = vec![StyledSegment {
+            text: message.plain_text.clone(),
+            style,
+        }];
+    }
+    wrap_styled_segments(&segments, width, style)
+}
+
+fn message_body_line_count(message: &ZulipMessage, width: usize) -> usize {
+    message_body_lines(message, width, Style::default()).len()
+}
+
+fn html_segments(html: &str, style: Style) -> Vec<StyledSegment> {
+    let fragment = Html::parse_fragment(html);
+    let root = fragment.root_element();
+    let mut segments = Vec::new();
+    for child in root.children() {
+        collect_html_segments(child, style, &mut segments);
+    }
+    segments
+}
+
+fn collect_html_segments(node: NodeRef<'_, Node>, style: Style, segments: &mut Vec<StyledSegment>) {
+    match node.value() {
+        Node::Text(text) => push_text_segments(segments, text, style),
+        Node::Element(_) => {
+            let Some(element) = ElementRef::wrap(node) else {
+                return;
+            };
+            let name = element.value().name();
+            if name == "br" {
+                push_segment(segments, " ".to_string(), style);
+                return;
+            }
+            if is_html_spacing_tag(name) {
+                push_segment(segments, " ".to_string(), style);
+            }
+            if let Some(emoji) = emoji_text(element) {
+                push_segment(segments, emoji, style);
+            } else {
+                let child_style = html_child_style(style, name);
+                for child in element.children() {
+                    collect_html_segments(child, child_style, segments);
+                }
+            }
+            if is_html_spacing_tag(name) {
+                push_segment(segments, " ".to_string(), style);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn push_text_segments(segments: &mut Vec<StyledSegment>, text: &str, style: Style) {
+    let mut emit_from = 0;
+    let mut search_from = 0;
+    while let Some(relative_start) = text[search_from..].find(':') {
+        let start = search_from + relative_start;
+        let Some(relative_end) = text[start + 1..].find(':') else {
+            break;
+        };
+        let end = start + 1 + relative_end;
+        let candidate = &text[start..=end];
+        let Some(emoji) = emoji_from_shortcode(candidate) else {
+            search_from = end + 1;
+            continue;
+        };
+        if emit_from < start {
+            push_segment(segments, text[emit_from..start].to_string(), style);
+        }
+        push_segment(segments, emoji, style);
+        emit_from = end + 1;
+        search_from = emit_from;
+    }
+    if emit_from < text.len() {
+        push_segment(segments, text[emit_from..].to_string(), style);
+    }
+}
+
+fn push_segment(segments: &mut Vec<StyledSegment>, text: String, style: Style) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(previous) = segments.last_mut() {
+        if previous.style == style {
+            previous.text.push_str(&text);
+            return;
+        }
+    }
+    segments.push(StyledSegment { text, style });
+}
+
+fn html_child_style(style: Style, tag: &str) -> Style {
+    match tag {
+        "b" | "strong" => style.add_modifier(Modifier::BOLD),
+        "em" | "i" => style.add_modifier(Modifier::ITALIC),
+        "code" | "pre" => style.add_modifier(Modifier::DIM),
+        _ => style,
+    }
+}
+
+fn is_html_spacing_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "p" | "div" | "li" | "ul" | "ol" | "blockquote" | "pre" | "tr" | "td" | "th"
+    )
+}
+
+fn digest_item_destination(item: &libzul::digest::DigestItem) -> String {
+    if item.stream == "Direct messages" {
+        format!("DM: {}", item.topic)
+    } else {
+        format!("#{} > {}", item.stream, item.topic)
+    }
+}
+
+fn emoji_text(element: ElementRef<'_>) -> Option<String> {
+    if !is_emoji_element(element) {
         return None;
     }
-    let (fg, bg) = if active {
-        (theme.active_selection_fg, theme.active_selection_bg)
+    if let Some(emoji) = element.attr("class").and_then(emoji_from_class) {
+        return Some(emoji);
+    }
+    let text = element.text().collect::<String>().trim().to_string();
+    if let Some(emoji) = emoji_from_shortcode(&text) {
+        return Some(emoji);
+    }
+    if !text.is_empty() && !looks_like_shortcode(&text) {
+        return Some(text);
+    }
+    for attr in ["alt", "title", "aria-label", "data-emoji-name"] {
+        if let Some(value) = element
+            .attr(attr)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if let Some(emoji) = emoji_from_shortcode(value) {
+                return Some(emoji);
+            }
+            return Some(format_shortcode(value));
+        }
+    }
+    (!text.is_empty()).then_some(text)
+}
+
+fn is_emoji_element(element: ElementRef<'_>) -> bool {
+    element
+        .attr("class")
+        .is_some_and(|classes| classes.split_whitespace().any(is_emoji_class))
+        || element.attr("data-emoji-name").is_some()
+        || (element.value().name() == "img"
+            && element
+                .attr("alt")
+                .is_some_and(|alt| looks_like_shortcode(alt.trim())))
+}
+
+fn is_emoji_class(class: &str) -> bool {
+    class == "emoji" || class.starts_with("emoji-")
+}
+
+fn emoji_from_class(classes: &str) -> Option<String> {
+    classes
+        .split_whitespace()
+        .filter_map(|class| class.strip_prefix("emoji-"))
+        .find_map(emoji_from_code)
+}
+
+fn emoji_from_code(code: &str) -> Option<String> {
+    let mut emoji = String::new();
+    for part in code.split('-') {
+        let value = u32::from_str_radix(part, 16).ok()?;
+        emoji.push(char::from_u32(value)?);
+    }
+    (!emoji.is_empty()).then_some(emoji)
+}
+
+fn emoji_from_shortcode(value: &str) -> Option<String> {
+    let normalized = normalize_shortcode(value);
+    emojis::get_by_shortcode(shortcode_alias(&normalized)).map(|emoji| emoji.as_str().to_string())
+}
+
+fn looks_like_shortcode(value: &str) -> bool {
+    value.len() > 2 && value.starts_with(':') && value.ends_with(':')
+}
+
+fn format_shortcode(value: &str) -> String {
+    let name = normalize_shortcode(value);
+    format!(":{name}:")
+}
+
+fn normalize_shortcode(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches(':')
+        .trim_end_matches(" emoji")
+        .trim()
+        .replace(' ', "_")
+        .to_ascii_lowercase()
+}
+
+fn shortcode_alias(value: &str) -> &str {
+    match value {
+        "thumbs_up" => "+1",
+        "thumbs_down" => "-1",
+        "slight_smile" => "slightly_smiling_face",
+        _ => value,
+    }
+}
+
+fn wrap_styled_segments(
+    segments: &[StyledSegment],
+    width: usize,
+    empty_style: Style,
+) -> Vec<Line<'static>> {
+    let words = styled_words(segments);
+    if words.is_empty() {
+        return vec![Line::from(Span::styled(String::new(), empty_style))];
+    }
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut spans = Vec::new();
+    let mut line_width = 0;
+
+    for word in words {
+        push_styled_word(
+            word,
+            width,
+            &mut lines,
+            &mut spans,
+            &mut line_width,
+            empty_style,
+        );
+    }
+
+    if !spans.is_empty() {
+        lines.push(Line::from(spans));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(String::new(), empty_style)));
+    }
+    lines
+}
+
+fn styled_words(segments: &[StyledSegment]) -> Vec<StyledWord> {
+    let mut words = Vec::new();
+    let mut pending_space = false;
+    for segment in segments {
+        let mut current = String::new();
+        let mut current_space_before = false;
+        for ch in segment.text.chars() {
+            if ch.is_whitespace() {
+                if !current.is_empty() {
+                    words.push(StyledWord {
+                        text: std::mem::take(&mut current),
+                        style: segment.style,
+                        space_before: current_space_before,
+                    });
+                }
+                pending_space = true;
+                current_space_before = false;
+            } else {
+                if current.is_empty() {
+                    current_space_before = pending_space && !words.is_empty();
+                    pending_space = false;
+                }
+                current.push(ch);
+            }
+        }
+        if !current.is_empty() {
+            words.push(StyledWord {
+                text: current,
+                style: segment.style,
+                space_before: current_space_before,
+            });
+        }
+    }
+    words
+}
+
+fn push_styled_word(
+    word: StyledWord,
+    width: usize,
+    lines: &mut Vec<Line<'static>>,
+    spans: &mut Vec<Span<'static>>,
+    line_width: &mut usize,
+    empty_style: Style,
+) {
+    let word_width = display_width(&word.text);
+    let space_width = usize::from(*line_width > 0 && word.space_before);
+    if *line_width > 0 && *line_width + space_width + word_width > width {
+        lines.push(Line::from(std::mem::take(spans)));
+        *line_width = 0;
+    }
+    if *line_width > 0 && word.space_before {
+        spans.push(Span::styled(" ".to_string(), word.style));
+        *line_width += 1;
+    }
+    if word_width <= width {
+        spans.push(Span::styled(word.text, word.style));
+        *line_width += word_width;
     } else {
-        (theme.inactive_selection_fg, theme.inactive_selection_bg)
+        push_long_styled_word(word.text, word.style, width, lines, spans, line_width);
+    }
+    if spans.is_empty() && *line_width == 0 {
+        spans.push(Span::styled(String::new(), empty_style));
+    }
+}
+
+fn push_long_styled_word(
+    word: String,
+    style: Style,
+    width: usize,
+    lines: &mut Vec<Line<'static>>,
+    spans: &mut Vec<Span<'static>>,
+    line_width: &mut usize,
+) {
+    let mut chunk = String::new();
+    let mut chunk_width = 0;
+    for grapheme in word.graphemes(true) {
+        let grapheme_width = display_width(grapheme);
+        if chunk_width > 0 && chunk_width + grapheme_width > width {
+            spans.push(Span::styled(std::mem::take(&mut chunk), style));
+            lines.push(Line::from(std::mem::take(spans)));
+            *line_width = 0;
+            chunk_width = 0;
+        }
+        if chunk_width == 0 && grapheme_width > width {
+            spans.push(Span::styled(grapheme.to_string(), style));
+            lines.push(Line::from(std::mem::take(spans)));
+            *line_width = 0;
+            continue;
+        }
+        chunk.push_str(grapheme);
+        chunk_width += grapheme_width;
+    }
+    if !chunk.is_empty() {
+        spans.push(Span::styled(chunk, style));
+        *line_width += chunk_width;
+    }
+}
+
+fn display_width(value: &str) -> usize {
+    UnicodeWidthStr::width(value)
+}
+
+fn wrapped_line_widths(line: &str, width: usize) -> Vec<usize> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut pending_line_width = 0usize;
+    let mut word_width = 0usize;
+    let mut whitespace_width = 0usize;
+    let mut pending_whitespace = VecDeque::new();
+    let mut non_whitespace_previous = false;
+
+    for grapheme in line.graphemes(true) {
+        let symbol_width = display_width(grapheme);
+        if symbol_width > width {
+            continue;
+        }
+
+        let is_whitespace = grapheme.chars().all(char::is_whitespace);
+        let word_found = non_whitespace_previous && is_whitespace;
+        let untrimmed_overflow =
+            pending_line_width == 0 && word_width + whitespace_width + symbol_width > width;
+
+        if word_found || untrimmed_overflow {
+            pending_line_width += whitespace_width + word_width;
+            pending_whitespace.clear();
+            whitespace_width = 0;
+            word_width = 0;
+        }
+
+        let line_full = pending_line_width >= width;
+        let pending_word_overflow =
+            symbol_width > 0 && pending_line_width + whitespace_width + word_width >= width;
+
+        if line_full || pending_word_overflow {
+            let mut remaining_width = width.saturating_sub(pending_line_width);
+            lines.push(pending_line_width);
+            pending_line_width = 0;
+
+            while let Some(width) = pending_whitespace.front().copied() {
+                if width > remaining_width {
+                    break;
+                }
+                whitespace_width = whitespace_width.saturating_sub(width);
+                remaining_width -= width;
+                pending_whitespace.pop_front();
+            }
+
+            if is_whitespace && pending_whitespace.is_empty() {
+                continue;
+            }
+        }
+
+        if is_whitespace {
+            whitespace_width += symbol_width;
+            pending_whitespace.push_back(symbol_width);
+        } else {
+            word_width += symbol_width;
+        }
+
+        non_whitespace_previous = !is_whitespace;
+    }
+
+    pending_line_width += whitespace_width + word_width;
+    if pending_line_width > 0 {
+        lines.push(pending_line_width);
+    }
+    if lines.is_empty() {
+        lines.push(0);
+    }
+    lines
+}
+
+fn reaction_line(message: &ZulipMessage, style: Style) -> Option<Line<'static>> {
+    let summaries = reaction_summaries(message);
+    if summaries.is_empty() {
+        return None;
+    }
+    let mut spans = Vec::new();
+    for (idx, summary) in summaries.iter().enumerate() {
+        if idx > 0 {
+            spans.push(Span::styled("  ".to_string(), style));
+        }
+        spans.push(Span::styled(
+            format!("{} {}", summary.display, summary.count),
+            style,
+        ));
+    }
+    Some(Line::from(spans))
+}
+
+fn reaction_line_count(message: &ZulipMessage) -> usize {
+    usize::from(!reaction_summaries(message).is_empty())
+}
+
+fn reaction_summaries(message: &ZulipMessage) -> Vec<ReactionSummary> {
+    let Some(reactions) = message
+        .raw_json
+        .get("reactions")
+        .and_then(|value| value.as_array())
+    else {
+        return Vec::new();
     };
-    Some(Style::default().fg(fg).bg(bg))
+    let mut summaries: Vec<(String, ReactionSummary)> = Vec::new();
+    for reaction in reactions {
+        let emoji_name = reaction
+            .get("emoji_name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("emoji");
+        let emoji_code = reaction
+            .get("emoji_code")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let reaction_type = reaction
+            .get("reaction_type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let key = format!("{reaction_type}:{emoji_code}:{emoji_name}");
+        if let Some((_, summary)) = summaries.iter_mut().find(|(existing, _)| existing == &key) {
+            summary.count += 1;
+            continue;
+        }
+        summaries.push((
+            key,
+            ReactionSummary {
+                display: reaction_display(reaction_type, emoji_code, emoji_name),
+                count: 1,
+            },
+        ));
+    }
+    summaries.into_iter().map(|(_, summary)| summary).collect()
+}
+
+fn reaction_display(reaction_type: &str, emoji_code: &str, emoji_name: &str) -> String {
+    if reaction_type == "unicode_emoji" {
+        if let Some(emoji) = emoji_from_code(emoji_code) {
+            return emoji;
+        }
+    }
+    emoji_from_shortcode(emoji_name).unwrap_or_else(|| format_shortcode(emoji_name))
+}
+
+fn fuzzy_time_ago(timestamp: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let Ok(age) = now.signed_duration_since(timestamp).to_std() else {
+        return "now".to_string();
+    };
+    let seconds = age.as_secs();
+    if seconds < 60 {
+        return "now".to_string();
+    }
+
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes}m ago");
+    }
+
+    let hours = minutes / 60;
+    if hours < 24 {
+        return format!("{hours}h ago");
+    }
+
+    let days = hours / 24;
+    if days < 7 {
+        return plural_time(days, "day");
+    }
+
+    let weeks = days / 7;
+    if weeks < 5 {
+        return plural_time(weeks, "week");
+    }
+
+    if days < 365 {
+        let months = days / 30;
+        return plural_time(months.max(1), "month");
+    }
+
+    plural_time((days / 365).max(1), "year")
+}
+
+fn plural_time(value: u64, unit: &str) -> String {
+    if value == 1 {
+        format!("1 {unit} ago")
+    } else {
+        format!("{value} {unit}s ago")
+    }
 }
 
 fn selected_message_line_start(
@@ -1358,7 +3291,7 @@ fn message_line_height(
     } else {
         app.image_attachments(message).len() + image_slot_rows as usize
     };
-    1 + wrap_text(&message.plain_text, width).len() + attachment_rows + 1
+    1 + message_body_line_count(message, width) + reaction_line_count(message) + attachment_rows + 1
 }
 
 fn visible_line_start(selected_line: usize, total_lines: usize, height: usize) -> usize {
@@ -1369,59 +3302,19 @@ fn visible_line_start(selected_line: usize, total_lines: usize, height: usize) -
     selected_line.saturating_sub(half).min(total_lines - height)
 }
 
-fn wrap_text(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut lines = Vec::new();
-
-    for source_line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        let mut current = String::new();
-        for word in source_line.split_whitespace() {
-            if current.is_empty() {
-                push_wrapped_word(&mut lines, &mut current, word, width);
-            } else if current.len() + 1 + word.len() <= width {
-                current.push(' ');
-                current.push_str(word);
-            } else {
-                lines.push(current);
-                current = String::new();
-                push_wrapped_word(&mut lines, &mut current, word, width);
-            }
-        }
-        if !current.is_empty() {
-            lines.push(current);
-        }
-    }
-
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-
-    lines
-}
-
-fn push_wrapped_word(lines: &mut Vec<String>, current: &mut String, word: &str, width: usize) {
-    if word.len() <= width {
-        current.push_str(word);
-        return;
-    }
-
-    let mut chunk = String::new();
-    for ch in word.chars() {
-        if chunk.len() + ch.len_utf8() > width {
-            lines.push(chunk);
-            chunk = String::new();
-        }
-        chunk.push(ch);
-    }
-    *current = chunk;
-}
-
 fn move_index(current: usize, len: usize, delta: isize) -> usize {
     if len == 0 {
         return 0;
     }
     let next = current as isize + delta;
     next.clamp(0, len.saturating_sub(1) as isize) as usize
+}
+
+fn wrap_index(current: usize, len: usize, delta: isize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    (current as isize + delta).rem_euclid(len as isize) as usize
 }
 
 fn list_content_height(area: Rect) -> usize {
@@ -1458,14 +3351,18 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     Terminal::new(backend).map_err(Into::into)
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -1473,11 +3370,14 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration as ChronoDuration;
+    use chrono::TimeZone;
     use chrono::Utc;
     use libzul::cache::Cache;
     use libzul::config::{
         AppPaths, CacheConfig, DigestConfig, SafetyConfig, Settings, UiConfig, ZulipConfig,
     };
+    use libzul::zulip::models::ZulipDmParticipant;
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -1505,6 +3405,16 @@ mod tests {
 
         assert_eq!(theme.background, rgb(0x3f, 0x3f, 0x3f));
         assert_eq!(theme.active_title, rgb(0xf0, 0xdf, 0xaf));
+    }
+
+    #[test]
+    fn built_in_themes_resolve() {
+        for name in TuiTheme::builtin_names() {
+            let mut settings = test_settings(TempDir::new().unwrap().path());
+            settings.ui.theme = (*name).to_string();
+
+            TuiTheme::resolve(&settings).unwrap();
+        }
     }
 
     #[test]
@@ -1555,6 +3465,53 @@ mod tests {
     }
 
     #[test]
+    fn theme_options_include_builtins_and_custom_themes() {
+        let mut settings = test_settings(TempDir::new().unwrap().path());
+        settings
+            .themes
+            .insert("cozy".to_string(), ThemeConfig::default());
+
+        let options = theme_options(&settings);
+
+        assert!(options.contains(&"zenburn".to_string()));
+        assert!(options.contains(&"dracula".to_string()));
+        assert!(options.contains(&"cozy".to_string()));
+    }
+
+    #[test]
+    fn config_theme_field_cycles_available_options() {
+        let mut settings = test_settings(TempDir::new().unwrap().path());
+        settings.ui.theme = "zenburn".to_string();
+        let mut form = ConfigForm::config(&settings);
+        form.selected = form
+            .fields
+            .iter()
+            .position(|field| field.key == ConfigField::Theme)
+            .unwrap();
+
+        cycle_theme_field(&mut form, &settings, 1);
+        assert_eq!(form.value(ConfigField::Theme), "solarized-dark");
+
+        cycle_theme_field(&mut form, &settings, -1);
+        assert_eq!(form.value(ConfigField::Theme), "zenburn");
+    }
+
+    #[test]
+    fn config_theme_cycling_leaves_other_fields_unchanged() {
+        let settings = test_settings(TempDir::new().unwrap().path());
+        let mut form = ConfigForm::config(&settings);
+        form.selected = form
+            .fields
+            .iter()
+            .position(|field| field.key == ConfigField::Email)
+            .unwrap();
+
+        cycle_theme_field(&mut form, &settings, 1);
+
+        assert_eq!(form.value(ConfigField::Theme), "zenburn");
+    }
+
+    #[test]
     fn focus_weighted_layout_ratios_are_stable() {
         assert_eq!(pane_percentages(Focus::Streams), [40, 30, 30]);
         assert_eq!(pane_percentages(Focus::Topics), [20, 45, 35]);
@@ -1577,16 +3534,60 @@ mod tests {
     }
 
     #[test]
-    fn refresh_follows_when_thread_was_at_end() {
+    fn initial_selected_thread_is_marked_read() {
+        let fixture = TuiFixture::new(&[1, 2, 3]);
+        let app = App::open(fixture.settings.clone(), false).unwrap();
+        let state = TuiState::load(&app).unwrap();
+
+        assert_eq!(state.messages[state.message_idx].id, 3);
+        assert_eq!(state.read_message_ids, [1, 2, 3].into());
+        assert_eq!(
+            state.stream_unread_counts.get("core").copied().unwrap_or(0),
+            0
+        );
+        assert_eq!(
+            state.topic_unread_counts.get("ops").copied().unwrap_or(0),
+            0
+        );
+    }
+
+    #[test]
+    fn refresh_preserves_cursor_and_keeps_new_messages_unread() {
         let fixture = TuiFixture::new(&[1, 2, 3]);
         let app = App::open(fixture.settings.clone(), false).unwrap();
         let mut state = TuiState::load(&app).unwrap();
         state.message_idx = 2;
 
         fixture.insert_messages(&[4]);
-        state.refresh_from_cache(&app, true).unwrap();
+        state.refresh_from_cache(&app).unwrap();
+
+        assert_eq!(state.messages[state.message_idx].id, 3);
+        assert!(!state.read_message_ids.contains(&4));
+        assert_eq!(state.stream_unread_counts.get("core"), Some(&1));
+        assert_eq!(state.topic_unread_counts.get("ops"), Some(&1));
+    }
+
+    #[test]
+    fn moving_to_new_thread_end_marks_thread_read() {
+        let fixture = TuiFixture::new(&[1, 2, 3]);
+        let app = App::open(fixture.settings.clone(), false).unwrap();
+        let mut state = TuiState::load(&app).unwrap();
+        fixture.insert_messages(&[4]);
+        state.refresh_from_cache(&app).unwrap();
+
+        state.focus = Focus::Thread;
+        state.move_selection(1, &app).unwrap();
 
         assert_eq!(state.messages[state.message_idx].id, 4);
+        assert!(state.read_message_ids.contains(&4));
+        assert_eq!(
+            state.stream_unread_counts.get("core").copied().unwrap_or(0),
+            0
+        );
+        assert_eq!(
+            state.topic_unread_counts.get("ops").copied().unwrap_or(0),
+            0
+        );
     }
 
     #[test]
@@ -1599,6 +3600,99 @@ mod tests {
     }
 
     #[test]
+    fn missing_credentials_open_login_form() {
+        let fixture = TuiFixture::new(&[]);
+        let app = App::open(fixture.settings.clone(), false).unwrap();
+
+        let state = TuiState::load(&app).unwrap();
+
+        assert_eq!(state.mode, Mode::Login);
+        assert_eq!(state.form.as_ref().unwrap().purpose, ConfigPurpose::Login);
+    }
+
+    #[test]
+    fn incomplete_startup_env_forces_login_even_when_settings_have_auth() {
+        let mut fixture = TuiFixture::new(&[]);
+        fixture.settings.zulip = ZulipConfig {
+            base_url: Some("https://stale.example".to_string()),
+            email: Some("dotenv@example.com".to_string()),
+            api_key: Some("stale-secret".to_string()),
+        };
+        let app = App::open(fixture.settings.clone(), false).unwrap();
+        let startup = StartupCredentials {
+            base_url: String::new(),
+            email: String::new(),
+            api_key: String::new(),
+        };
+
+        let state = TuiState::load_for_startup(&app, &startup).unwrap();
+        let form = state.form.as_ref().unwrap();
+
+        assert_eq!(state.mode, Mode::Login);
+        assert_eq!(form.value(ConfigField::BaseUrl), "");
+        assert_eq!(form.value(ConfigField::Email), "");
+        assert_eq!(form.value(ConfigField::ApiKey), "");
+    }
+
+    #[test]
+    fn complete_startup_env_does_not_force_login() {
+        let mut fixture = TuiFixture::new(&[]);
+        fixture.settings.zulip = ZulipConfig {
+            base_url: Some("https://zulip.example".to_string()),
+            email: Some("ada@example.com".to_string()),
+            api_key: Some("secret".to_string()),
+        };
+        let app = App::open(fixture.settings.clone(), false).unwrap();
+        let startup = StartupCredentials {
+            base_url: "https://zulip.example".to_string(),
+            email: "ada@example.com".to_string(),
+            api_key: "secret".to_string(),
+        };
+
+        let state = TuiState::load_for_startup(&app, &startup).unwrap();
+
+        assert_eq!(state.mode, Mode::Browser);
+    }
+
+    #[test]
+    fn complete_credentials_open_browser() {
+        let mut fixture = TuiFixture::new(&[]);
+        fixture.settings.zulip = ZulipConfig {
+            base_url: Some("https://zulip.example".to_string()),
+            email: Some("ada@example.com".to_string()),
+            api_key: Some("secret".to_string()),
+        };
+        let app = App::open(fixture.settings.clone(), false).unwrap();
+
+        let state = TuiState::load(&app).unwrap();
+
+        assert_eq!(state.mode, Mode::Browser);
+    }
+
+    #[test]
+    fn secret_form_fields_are_masked() {
+        let field = FormField::secret(ConfigField::ApiKey, "API key", "secret".to_string());
+
+        assert_eq!(field.display_value(), "******");
+    }
+
+    #[test]
+    fn config_parsers_accept_expected_values() {
+        assert_eq!(
+            parse_image_mode("placeholder").unwrap(),
+            ImageMode::Placeholder
+        );
+        assert_eq!(parse_image_mode("off").unwrap(), ImageMode::Off);
+        assert!(parse_image_mode("sparkles").is_err());
+        assert!(parse_bool("yes", "field").unwrap());
+        assert!(!parse_bool("0", "field").unwrap());
+        assert_eq!(
+            split_aliases("Ada, The Maintainer, "),
+            ["Ada", "The Maintainer"]
+        );
+    }
+
+    #[test]
     fn refresh_keeps_position_when_reading_older_messages() {
         let fixture = TuiFixture::new(&[1, 2, 3]);
         let app = App::open(fixture.settings.clone(), false).unwrap();
@@ -1606,9 +3700,508 @@ mod tests {
         state.message_idx = 0;
 
         fixture.insert_messages(&[4]);
-        state.refresh_from_cache(&app, false).unwrap();
+        state.refresh_from_cache(&app).unwrap();
 
         assert_eq!(state.messages[state.message_idx].id, 1);
+    }
+
+    #[test]
+    fn direct_messages_load_as_synthetic_left_pane_entry() {
+        let fixture = TuiFixture::new(&[1]);
+        fixture.insert_direct_messages(&[10, 11], "id:7");
+        let app = App::open(fixture.settings.clone(), false).unwrap();
+        let mut state = TuiState::load(&app).unwrap();
+
+        state.stream_idx = state.streams.len();
+        state.reload_topics(&app).unwrap();
+        state.reload_messages(&app).unwrap();
+
+        assert!(state.selected_direct_messages());
+        assert_eq!(state.direct_unread_count, 2);
+        assert_eq!(state.middle_len(), 1);
+        assert_eq!(
+            direct_conversation_label(state.selected_direct_conversation().unwrap()),
+            "Grace Hopper"
+        );
+        assert_eq!(
+            state
+                .messages
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>(),
+            [10, 11]
+        );
+        assert_eq!(selected_destination_label(&state), "DM: Grace Hopper");
+    }
+
+    #[test]
+    fn thread_lines_render_html_emoji_and_bold_spans() {
+        let settings = test_settings(TempDir::new().unwrap().path());
+        let app = App::open(settings, false).unwrap();
+        let messages = vec![test_message_with_html(
+            1,
+            r#"<p>Awesome <span class="emoji emoji-1f60e" title="sunglasses">:sunglasses:</span> <strong>bold</strong></p>"#,
+            "ignored",
+        )];
+        let theme = TuiTheme::zenburn();
+
+        let lines = thread_lines(
+            &messages,
+            0,
+            80,
+            &theme,
+            &app,
+            0,
+            Utc::now(),
+            &BTreeSet::from([1]),
+        );
+        let body = &lines[1];
+
+        assert_eq!(line_text(body), "Awesome 😎 bold");
+        assert!(body.spans.iter().any(|span| {
+            span.content.as_ref() == "bold" && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+    }
+
+    #[test]
+    fn selected_thread_message_uses_marker_without_selection_colors() {
+        let settings = test_settings(TempDir::new().unwrap().path());
+        let app = App::open(settings, false).unwrap();
+        let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+        let mut messages = vec![
+            test_message_with_text(1, "first"),
+            test_message_with_text(2, "second"),
+        ];
+        messages[0].timestamp = now - ChronoDuration::minutes(15);
+        messages[1].timestamp = now - ChronoDuration::days(1);
+        let theme = TuiTheme::zenburn();
+
+        let lines = thread_lines(
+            &messages,
+            1,
+            80,
+            &theme,
+            &app,
+            0,
+            now,
+            &BTreeSet::from([1, 2]),
+        );
+
+        assert_eq!(line_text(&lines[0]), "   15m ago Ada");
+        assert_eq!(line_text(&lines[3]), " > 1 day ago Ada");
+        assert_eq!(lines[3].spans[0].style.bg, Some(theme.background));
+        assert_eq!(lines[3].spans[1].style.bg, Some(theme.background));
+        assert_eq!(lines[4].spans[0].style.bg, Some(theme.background));
+        assert_ne!(lines[3].spans[0].style.bg, Some(theme.active_selection_bg));
+    }
+
+    #[test]
+    fn unread_thread_messages_use_star_marker() {
+        let settings = test_settings(TempDir::new().unwrap().path());
+        let app = App::open(settings, false).unwrap();
+        let messages = vec![
+            test_message_with_text(1, "first"),
+            test_message_with_text(2, "second"),
+        ];
+        let theme = TuiTheme::zenburn();
+
+        let lines = thread_lines(
+            &messages,
+            0,
+            80,
+            &theme,
+            &app,
+            0,
+            Utc::now(),
+            &BTreeSet::from([1]),
+        );
+
+        assert!(line_text(&lines[0]).starts_with(" > "));
+        assert!(line_text(&lines[3]).starts_with(" * "));
+    }
+
+    #[test]
+    fn literal_shortcodes_expand_using_emoji_dataset() {
+        let message = test_message_with_html(
+            1,
+            r#"<p>launch :rocket: :sunglasses: :not_real:</p>"#,
+            "ignored",
+        );
+
+        let lines = message_body_lines(&message, 80, Style::default());
+
+        assert_eq!(line_text(&lines[0]), "launch 🚀 😎 :not_real:");
+    }
+
+    #[test]
+    fn styled_html_wrapping_preserves_span_styles() {
+        let message =
+            test_message_with_html(1, r#"<p>one two <strong>three</strong></p>"#, "ignored");
+
+        let lines = message_body_lines(&message, 8, Style::default());
+
+        assert_eq!(
+            lines.iter().map(line_text).collect::<Vec<_>>(),
+            ["one two", "three"]
+        );
+        assert!(lines[1].spans.iter().any(|span| {
+            span.content.as_ref() == "three" && span.style.add_modifier.contains(Modifier::BOLD)
+        }));
+    }
+
+    #[test]
+    fn fuzzy_time_ago_formats_boundaries() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+
+        assert_eq!(fuzzy_time_ago(now + ChronoDuration::seconds(1), now), "now");
+        assert_eq!(
+            fuzzy_time_ago(now - ChronoDuration::seconds(59), now),
+            "now"
+        );
+        assert_eq!(
+            fuzzy_time_ago(now - ChronoDuration::minutes(1), now),
+            "1m ago"
+        );
+        assert_eq!(
+            fuzzy_time_ago(now - ChronoDuration::minutes(15), now),
+            "15m ago"
+        );
+        assert_eq!(
+            fuzzy_time_ago(now - ChronoDuration::hours(1), now),
+            "1h ago"
+        );
+        assert_eq!(
+            fuzzy_time_ago(now - ChronoDuration::hours(23), now),
+            "23h ago"
+        );
+        assert_eq!(
+            fuzzy_time_ago(now - ChronoDuration::days(1), now),
+            "1 day ago"
+        );
+        assert_eq!(
+            fuzzy_time_ago(now - ChronoDuration::days(6), now),
+            "6 days ago"
+        );
+        assert_eq!(
+            fuzzy_time_ago(now - ChronoDuration::days(7), now),
+            "1 week ago"
+        );
+        assert_eq!(
+            fuzzy_time_ago(now - ChronoDuration::days(21), now),
+            "3 weeks ago"
+        );
+        assert_eq!(
+            fuzzy_time_ago(now - ChronoDuration::days(45), now),
+            "1 month ago"
+        );
+        assert_eq!(
+            fuzzy_time_ago(now - ChronoDuration::days(120), now),
+            "4 months ago"
+        );
+        assert_eq!(
+            fuzzy_time_ago(now - ChronoDuration::days(365), now),
+            "1 year ago"
+        );
+        assert_eq!(
+            fuzzy_time_ago(now - ChronoDuration::days(800), now),
+            "2 years ago"
+        );
+    }
+
+    #[test]
+    fn draft_editor_inserts_in_middle() {
+        let mut editor = TextEditor::default();
+        editor.insert_char('a');
+        editor.insert_char('c');
+        editor.move_left();
+        editor.insert_char('b');
+
+        assert_eq!(editor.as_str(), "abc");
+        assert_eq!(editor.cursor, 2);
+    }
+
+    #[test]
+    fn draft_editor_pastes_string_at_cursor() {
+        let mut editor = TextEditor::default();
+        editor.insert_str("hello  world");
+        for _ in 0.." world".len() {
+            editor.move_left();
+        }
+        editor.insert_str("there");
+
+        assert_eq!(editor.as_str(), "hello there world");
+        assert_eq!(editor.cursor, "hello there".len());
+    }
+
+    #[test]
+    fn composer_paste_event_inserts_text() {
+        let fixture = TuiFixture::new(&[]);
+        let app = App::open(fixture.settings.clone(), false).unwrap();
+        let mut state = TuiState::load(&app).unwrap();
+        state.mode = Mode::Composer;
+        state.draft.insert_str("hello ");
+
+        handle_paste("there\nfriend".to_string(), &mut state);
+
+        assert_eq!(state.draft.as_str(), "hello there\nfriend");
+    }
+
+    #[test]
+    fn draft_editor_backspace_removes_previous_grapheme() {
+        let mut editor = TextEditor::default();
+        editor.insert_char('a');
+        editor.insert_char('😎');
+        editor.insert_char('b');
+        editor.move_left();
+        editor.backspace();
+
+        assert_eq!(editor.as_str(), "ab");
+        assert_eq!(editor.cursor, 1);
+    }
+
+    #[test]
+    fn draft_editor_delete_removes_current_grapheme() {
+        let mut editor = TextEditor::default();
+        editor.insert_char('a');
+        editor.insert_char('😎');
+        editor.insert_char('b');
+        editor.move_left();
+        editor.move_left();
+        editor.delete();
+
+        assert_eq!(editor.as_str(), "ab");
+        assert_eq!(editor.cursor, 1);
+    }
+
+    #[test]
+    fn draft_editor_left_right_move_by_grapheme() {
+        let mut editor = TextEditor::default();
+        editor.insert_char('a');
+        editor.insert_char('😎');
+        editor.insert_char('b');
+
+        editor.move_left();
+        assert_eq!(editor.cursor, "a😎".len());
+        editor.move_left();
+        assert_eq!(editor.cursor, "a".len());
+        editor.move_right();
+        assert_eq!(editor.cursor, "a😎".len());
+    }
+
+    #[test]
+    fn draft_editor_home_end_stay_on_current_line() {
+        let mut editor = TextEditor::default();
+        editor.insert_char('a');
+        editor.insert_newline();
+        editor.insert_char('b');
+        editor.insert_char('c');
+        editor.move_left();
+
+        editor.move_home();
+        assert_eq!(editor.cursor, "a\n".len());
+        editor.move_end();
+        assert_eq!(editor.cursor, "a\nbc".len());
+    }
+
+    #[test]
+    fn draft_editor_enter_splits_text_at_cursor() {
+        let mut editor = TextEditor::default();
+        editor.insert_char('a');
+        editor.insert_char('b');
+        editor.move_left();
+        editor.insert_newline();
+
+        assert_eq!(editor.as_str(), "a\nb");
+        assert_eq!(editor.cursor, "a\n".len());
+    }
+
+    #[test]
+    fn draft_editor_up_down_preserve_column() {
+        let mut editor = TextEditor::default();
+        for ch in "one\nthree\nx".chars() {
+            editor.insert_char(ch);
+        }
+
+        editor.move_up();
+        assert_eq!(editor.cursor, "one\n".len() + 1);
+        editor.move_up();
+        assert_eq!(editor.cursor, "o".len());
+        editor.move_down();
+        assert_eq!(editor.cursor, "one\nt".len());
+    }
+
+    #[test]
+    fn empty_input_cursor_starts_on_input_line() {
+        let area = Rect::new(10, 20, 30, 10);
+
+        assert_eq!(input_cursor_position(area, 2, ""), Some((11, 23)));
+    }
+
+    #[test]
+    fn command_cursor_follows_text_width() {
+        let area = Rect::new(10, 20, 30, 10);
+
+        assert_eq!(input_cursor_position(area, 2, "abc"), Some((14, 23)));
+    }
+
+    #[test]
+    fn input_cursor_counts_wide_emoji_cells() {
+        let area = Rect::new(10, 20, 30, 10);
+
+        assert_eq!(input_cursor_position(area, 2, "a😎"), Some((14, 23)));
+    }
+
+    #[test]
+    fn input_cursor_clamps_to_overlay_width() {
+        let area = Rect::new(10, 20, 10, 10);
+
+        assert_eq!(
+            input_cursor_position(area, 2, "way too long for the modal"),
+            Some((18, 23))
+        );
+    }
+
+    #[test]
+    fn draft_cursor_follows_last_draft_line() {
+        let area = Rect::new(10, 20, 30, 10);
+
+        assert_eq!(
+            draft_cursor_position(area, "one\ntwo", "one\ntwo".len()),
+            Some((14, 27))
+        );
+    }
+
+    #[test]
+    fn draft_cursor_follows_wrapped_sentence() {
+        let area = Rect::new(10, 20, 10, 10);
+
+        assert_eq!(
+            draft_cursor_position(area, "one two three", "one two three".len()),
+            Some((16, 27))
+        );
+    }
+
+    #[test]
+    fn draft_cursor_follows_wrapped_long_word() {
+        let area = Rect::new(10, 20, 10, 10);
+
+        assert_eq!(
+            draft_cursor_position(area, "abcdefghijk", "abcdefghijk".len()),
+            Some((14, 27))
+        );
+    }
+
+    #[test]
+    fn draft_cursor_can_sit_in_middle_of_line() {
+        let area = Rect::new(10, 20, 30, 10);
+
+        assert_eq!(draft_cursor_position(area, "one two", 3), Some((14, 26)));
+    }
+
+    #[test]
+    fn draft_cursor_can_sit_on_earlier_multiline_line() {
+        let area = Rect::new(10, 20, 30, 10);
+
+        assert_eq!(draft_cursor_position(area, "one\ntwo", 1), Some((12, 26)));
+    }
+
+    #[test]
+    fn draft_cursor_counts_wide_emoji_before_cursor() {
+        let area = Rect::new(10, 20, 30, 10);
+
+        assert_eq!(
+            draft_cursor_position(area, "a😎b", "a😎".len()),
+            Some((14, 26))
+        );
+    }
+
+    #[test]
+    fn draft_cursor_can_sit_inside_wrapped_text() {
+        let area = Rect::new(10, 20, 10, 10);
+
+        assert_eq!(
+            draft_cursor_position(area, "one two three", "one two".len()),
+            Some((18, 26))
+        );
+    }
+
+    #[test]
+    fn emoji_width_uses_terminal_cell_width() {
+        assert_eq!(display_width("a"), 1);
+        assert_eq!(display_width("😎"), 2);
+        assert_eq!(display_width("a😎"), 3);
+    }
+
+    #[test]
+    fn wrapping_keeps_multi_codepoint_emoji_graphemes_intact() {
+        let segments = [StyledSegment {
+            text: "❤️x".to_string(),
+            style: Style::default(),
+        }];
+
+        let lines = wrap_styled_segments(&segments, 1, Style::default());
+
+        assert_eq!(lines.iter().map(line_text).collect::<Vec<_>>(), ["❤️", "x"]);
+    }
+
+    #[test]
+    fn wrapping_counts_zwj_emoji_as_single_wide_grapheme() {
+        let segments = [StyledSegment {
+            text: "a👨‍💻b".to_string(),
+            style: Style::default(),
+        }];
+
+        let lines = wrap_styled_segments(&segments, 3, Style::default());
+
+        assert_eq!(
+            lines.iter().map(line_text).collect::<Vec<_>>(),
+            ["a👨‍💻", "b"]
+        );
+    }
+
+    #[test]
+    fn thread_lines_show_aggregated_reactions_under_message() {
+        let settings = test_settings(TempDir::new().unwrap().path());
+        let app = App::open(settings, false).unwrap();
+        let mut message = test_message_with_text(1, "hello");
+        message.raw_json = json!({
+            "id": 1,
+            "reactions": [
+                {"emoji_name": "thumbs_up", "emoji_code": "1f44d", "reaction_type": "unicode_emoji"},
+                {"emoji_name": "thumbs_up", "emoji_code": "1f44d", "reaction_type": "unicode_emoji"},
+                {"emoji_name": "sunglasses", "emoji_code": "1f60e", "reaction_type": "unicode_emoji"}
+            ]
+        });
+        let theme = TuiTheme::zenburn();
+
+        let lines = thread_lines(
+            &[message],
+            0,
+            80,
+            &theme,
+            &app,
+            0,
+            Utc::now(),
+            &BTreeSet::from([1]),
+        );
+        let text = lines.iter().map(line_text).collect::<Vec<_>>();
+
+        assert!(text.iter().any(|line| line == "👍 2  😎 1"));
+    }
+
+    #[test]
+    fn reaction_summary_falls_back_to_shortcode_for_custom_emoji() {
+        let mut message = test_message_with_text(1, "hello");
+        message.raw_json = json!({
+            "id": 1,
+            "reactions": [
+                {"emoji_name": "party parrot", "emoji_code": "123", "reaction_type": "realm_emoji"}
+            ]
+        });
+
+        let line = reaction_line(&message, Style::default()).unwrap();
+
+        assert_eq!(line_text(&line), ":party_parrot: 1");
     }
 
     #[test]
@@ -1623,7 +4216,16 @@ mod tests {
         )];
         let theme = TuiTheme::zenburn();
 
-        let lines = thread_lines(&messages, 0, 40, true, &theme, &app, IMAGE_ROWS);
+        let lines = thread_lines(
+            &messages,
+            0,
+            40,
+            &theme,
+            &app,
+            IMAGE_ROWS,
+            Utc::now(),
+            &BTreeSet::from([1]),
+        );
         let text = lines.iter().map(line_text).collect::<Vec<_>>();
 
         assert!(text.iter().any(|line| line == "[image: rack.png]"));
@@ -1646,10 +4248,50 @@ mod tests {
         )];
         let theme = TuiTheme::zenburn();
 
-        let lines = thread_lines(&messages, 0, 40, true, &theme, &app, 0);
+        let lines = thread_lines(
+            &messages,
+            0,
+            40,
+            &theme,
+            &app,
+            0,
+            Utc::now(),
+            &BTreeSet::from([1]),
+        );
         let text = lines.iter().map(line_text).collect::<Vec<_>>();
 
         assert!(!text.iter().any(|line| line.contains("[image:")));
+    }
+
+    #[cfg(feature = "tui-images")]
+    #[test]
+    fn iterm_env_prefers_iterm2_protocol() {
+        assert!(terminal_env_prefers_iterm2_protocol(
+            Some("iTerm.app"),
+            None,
+            None
+        ));
+        assert!(terminal_env_prefers_iterm2_protocol(
+            None,
+            Some("iTerm2"),
+            None
+        ));
+        assert!(terminal_env_prefers_iterm2_protocol(
+            None,
+            None,
+            Some("w0t0p0")
+        ));
+    }
+
+    #[cfg(feature = "tui-images")]
+    #[test]
+    fn non_iterm_env_keeps_detected_protocol() {
+        assert!(!terminal_env_prefers_iterm2_protocol(
+            Some("ghostty"),
+            None,
+            None
+        ));
+        assert!(!terminal_env_prefers_iterm2_protocol(None, None, Some("")));
     }
 
     struct TuiFixture {
@@ -1698,6 +4340,20 @@ mod tests {
                 .collect::<Vec<_>>();
             cache.upsert_messages(&messages).unwrap();
         }
+
+        fn insert_direct_messages(&self, message_ids: &[i64], key: &str) {
+            let cache = Cache::open(&self.settings.paths.cache_file).unwrap();
+            let participants = vec![ZulipDmParticipant {
+                id: Some(7),
+                name: "Grace Hopper".to_string(),
+                email: Some("grace@example.com".to_string()),
+            }];
+            let messages = message_ids
+                .iter()
+                .map(|id| test_direct_message(*id, key, participants.clone()))
+                .collect::<Vec<_>>();
+            cache.upsert_messages(&messages).unwrap();
+        }
     }
 
     fn test_message(id: i64) -> ZulipMessage {
@@ -1711,15 +4367,42 @@ mod tests {
     fn test_message_with_html(id: i64, html: &str, text: &str) -> ZulipMessage {
         ZulipMessage {
             id,
+            message_type: ZulipMessageType::Stream,
             stream_id: Some(1),
             stream_name: "core".to_string(),
             topic: "ops".to_string(),
+            dm_conversation_key: None,
+            dm_participants: Vec::new(),
             sender_id: Some(2),
             sender_name: "Ada".to_string(),
             sender_email: Some("ada@example.com".to_string()),
             timestamp: Utc::now(),
             rendered_html: html.to_string(),
             plain_text: text.to_string(),
+            permalink: None,
+            raw_json: json!({ "id": id }),
+        }
+    }
+
+    fn test_direct_message(
+        id: i64,
+        key: &str,
+        participants: Vec<ZulipDmParticipant>,
+    ) -> ZulipMessage {
+        ZulipMessage {
+            id,
+            message_type: ZulipMessageType::Direct,
+            stream_id: None,
+            stream_name: "Direct messages".to_string(),
+            topic: "Grace Hopper".to_string(),
+            dm_conversation_key: Some(key.to_string()),
+            dm_participants: participants,
+            sender_id: Some(7),
+            sender_name: "Grace Hopper".to_string(),
+            sender_email: Some("grace@example.com".to_string()),
+            timestamp: Utc.timestamp_opt(1_700_000_000 + id, 0).unwrap(),
+            rendered_html: format!("<p>dm {id}</p>"),
+            plain_text: format!("dm {id}"),
             permalink: None,
             raw_json: json!({ "id": id }),
         }

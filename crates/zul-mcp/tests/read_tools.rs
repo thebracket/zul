@@ -15,7 +15,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 use zul_mcp::tools::{call, invalid_arguments_result, ToolContext, ToolFailure};
 
@@ -405,23 +405,33 @@ async fn sync_populates_the_cache_for_later_reads() {
         .expect(1)
         .mount(&server)
         .await;
+    let message_body = json!({
+        "result": "success",
+        "msg": "",
+        "messages": [{
+            "id": 11,
+            "stream_id": 1,
+            "display_recipient": "core team",
+            "subject": "ops",
+            "sender_id": 2,
+            "sender_full_name": "Ada",
+            "sender_email": "ada@example.com",
+            "timestamp": now(),
+            "content": "<p>hello from wiremock</p>",
+        }],
+    });
     Mock::given(method("GET"))
         .and(path("/api/v1/messages"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "result": "success",
-            "msg": "",
-            "messages": [{
-                "id": 11,
-                "stream_id": 1,
-                "display_recipient": "core team",
-                "subject": "ops",
-                "sender_id": 2,
-                "sender_full_name": "Ada",
-                "sender_email": "ada@example.com",
-                "timestamp": now(),
-                "content": "<p>hello from wiremock</p>",
-            }],
-        })))
+        .and(query_param("anchor", "newest"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(message_body.clone()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    // `sync` refreshes cached messages authored by the current account.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/messages"))
+        .and(query_param("anchor", "11"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(message_body))
         .expect(1)
         .mount(&server)
         .await;
@@ -437,7 +447,13 @@ async fn sync_populates_the_cache_for_later_reads() {
     let synced = structured(&synced);
     assert_eq!(
         synced,
-        &json!({"streams": 1, "messages": 1, "hours": 1, "offline": false})
+        &json!({
+            "streams": 1,
+            "messages": 1,
+            "refreshed_messages": 1,
+            "hours": 1,
+            "offline": false
+        })
     );
 
     let read = invoke(

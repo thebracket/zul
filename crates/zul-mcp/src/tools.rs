@@ -384,6 +384,7 @@ async fn sync(context: &ToolContext, hours: i64) -> Value {
         Ok(result) => complete_result(json!({
             "streams": result.streams,
             "messages": result.messages,
+            "refreshed_messages": result.refreshed_messages,
             "hours": result.hours,
             "offline": result.offline,
         })),

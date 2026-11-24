@@ -7,7 +7,7 @@ license.workspace = true
 
 [features]
 default = ["tui-images"]
-tui-images = ["dep:image", "dep:ratatui-image"]
+tui-images = ["dep:ratatui-image"]
 
 [[bin]]
 name = "zul-tui"
@@ -15,15 +15,21 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+arboard.workspace = true
 chrono.workspace = true
 crossterm.workspace = true
-image = { workspace = true, optional = true }
+ego-tree = "0.10"
+emojis = "0.8.2"
+image.workspace = true
 dotenvy.workspace = true
 libzul.workspace = true
 ratatui.workspace = true
 ratatui-image = { workspace = true, optional = true }
+scraper.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
+unicode-segmentation = "1.13"
+unicode-width = "0.2"
 
 [dev-dependencies]
 serde_json.workspace = true

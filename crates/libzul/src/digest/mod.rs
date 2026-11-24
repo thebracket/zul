@@ -174,7 +174,7 @@ fn unanswered_questions(messages: &[ZulipMessage]) -> Vec<DigestItem> {
         }
     }
 
-    unanswered.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    unanswered.sort_by_key(|item| std::cmp::Reverse(item.timestamp));
     unanswered.truncate(50);
     unanswered
 }
@@ -213,14 +213,18 @@ fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::zulip::models::ZulipMessageType;
     use serde_json::json;
 
     fn msg(id: i64, text: &str) -> ZulipMessage {
         ZulipMessage {
             id,
+            message_type: ZulipMessageType::Stream,
             stream_id: Some(1),
             stream_name: "core".to_string(),
             topic: "ops".to_string(),
+            dm_conversation_key: None,
+            dm_participants: Vec::new(),
             sender_id: None,
             sender_name: "Ada".to_string(),
             sender_email: None,

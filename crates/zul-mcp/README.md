@@ -220,7 +220,7 @@ every successful result carries `structuredContent` plus a JSON text copy.
 | Tool | Inputs (defaults in parentheses) | Behaviour |
 | --- | --- | --- |
 | `whoami` | none | Reports the configured realm URL, account email, `ready`, and `problems`. Local config probe; does not sync the cache. |
-| `sync` | `hours` 1–168 (24) | Fetches subscribed streams and recent messages into the cache. Network call; run it before reading. |
+| `sync` | `hours` 1–168 (24) | Fetches subscribed streams and recent messages into the cache and refreshes cached messages authored by the account. Network call; run it before reading. |
 | `list_streams` | none | Cached streams, sorted by name. |
 | `list_topics` | `stream` (required) | Cached topics in one stream, newest activity first. An unknown stream returns an empty list. |
 | `read_topic` | `stream`, `topic` (required); `limit` 1–500 (100) | The newest `limit` cached messages in the topic, returned oldest first. Message text is capped at 4000 characters with `text_truncated`. |
@@ -466,9 +466,9 @@ Cursors and gaps:
 - Reads are cache-only. `sync` is explicit and accepts at most 168 hours; there
   is no background cache refresh except the events poller, which does not write
   the cache.
-- `cargo clippy -p zul-mcp --all-targets --no-deps -- -D warnings` checks this
-  crate. Omitting `--no-deps` also lints `libzul`, where a pre-existing clippy
-  warning fails the build; that lint is unrelated to `zul-mcp`.
+- `cargo clippy -p zul-mcp --all-targets -- -D warnings` checks this crate and
+  its `libzul` dependency. A full `cargo clippy --workspace` still reports
+  pre-existing lints in `zul-tui`; those are unrelated to `zul-mcp`.
 
 ## Troubleshooting
 

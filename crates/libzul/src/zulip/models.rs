@@ -1,6 +1,58 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+/// Kind of Zulip conversation a message belongs to.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ZulipMessageType {
+    /// Channel/stream message with a topic.
+    Stream,
+    /// Direct message conversation.
+    Direct,
+}
+
+impl ZulipMessageType {
+    /// Stable cache representation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stream => "stream",
+            Self::Direct => "direct",
+        }
+    }
+
+    /// Parse a cached representation, defaulting old rows to stream messages.
+    pub fn from_cache(value: &str) -> Self {
+        match value {
+            "direct" => Self::Direct,
+            _ => Self::Stream,
+        }
+    }
+}
+
+/// One participant in a Zulip direct-message conversation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ZulipDmParticipant {
+    /// Zulip user ID, if present in the API response.
+    pub id: Option<i64>,
+    /// Display name.
+    pub name: String,
+    /// Email address, if present.
+    pub email: Option<String>,
+}
+
+/// Cached summary for one direct-message conversation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ZulipDirectConversation {
+    /// Stable cache key for the participant set.
+    pub key: String,
+    /// Participants displayed for the conversation.
+    pub participants: Vec<ZulipDmParticipant>,
+    /// Number of cached messages in this conversation.
+    pub message_count: i64,
+    /// Timestamp of the newest cached message in the conversation.
+    pub last_message_at: Option<DateTime<Utc>>,
+}
+
 /// Zulip stream metadata stored in the local cache.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ZulipStream {
@@ -32,12 +84,18 @@ pub struct ZulipTopic {
 pub struct ZulipMessage {
     /// Zulip message ID.
     pub id: i64,
+    /// Conversation kind.
+    pub message_type: ZulipMessageType,
     /// Zulip stream ID, if the API response included one.
     pub stream_id: Option<i64>,
     /// Stream display name.
     pub stream_name: String,
     /// Topic name.
     pub topic: String,
+    /// Stable direct-message conversation key, for direct messages.
+    pub dm_conversation_key: Option<String>,
+    /// Direct-message participants, for direct messages.
+    pub dm_participants: Vec<ZulipDmParticipant>,
     /// Sender Zulip user ID, if present.
     pub sender_id: Option<i64>,
     /// Sender display name.
@@ -112,6 +170,8 @@ pub struct ZulipApiResponse<T> {
     pub result: String,
     /// Zulip message text for errors or status details.
     pub msg: String,
+    /// Zulip machine-readable error code, when present.
+    pub code: Option<String>,
     #[serde(flatten)]
     /// Endpoint-specific response payload.
     pub data: T,
@@ -158,11 +218,28 @@ pub struct SendMessageResponse {
     pub id: i64,
 }
 
+/// Response payload for the upload-file endpoint.
+#[derive(Debug, Deserialize)]
+pub struct UploadFileResponse {
+    /// URL of the uploaded file, available on modern Zulip servers.
+    pub url: Option<String>,
+    /// Legacy alias for `url`.
+    pub uri: Option<String>,
+    /// Filename stored by Zulip.
+    pub filename: Option<String>,
+}
+
+/// Empty response payload for endpoints that only return the Zulip envelope.
+#[derive(Debug, Deserialize)]
+pub struct EmptyResponse {}
+
 impl<T> ZulipApiResponse<T> {
     /// Return the endpoint payload or convert a Zulip error into an `anyhow` error.
     pub fn into_data(self) -> anyhow::Result<T> {
         if self.result == "success" {
             Ok(self.data)
+        } else if let Some(code) = self.code {
+            anyhow::bail!("Zulip API error {code}: {}", self.msg);
         } else {
             anyhow::bail!("Zulip API error: {}", self.msg);
         }

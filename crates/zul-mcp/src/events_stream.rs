@@ -853,16 +853,19 @@ pub(crate) async fn serve(subscription: Subscription, tx: mpsc::Sender<String>) 
 mod tests {
     use super::*;
     use crate::events::EVENT_NAME;
-    use libzul::zulip::models::ZulipMessage;
+    use libzul::zulip::models::{ZulipMessage, ZulipMessageType};
     use serde_json::json;
     use tokio::task::LocalSet;
 
     fn message(id: i64, timestamp: chrono::DateTime<Utc>) -> ZulipMessage {
         ZulipMessage {
             id,
+            message_type: ZulipMessageType::Stream,
             stream_id: Some(1),
             stream_name: "core".to_string(),
             topic: "ops".to_string(),
+            dm_conversation_key: None,
+            dm_participants: Vec::new(),
             sender_id: Some(2),
             sender_name: "Grace".to_string(),
             sender_email: Some("grace@example.com".to_string()),
