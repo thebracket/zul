@@ -26,6 +26,8 @@ pub const READ_TOPIC: &str = "read_topic";
 pub const RECENT: &str = "recent";
 /// Tool name for searching cached messages.
 pub const SEARCH: &str = "search";
+/// Tool name for dry-run or confirmed stream sends.
+pub const SEND_MESSAGE: &str = "send_message";
 
 const DEFAULT_HOURS: i64 = 24;
 const MAX_HOURS: i64 = 168;
@@ -33,6 +35,9 @@ const DEFAULT_READ_LIMIT: i64 = 100;
 const MAX_READ_LIMIT: i64 = 500;
 const DEFAULT_SEARCH_LIMIT: i64 = 50;
 const MAX_SEARCH_LIMIT: i64 = 100;
+
+/// Longest message body accepted by the send tool, in Unicode scalar values.
+const MAX_SEND_MESSAGE_CHARS: usize = 10_000;
 
 /// Longest message text returned by a read tool, in Unicode scalar values.
 const MAX_MESSAGE_TEXT_CHARS: usize = 4000;
@@ -146,6 +151,25 @@ pub fn catalog() -> Value {
                     }
                 },
                 "required": ["query"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": SEND_MESSAGE,
+            "description": "Send a message to a Zulip stream topic. The default is a dry run: it validates the destination, records the attempt, and returns what would be sent without contacting Zulip. Pass confirm:true only when the user has approved an actual send. Never include credentials or API keys in the message.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "stream": {"type": "string", "minLength": 1},
+                    "topic": {"type": "string", "minLength": 1},
+                    "message": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_SEND_MESSAGE_CHARS
+                    },
+                    "confirm": {"type": "boolean", "default": false}
+                },
+                "required": ["stream", "topic", "message"],
                 "additionalProperties": false
             }
         }
@@ -269,6 +293,16 @@ pub async fn call(
                 ));
             }
             Ok(search(context, query.trim(), limit))
+        }
+        SEND_MESSAGE => {
+            let mut args = arguments_object(arguments, SEND_MESSAGE)?;
+            let stream = string_argument(&mut args, "stream")?;
+            let topic = string_argument(&mut args, "topic")?;
+            let message = string_argument(&mut args, "message")?;
+            let confirm = boolean_argument(&mut args, "confirm")?;
+            ensure_consumed(args, SEND_MESSAGE)?;
+            validate_send_message(&stream, &topic, &message)?;
+            Ok(send_message(context, &stream, &topic, &message, confirm).await)
         }
         other => Err(ToolFailure::UnknownTool(other.to_string())),
     }
@@ -424,6 +458,44 @@ fn search(context: &ToolContext, query: &str, limit: i64) -> Value {
     })
 }
 
+async fn send_message(
+    context: &ToolContext,
+    stream: &str,
+    topic: &str,
+    message: &str,
+    confirm: bool,
+) -> Value {
+    let app = match context.app() {
+        Ok(app) => app,
+        Err(problem) => return tool_error(SEND_MESSAGE, problem),
+    };
+    // libzul owns the safety contract: audit-first recording, the duplicate
+    // guard, and the requirement that a real send be explicitly confirmed.
+    match app.reply(stream, topic, message, !confirm, confirm).await {
+        Ok(reply) => match serde_json::to_value(&reply) {
+            Ok(structured) => complete_result(structured),
+            Err(err) => tool_error(SEND_MESSAGE, err),
+        },
+        Err(err) => tool_error(SEND_MESSAGE, err),
+    }
+}
+
+fn validate_send_message(stream: &str, topic: &str, message: &str) -> Result<(), ToolFailure> {
+    for (name, value) in [("stream", stream), ("topic", topic), ("message", message)] {
+        if value.trim().is_empty() {
+            return Err(ToolFailure::InvalidArguments(format!(
+                "{name} must not be blank"
+            )));
+        }
+    }
+    if message.chars().count() > MAX_SEND_MESSAGE_CHARS {
+        return Err(ToolFailure::InvalidArguments(format!(
+            "message must be at most {MAX_SEND_MESSAGE_CHARS} characters"
+        )));
+    }
+    Ok(())
+}
+
 fn message_view(message: &ZulipMessage) -> Value {
     let (text, text_truncated) = cap_text(&message.plain_text);
     json!({
@@ -535,6 +607,16 @@ fn integer_argument(
     }
 }
 
+fn boolean_argument(args: &mut Map<String, Value>, name: &str) -> Result<bool, ToolFailure> {
+    match args.remove(name) {
+        None => Ok(false),
+        Some(Value::Bool(value)) => Ok(value),
+        Some(_) => Err(ToolFailure::InvalidArguments(format!(
+            "{name} must be a boolean"
+        ))),
+    }
+}
+
 fn ensure_consumed(args: Map<String, Value>, tool: &str) -> Result<(), ToolFailure> {
     if args.is_empty() {
         return Ok(());
@@ -568,7 +650,8 @@ mod tests {
                 LIST_TOPICS,
                 READ_TOPIC,
                 RECENT,
-                SEARCH
+                SEARCH,
+                SEND_MESSAGE
             ]
         );
         for tool in tools {
@@ -612,6 +695,51 @@ mod tests {
         let (text, truncated) = cap_text(&unicode);
         assert!(truncated);
         assert_eq!(text.chars().count(), MAX_MESSAGE_TEXT_CHARS);
+    }
+
+    #[test]
+    fn send_message_schema_freezes_the_safety_contract() {
+        let tools = catalog();
+        let tools = tools.as_array().expect("catalog is an array");
+        let send = tools
+            .iter()
+            .find(|tool| tool["name"] == SEND_MESSAGE)
+            .expect("send_message in the catalog");
+        let schema = &send["inputSchema"];
+        assert_eq!(schema["required"], json!(["stream", "topic", "message"]));
+        assert_eq!(schema["additionalProperties"], false);
+        for name in ["stream", "topic", "message"] {
+            assert_eq!(schema["properties"][name]["type"], "string");
+            assert_eq!(schema["properties"][name]["minLength"], 1);
+        }
+        assert_eq!(
+            schema["properties"]["message"]["maxLength"],
+            MAX_SEND_MESSAGE_CHARS
+        );
+        assert_eq!(schema["properties"]["confirm"]["type"], "boolean");
+        assert_eq!(schema["properties"]["confirm"]["default"], false);
+
+        let description = send["description"].as_str().expect("description");
+        assert!(description.contains("dry run"), "{description}");
+        assert!(description.contains("confirm:true"), "{description}");
+        assert!(description.contains("credentials"), "{description}");
+
+        assert!(validate_send_message("core", "ops", "hello").is_ok());
+        assert!(validate_send_message("core", "ops", &"x".repeat(MAX_SEND_MESSAGE_CHARS)).is_ok());
+        for (stream, topic, message) in [
+            (" ", "ops", "hello"),
+            ("core", "", "hello"),
+            ("core", "ops", "\t"),
+        ] {
+            assert!(matches!(
+                validate_send_message(stream, topic, message),
+                Err(ToolFailure::InvalidArguments(_))
+            ));
+        }
+        assert!(matches!(
+            validate_send_message("core", "ops", &"x".repeat(MAX_SEND_MESSAGE_CHARS + 1)),
+            Err(ToolFailure::InvalidArguments(_))
+        ));
     }
 
     #[test]

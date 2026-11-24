@@ -248,7 +248,8 @@ pub fn discover_result() -> Value {
     body.insert(
         "instructions".to_string(),
         json!(
-            "zul-mcp exposes read-only Zulip tools over MCP 2026-07-28. \
+            "zul-mcp exposes Zulip tools over MCP 2026-07-28: cache-backed read tools \
+    and a send tool that is a dry run unless the caller confirms. \
     Call tools/list to discover them. Tools may report missing credentials until \
     Zulip auth is configured; discovery and tools/list do not require it."
         ),

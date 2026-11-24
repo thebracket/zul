@@ -349,7 +349,8 @@ fn serves_discovery_tools_and_protocol_errors() {
             "list_topics",
             "read_topic",
             "recent",
-            "search"
+            "search",
+            "send_message"
         ]
     );
     for tool in tools {
@@ -485,6 +486,51 @@ fn serves_discovery_tools_and_protocol_errors() {
 }
 
 #[test]
+fn send_message_without_credentials_is_a_tool_error() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut harness = Harness::start(dir.path());
+
+    harness.send(&modern(
+        json!(1),
+        "tools/call",
+        json!({
+            "name": "send_message",
+            "arguments": {
+                "stream": "core",
+                "topic": "ops",
+                "message": "hello from stdio",
+                "confirm": true,
+            },
+        }),
+    ));
+    let line = harness.recv();
+    let response: Value = serde_json::from_str(&line).expect("send_message response is JSON");
+    let result = &response["result"];
+    assert_eq!(result["resultType"], "complete");
+    assert_eq!(result["isError"], true);
+    assert!(
+        result.get("structuredContent").is_none(),
+        "a failed send must not carry a structured payload: {result}"
+    );
+    let text = result["content"][0]["text"].as_str().expect("text content");
+    assert!(
+        text.contains("missing Zulip API key"),
+        "the missing credential must be named: {text}"
+    );
+    assert!(
+        !text.contains("hello from stdio"),
+        "an auth failure must not echo the message body: {text}"
+    );
+
+    let (remaining, status, stderr) = harness.finish();
+    assert!(status.success(), "exit status {status:?}; stderr: {stderr}");
+    assert!(
+        remaining.is_empty(),
+        "unexpected extra stdout lines: {remaining:?}"
+    );
+}
+
+#[test]
 fn answers_requests_read_before_stdin_closes() {
     let dir = tempfile::tempdir().expect("temp dir");
     let mut harness = Harness::start(dir.path());
@@ -505,7 +551,7 @@ fn answers_requests_read_before_stdin_closes() {
         responses.get("n:2").expect("tools list")["result"]["tools"]
             .as_array()
             .map(Vec::len),
-        Some(7)
+        Some(8)
     );
     assert_eq!(
         responses.get("n:3").expect("unknown method")["error"]["code"],

@@ -579,9 +579,9 @@ mod tests {
         assert!(result["ttlMs"].is_number());
         assert_eq!(result["cacheScope"], "private");
         let catalog = result["tools"].as_array().expect("tools array");
-        assert_eq!(catalog.len(), 7);
+        assert_eq!(catalog.len(), 8);
         assert_eq!(catalog[0]["name"], tools::WHOAMI);
-        assert_eq!(catalog[6]["name"], tools::SEARCH);
+        assert_eq!(catalog[7]["name"], tools::SEND_MESSAGE);
     }
 
     #[tokio::test]
