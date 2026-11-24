@@ -703,6 +703,50 @@ fn zul_dotenv_controls_dotenv_loading() {
 }
 
 #[test]
+fn zul_dotenv_path_selects_the_file() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("explicit.env");
+    std::fs::write(
+        &path,
+        "ZULIP_BASE_URL=https://dotenv-path.example\nZULIP_EMAIL=path@example.com\n",
+    )
+    .expect("write explicit env file");
+    let path = path.to_str().expect("utf-8 env path");
+
+    // The working directory deliberately has no `.env`; only ZUL_DOTENV can
+    // supply these values.
+    let mut harness = Harness::start_with_env(dir.path(), &[("ZUL_DOTENV", path)]);
+    harness.send(&modern(
+        json!(1),
+        "tools/call",
+        json!({"name": "whoami", "arguments": {}}),
+    ));
+    let line = harness.recv();
+    let response: Value = serde_json::from_str(&line).expect("whoami response is JSON");
+    let structured = &response["result"]["structuredContent"];
+    assert_eq!(structured["base_url"], "https://dotenv-path.example");
+    assert_eq!(structured["email"], "path@example.com");
+    assert_eq!(structured["ready"], false);
+    assert!(
+        structured["problems"]
+            .as_array()
+            .expect("problems")
+            .iter()
+            .any(|problem| problem
+                .as_str()
+                .is_some_and(|text| text.contains("missing Zulip API key"))),
+        "the explicit env file has no key, so the missing-key problem must be named: {structured}"
+    );
+
+    let (remaining, status, stderr) = harness.finish();
+    assert!(status.success(), "exit status {status:?}; stderr: {stderr}");
+    assert!(
+        remaining.is_empty(),
+        "unexpected extra stdout lines: {remaining:?}"
+    );
+}
+
+#[test]
 fn whoami_with_missing_api_key_reports_it_without_contacting_the_realm() {
     let dir = tempfile::tempdir().expect("temp dir");
     let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
@@ -754,6 +798,112 @@ fn whoami_with_missing_api_key_reports_it_without_contacting_the_realm() {
     assert!(
         remaining.is_empty(),
         "unexpected extra stdout lines: {remaining:?}"
+    );
+}
+
+const COMPLETE_CREDENTIALS_KEY: &str = "zul-mcp-stdio-key-7b2e-DO-NOT-LEAK";
+
+/// Serve one successful Zulip current-user request and return its request line.
+fn serve_one_current_user(listener: TcpListener) -> JoinHandle<String> {
+    thread::spawn(move || {
+        let (mut socket, _) = listener.accept().expect("accept whoami request");
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            let read = socket.read(&mut chunk).expect("read request");
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        let body =
+            r#"{"result":"success","msg":"","email":"ada@example.com","full_name":"Ada Lovelace"}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket
+            .write_all(response.as_bytes())
+            .expect("write response");
+        socket.flush().expect("flush response");
+        String::from_utf8_lossy(&request).into_owned()
+    })
+}
+
+#[test]
+fn whoami_with_complete_credentials_never_leaks_the_api_key() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
+    let base_url = format!(
+        "http://{}",
+        listener.local_addr().expect("listener address")
+    );
+    let responder = serve_one_current_user(listener);
+    let mut harness = Harness::start_with_env(
+        dir.path(),
+        &[
+            ("ZULIP_BASE_URL", &base_url),
+            ("ZULIP_EMAIL", "ada@example.com"),
+            ("ZULIP_API_KEY", COMPLETE_CREDENTIALS_KEY),
+        ],
+    );
+
+    harness.send(&modern(
+        json!(1),
+        "tools/call",
+        json!({"name": "whoami", "arguments": {}}),
+    ));
+    let line = harness.recv();
+    let response: Value = serde_json::from_str(&line).expect("whoami response is JSON");
+    let result = &response["result"];
+    assert_eq!(result["resultType"], "complete");
+    assert_ne!(result["isError"], true);
+    let structured = &result["structuredContent"];
+    assert_eq!(structured["ready"], true);
+    assert_eq!(structured["base_url"], base_url);
+    assert_eq!(structured["email"], "ada@example.com");
+    assert_eq!(structured["problems"], json!([]));
+    let text = result["content"][0]["text"].as_str().expect("text content");
+    let parsed: Value = serde_json::from_str(text).expect("text content is JSON");
+    assert_eq!(&parsed, structured);
+
+    assert!(
+        !line.contains(COMPLETE_CREDENTIALS_KEY),
+        "API key leaked into the stdout line: {line}"
+    );
+    assert!(
+        !structured.to_string().contains(COMPLETE_CREDENTIALS_KEY),
+        "API key leaked into structuredContent: {structured}"
+    );
+    assert!(
+        !text.contains(COMPLETE_CREDENTIALS_KEY),
+        "API key leaked into the text mirror: {text}"
+    );
+
+    let (remaining, status, stderr) = harness.finish();
+    assert!(status.success(), "exit status {status:?}; stderr: {stderr}");
+    for output in &remaining {
+        assert!(
+            !output.contains(COMPLETE_CREDENTIALS_KEY),
+            "API key leaked to stdout: {output}"
+        );
+    }
+    assert!(
+        !stderr.contains(COMPLETE_CREDENTIALS_KEY),
+        "API key leaked to stderr: {stderr}"
+    );
+
+    let request = responder.join().expect("responder thread");
+    assert!(
+        request.starts_with("GET /api/v1/users/me"),
+        "whoami must authenticate against the realm: {request}"
     );
 }
 
@@ -836,12 +986,21 @@ fn exits_when_the_stdout_queue_saturates() {
         .stderr(Stdio::piped());
     let mut child = command.spawn().expect("spawn zul-mcp");
     let mut stdin = child.stdin.take().expect("piped stdin");
-    let stdout = child.stdout.take().expect("piped stdout");
+    let mut stdout = child.stdout.take().expect("piped stdout");
     let mut stderr = child.stderr.take().expect("piped stderr");
 
-    // More responses than the writer queue (256) and the OS pipe can buffer.
-    // The test deliberately never reads stdout until after the child exits.
-    for id in 0..2000 {
+    // Parse errors are answered by the read loop itself through `Server::send`
+    // (try_send), unlike tool responses which wait for writer capacity. More
+    // frames than the writer queue (256) and the OS pipe can buffer therefore
+    // drive the drop-on-full arm. The trailing discoveries then keep the
+    // writer blocked at EOF so the drain timeout also fires. The test
+    // deliberately never reads stdout until after the child exits.
+    const MALFORMED: usize = 2000;
+    const DISCOVERIES: usize = 2000;
+    for _ in 0..MALFORMED {
+        writeln!(stdin, "{{not json").expect("write malformed frame");
+    }
+    for id in 0..DISCOVERIES {
         writeln!(
             stdin,
             "{}",
@@ -849,7 +1008,7 @@ fn exits_when_the_stdout_queue_saturates() {
         )
         .expect("write discovery");
     }
-    stdin.flush().expect("flush discoveries");
+    stdin.flush().expect("flush frames");
     drop(stdin);
 
     let started = Instant::now();
@@ -869,9 +1028,37 @@ fn exits_when_the_stdout_queue_saturates() {
     let mut stderr_text = String::new();
     let _ = stderr.read_to_string(&mut stderr_text);
     assert!(
+        stderr_text.contains("stdout queue full; dropping responses until the client reads"),
+        "expected the read-loop drop diagnostic; stderr: {stderr_text:?}"
+    );
+    assert_eq!(
+        stderr_text
+            .matches("stdout queue full; dropping responses")
+            .count(),
+        1,
+        "the drop diagnostic is emitted only once; stderr: {stderr_text:?}"
+    );
+    assert!(
         stderr_text.contains("stdout writer did not shut down promptly"),
         "expected the saturated writer to hit its drain timeout; stderr: {stderr_text:?}"
     );
+
+    let mut stdout_text = String::new();
+    let _ = stdout.read_to_string(&mut stdout_text);
+    let answered = stdout_text
+        .lines()
+        .filter(|line| serde_json::from_str::<Value>(line).is_ok())
+        .count();
+    assert!(
+        answered > 0,
+        "the client should still receive some responses"
+    );
+    assert!(
+        answered < MALFORMED + DISCOVERIES,
+        "a saturated queue must drop responses instead of delivering all {} (got {answered})",
+        MALFORMED + DISCOVERIES
+    );
+
     drop(stdout);
     drop(child);
 }

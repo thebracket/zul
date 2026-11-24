@@ -318,10 +318,20 @@ where
         },
     };
     // Losing the claim means a duplicate id replaced this task; emit nothing.
+    //
+    // Keep the registry entry until the response is actually enqueued: with a
+    // full writer queue, removing the entry first would let a duplicate id for
+    // this task be treated as a fresh request and produce a second response.
+    // Reserving first and then claiming leaves no await point between the
+    // ownership check and the enqueue, so a duplicate that arrives while the
+    // queue is full is still rejected and an aborted generation emits nothing.
+    let Ok(permit) = tx.reserve().await else {
+        return;
+    };
     if !claim(&active, &key, generation) {
         return;
     }
-    let _ = tx.send(protocol::to_line(&response)).await;
+    permit.send(protocol::to_line(&response));
 }
 
 fn report_task(finished: Result<(), tokio::task::JoinError>) {
@@ -478,6 +488,10 @@ mod tests {
             "params": modern(json!({})),
         })
         .to_string()
+    }
+
+    fn discover(id: Value) -> String {
+        json!({"jsonrpc": "2.0", "id": id, "method": "server/discover"}).to_string()
     }
 
     async fn next_response(rx: &mut mpsc::Receiver<String>) -> Value {
@@ -678,6 +692,71 @@ mod tests {
                         .is_err(),
                     "the aborted first request must not answer"
                 );
+                assert_eq!(server.inflight.get(), 0);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_id_is_rejected_while_the_first_response_waits_for_the_writer_queue() {
+        LocalSet::new()
+            .run_until(async {
+                // Three slots, all held by the test, so the two request
+                // responses park waiting for capacity and exactly one slot is
+                // still free when the duplicate's immediate reply is sent.
+                let (tx, mut rx) = mpsc::channel(3);
+                let writer_tx = tx.clone();
+                let permits = [
+                    writer_tx.reserve().await.expect("reserve slot one"),
+                    writer_tx.reserve().await.expect("reserve slot two"),
+                    writer_tx.reserve().await.expect("reserve slot three"),
+                ];
+                let mut server = Server::with_config(
+                    tx,
+                    ServerConfig {
+                        request_timeout: Duration::from_secs(30),
+                        max_inflight: 8,
+                    },
+                );
+
+                server.handle_line(&discover(json!(1))).await;
+                server.handle_line(&discover(json!(2))).await;
+                for _ in 0..4 {
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(
+                    server.inflight.get(),
+                    2,
+                    "both responses must still be waiting for capacity"
+                );
+                assert!(
+                    server.active.borrow().contains_key("n:1")
+                        && server.active.borrow().contains_key("n:2"),
+                    "the registry must keep responses that are waiting for the writer"
+                );
+
+                // Release the writer slots, then deliver the duplicate before
+                // the parked tasks can poll for capacity. The duplicate is
+                // answered with one -32600, and id 2's parked success must
+                // never be enqueued.
+                drop(permits);
+                server.handle_line(&discover(json!(2))).await;
+
+                let duplicate = next_response(&mut rx).await;
+                assert_eq!(duplicate["id"], 2);
+                assert_eq!(duplicate["error"]["code"], protocol::INVALID_REQUEST);
+                assert_eq!(duplicate["error"]["message"], "duplicate active request id");
+
+                let untouched = next_response(&mut rx).await;
+                assert_eq!(untouched["id"], 1, "the untouched request still completes");
+
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), rx.recv())
+                        .await
+                        .is_err(),
+                    "a duplicate id during a blocked enqueue must yield exactly one response"
+                );
+                assert!(server.active.borrow().is_empty());
                 assert_eq!(server.inflight.get(), 0);
             })
             .await;
