@@ -273,6 +273,11 @@ def test_adapter_site_extra_wins_when_no_env_is_set(config):
     assert ZulipAdapter(config).site == "https://extra.example.com"
 
 
+def test_adapter_site_extra_base_url_alias_when_no_env_is_set(config):
+    config.extra["base_url"] = "https://extra.example"
+    assert ZulipAdapter(config).site == "https://extra.example"
+
+
 def test_adapter_uses_base_url_alias(fake_bridge, config, monkeypatch):
     monkeypatch.setenv("ZULIP_BASE_URL", "https://base.example.com")
     monkeypatch.setenv("ZULIP_EMAIL", "bot@example.com")
@@ -493,6 +498,7 @@ def test_real_hermes_delivery_state_reads_the_pre_send_envelope(tmp_path):
         """
         import asyncio
 
+        import hermes_zulip.adapter as adapter
         from gateway.config import PlatformConfig
         from gateway.platforms._shared import delivery_state
         from hermes_zulip.adapter import _standalone_send
@@ -514,6 +520,31 @@ def test_real_hermes_delivery_state_reads_the_pre_send_envelope(tmp_path):
             assert "retryable" not in result, (label, result)
             assert result["delivery"] == "none", (label, result)
             assert delivery_state(result) == "none", (label, result)
+
+        class DummyBridge:
+            def close(self):
+                pass
+
+        # Exercise the post-connect boundary through the real helper without a
+        # Zulip server: the bridge constructor and chunk sender are replaced.
+        adapter.zul_bridge = object()
+        adapter._make_bridge = lambda extra: DummyBridge()
+
+        def failing_send(cause):
+            def fail(bridge, target, chunks):
+                raise cause
+
+            adapter._send_chunks = fail
+            return asyncio.run(_standalone_send(
+                config, encode_stream("core", "ops", 12), "hello",
+            ))
+
+        uncertain = failing_send(RuntimeError("send exploded"))
+        assert "delivery" not in uncertain, uncertain
+        assert delivery_state(uncertain) == "uncertain", uncertain
+        partial = failing_send(adapter._ChunkSendError(RuntimeError("send exploded"), ["42"]))
+        assert partial["delivery"] == "partial", partial
+        assert delivery_state(partial) == "partial", partial
         print("ok")
         """
     )

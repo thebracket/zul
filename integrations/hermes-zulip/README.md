@@ -213,9 +213,9 @@ This is a text-only v1:
   sends; Hermes' normal chunking applies.
 - A queue that Zulip rejects, or that fails three consecutive polls, is deleted
   and re-registered. The replacement starts at a new server cursor, so events
-  produced during that gap are not delivered. A successful replacement restarts
-  the failure budget; a fatal poller error is reported only after five
-  consecutive registration failures.
+  produced during that gap are not delivered. Discarding the queue and a
+  successful replacement both restart the failure budget; a fatal poller error
+  is reported only after five consecutive registration failures.
 - Silent mentions (the no-notification mention form) render without `@`, so
   detection depends on the event-level flags Zulip supplies. If the flags are
   absent, a silent mention is treated as an ordinary message and dropped when

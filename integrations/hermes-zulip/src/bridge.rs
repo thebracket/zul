@@ -725,7 +725,12 @@ async fn event_loop(
                 if unusable || queue_errors >= EVENT_MAX_SAME_QUEUE_ERRORS {
                     delete_queue(&client, &queue_id).await;
                     queue = None;
+                    // The discarded queue also clears the failure budget so the
+                    // replacement registration gets its own full set of
+                    // attempts, as the README promises.
+                    failures = 0;
                     queue_errors = 0;
+                    backoff = EVENT_BACKOFF_START;
                 }
                 if !sleep_until_stopped(&mut stop, backoff).await {
                     return;

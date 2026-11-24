@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import tomllib
 from pathlib import Path
 
 import hermes_zulip.install as install_module
@@ -16,6 +17,7 @@ import yaml
 
 _PYTHON_SRC = Path(__file__).resolve().parents[1] / "python"
 _PLUGIN_YAML = _PYTHON_SRC / "hermes_zulip" / "plugin.yaml"
+_PYPROJECT = _PYTHON_SRC.parent / "pyproject.toml"
 
 _EXPECTED_INIT = (
     "from hermes_zulip.adapter import register\n"
@@ -183,6 +185,14 @@ def test_module_entry_point(tmp_path):
     assert completed.stdout.strip() == str(home / "plugins" / "zulip")
     assert (home / "plugins" / "zulip" / "plugin.yaml").is_file()
     assert (home / "plugins" / "zulip" / "__init__.py").is_file()
+
+
+def test_console_script_is_declared_in_pyproject():
+    pyproject = tomllib.loads(_PYPROJECT.read_text(encoding="utf-8"))
+    assert (
+        pyproject["project"]["scripts"]["hermes-zulip-install"]
+        == "hermes_zulip.install:main"
+    )
 
 
 def test_console_script_entry_point_is_declared():

@@ -46,6 +46,16 @@ fn verify(server: &MockServer) {
     block_on(server.verify());
 }
 
+fn registration_posts(server: &MockServer) -> usize {
+    block_on(server.received_requests())
+        .expect("wiremock records requests")
+        .iter()
+        .filter(|request| {
+            request.method.as_str() == "POST" && request.url.path() == "/api/v1/register"
+        })
+        .count()
+}
+
 fn config(server: &MockServer) -> BridgeConfig {
     merge_config(
         None,
@@ -67,6 +77,20 @@ fn register_mock(queue_id: &str) -> Mock {
             "last_event_id": 0,
             "event_queue_longpoll_timeout_seconds": 30
         })))
+}
+
+fn failing_register_mock(delay: Duration) -> Mock {
+    Mock::given(method("POST"))
+        .and(path("/api/v1/register"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(delay)
+                .set_body_json(json!({
+                    "result": "error",
+                    "msg": "registration is down",
+                    "last_event_id": 0
+                })),
+        )
 }
 
 fn empty_events_mock(queue_id: &str, delay: Duration) -> Mock {
@@ -541,17 +565,7 @@ fn persistent_poll_errors_reregister_without_a_fatal_result() {
 #[test]
 fn registration_failures_are_fatal_after_the_limit() {
     let server = start_server();
-    mount(
-        &server,
-        Mock::given(method("POST"))
-            .and(path("/api/v1/register"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "result": "error",
-                "msg": "registration is down",
-                "last_event_id": 0
-            })))
-            .expect(5),
-    );
+    mount(&server, failing_register_mock(Duration::ZERO).expect(5));
 
     let core = BridgeCore::new(config(&server)).expect("bridge");
     let error = core
@@ -672,34 +686,39 @@ fn queue_expiry_reregisters_and_keeps_delivering_events() {
 #[test]
 fn successful_registration_resets_the_failure_budget() {
     let server = start_server();
-    mount(&server, register_mock("q-old").up_to_n_times(1).expect(1));
+    // Two failed registrations leave the counter at two. Without the
+    // successful registration clearing it, the next three poll errors would
+    // reach the fatal threshold on the third error; the reset keeps them
+    // recoverable.
+    mount(
+        &server,
+        failing_register_mock(Duration::ZERO)
+            .up_to_n_times(2)
+            .expect(2),
+    );
     mount(&server, register_mock("q-new").up_to_n_times(1).expect(1));
-    // Three transient errors exhaust the same-queue budget and force a
-    // replacement registration with three accumulated failures.
-    mount(&server, failing_events_mock("q-old", 3));
+    mount(&server, failing_events_mock("q-new", 3));
     mount(
         &server,
         Mock::given(method("DELETE"))
             .and(path("/api/v1/events"))
-            .and(body_string_contains("queue_id=q-old"))
+            .and(body_string_contains("queue_id=q-new"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "result": "success",
                 "msg": ""
             })))
             .expect(1),
     );
-    // Two further errors would cross the five-failure fatal threshold if the
-    // successful registration had not reset the counter.
-    mount(&server, failing_events_mock("q-new", 2).up_to_n_times(2));
+    mount(&server, register_mock("q-after").up_to_n_times(1).expect(1));
     mount(
         &server,
         Mock::given(method("GET"))
             .and(path("/api/v1/events"))
-            .and(query_param("queue_id", "q-new"))
+            .and(query_param("queue_id", "q-after"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "result": "success",
                 "msg": "",
-                "queue_id": "q-new",
+                "queue_id": "q-after",
                 "events": [
                     message_event(json!({
                         "id": 77,
@@ -721,16 +740,84 @@ fn successful_registration_resets_the_failure_budget() {
     );
     mount(
         &server,
-        empty_events_mock("q-new", Duration::from_millis(10)),
+        empty_events_mock("q-after", Duration::from_millis(10)),
     );
 
     let core = BridgeCore::new(config(&server)).expect("bridge");
     let event = core
         .next_event(Duration::from_secs(5))
-        .expect("poller survives two errors after re-registration")
+        .expect("the success reset keeps poll errors non-fatal")
         .expect("event present");
     assert_eq!(event["id"], 77);
-    assert_eq!(core.queue_id().as_deref(), Some("q-new"));
+    assert_eq!(core.queue_id().as_deref(), Some("q-after"));
+
+    core.close();
+    verify(&server);
+}
+
+#[test]
+fn queue_replacement_restarts_the_registration_failure_budget() {
+    // Three same-queue poll errors discard the queue with three failures on
+    // the counter. Without the reset, two failed registrations would then
+    // cross the five-failure threshold instead of getting their own budget.
+    let server = start_server();
+    mount(&server, register_mock("q-old").up_to_n_times(1).expect(1));
+    mount(&server, failing_events_mock("q-old", 3));
+    mount(
+        &server,
+        Mock::given(method("DELETE"))
+            .and(path("/api/v1/events"))
+            .and(body_string_contains("queue_id=q-old"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "result": "success",
+                "msg": ""
+            })))
+            .expect(1),
+    );
+    mount(
+        &server,
+        failing_register_mock(Duration::ZERO)
+            .up_to_n_times(2)
+            .expect(2),
+    );
+    // Hold the third attempt so the non-fatal window between the second and
+    // third failures is wide enough to observe.
+    mount(
+        &server,
+        failing_register_mock(Duration::from_secs(1))
+            .up_to_n_times(1)
+            .expect(1),
+    );
+    mount(
+        &server,
+        failing_register_mock(Duration::ZERO)
+            .up_to_n_times(2)
+            .expect(2),
+    );
+
+    let core = BridgeCore::new(config(&server)).expect("bridge");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while registration_posts(&server) < 3 {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for two failed registrations"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let outcome = core.next_event(Duration::from_millis(200));
+    assert!(
+        matches!(outcome, Ok(None)),
+        "two failed registrations must not exhaust the replacement budget: {outcome:?}"
+    );
+
+    let error = core
+        .next_event(Duration::from_secs(5))
+        .expect_err("five consecutive registration failures are fatal");
+    assert!(
+        error.contains("registration failed repeatedly"),
+        "message: {error}"
+    );
+    assert!(error.contains("registration is down"), "message: {error}");
 
     core.close();
     verify(&server);
