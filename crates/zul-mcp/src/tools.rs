@@ -176,9 +176,10 @@ pub fn catalog() -> Value {
     ])
 }
 
-/// Process-wide Zulip access shared by tool handlers.
+/// Process-wide Zulip access shared by request handlers.
 pub struct ToolContext {
     app: RefCell<Option<Result<Rc<App>, String>>>,
+    settings: RefCell<Option<Result<Rc<Settings>, String>>>,
 }
 
 impl ToolContext {
@@ -186,6 +187,7 @@ impl ToolContext {
     pub fn new() -> Self {
         Self {
             app: RefCell::new(None),
+            settings: RefCell::new(None),
         }
     }
 
@@ -194,24 +196,37 @@ impl ToolContext {
     /// Tests use this to point handlers at a temporary SQLite cache; production
     /// uses [`ToolContext::new`] so configuration is loaded lazily once.
     pub fn with_app(app: Rc<App>) -> Self {
+        let settings = Rc::new(app.settings().clone());
         Self {
             app: RefCell::new(Some(Ok(app))),
+            settings: RefCell::new(Some(Ok(settings))),
         }
     }
 
-    fn app(&self) -> Result<Rc<App>, String> {
-        let mut app = self.app.borrow_mut();
-        if let Some(existing) = app.as_ref() {
+    /// Return the loaded Zulip settings without opening the local cache.
+    ///
+    /// `events/poll` needs only credentials and the realm URL, so it must not
+    /// pay for (or hold) an [`App`] across its network request.
+    pub fn settings(&self) -> Result<Rc<Settings>, String> {
+        if let Some(existing) = self.settings.borrow().as_ref() {
             return existing.clone();
         }
         let loaded = Settings::load()
-            .map_err(|err| format!("failed to load Zulip settings: {err}"))
-            .and_then(|settings| {
-                App::open(settings, false)
-                    .map(Rc::new)
-                    .map_err(|err| format!("failed to open the local Zulip cache: {err}"))
-            });
-        *app = Some(loaded.clone());
+            .map(Rc::new)
+            .map_err(|err| format!("failed to load Zulip settings: {err}"));
+        *self.settings.borrow_mut() = Some(loaded.clone());
+        loaded
+    }
+
+    fn app(&self) -> Result<Rc<App>, String> {
+        if let Some(existing) = self.app.borrow().as_ref() {
+            return existing.clone();
+        }
+        let settings = self.settings()?;
+        let loaded = App::open((*settings).clone(), false)
+            .map(Rc::new)
+            .map_err(|err| format!("failed to open the local Zulip cache: {err}"));
+        *self.app.borrow_mut() = Some(loaded.clone());
         loaded
     }
 }
@@ -512,7 +527,12 @@ fn message_view(message: &ZulipMessage) -> Value {
 }
 
 fn cap_text(text: &str) -> (String, bool) {
-    match text.char_indices().nth(MAX_MESSAGE_TEXT_CHARS) {
+    cap_text_at(text, MAX_MESSAGE_TEXT_CHARS)
+}
+
+/// Cap text at a character count, reporting whether anything was removed.
+pub(crate) fn cap_text_at(text: &str, max_chars: usize) -> (String, bool) {
+    match text.char_indices().nth(max_chars) {
         Some((end, _)) => (text[..end].to_string(), true),
         None => (text.to_string(), false),
     }
@@ -555,7 +575,7 @@ fn tool_error(tool: &str, problem: impl std::fmt::Display) -> Value {
     error_result(format!("{tool} failed: {}", one_line(&problem.to_string())))
 }
 
-fn one_line(text: &str) -> String {
+pub(crate) fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 

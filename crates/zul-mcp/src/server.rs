@@ -5,6 +5,7 @@
 //! under a timeout and a concurrency cap, and enqueues complete response lines.
 //! Streaming methods are exempt from both limits through [`is_long_lived`].
 
+use crate::events::{self, PollError};
 use crate::protocol::{self, Envelope, RequestId};
 use crate::tools::{self, ToolContext, ToolFailure};
 use serde_json::{Map, Value};
@@ -235,7 +236,8 @@ impl Server {
 /// counted against the ordinary request cap and has no request timeout.
 ///
 /// No streaming method is implemented yet: `events/stream` will use this seam
-/// when Unit 4 lands, and currently still receives the unknown-method error.
+/// when push delivery lands (Unit 4b), and currently still receives the
+/// unknown-method error.
 fn is_long_lived(method: &str) -> bool {
     matches!(method, "events/stream")
 }
@@ -426,6 +428,8 @@ async fn handle_request(
             Ok(protocol::complete_cached(body))
         }
         "tools/call" => call_tool(tools, params).await,
+        "events/list" => Ok(events::list_result()),
+        "events/poll" => poll_events(tools, params).await,
         other => Err(rpc_error(
             protocol::METHOD_NOT_FOUND,
             format!("unknown method: {other}"),
@@ -434,10 +438,38 @@ async fn handle_request(
 }
 
 /// Methods that require per-request protocol metadata. Discovery is exempt and
-/// `initialize` is handled before this check; `events/*` joins this list when
-/// streaming lands.
+/// `initialize` is handled before this check; `events/stream` stays unknown
+/// until push delivery lands.
 fn is_known_method(method: &str) -> bool {
-    matches!(method, "tools/list" | "tools/call")
+    matches!(
+        method,
+        "tools/list" | "tools/call" | "events/list" | "events/poll"
+    )
+}
+
+async fn poll_events(tools: &ToolContext, params: Option<&Value>) -> Result<Value, RpcError> {
+    let params = params.ok_or_else(|| {
+        rpc_error(
+            protocol::INVALID_PARAMS,
+            "events/poll requires a params object",
+        )
+    })?;
+    let params = events::parse_poll_params(params).map_err(poll_error)?;
+    let settings = tools.settings().map_err(|problem| {
+        rpc_error(
+            protocol::INTERNAL_ERROR,
+            format!("events/poll failed: {}", tools::one_line(&problem)),
+        )
+    })?;
+    events::poll(&settings, params).await.map_err(poll_error)
+}
+
+fn poll_error(error: PollError) -> RpcError {
+    let code = match &error {
+        PollError::InvalidParams(_) => protocol::INVALID_PARAMS,
+        PollError::Internal(_) => protocol::INTERNAL_ERROR,
+    };
+    rpc_error(code, error.message())
 }
 
 async fn call_tool(tools: &ToolContext, params: Option<&Value>) -> Result<Value, RpcError> {
@@ -581,6 +613,79 @@ mod tests {
         .await
         .expect_err("unsupported metadata must fail");
         assert_eq!(unsupported.code, protocol::UNSUPPORTED_PROTOCOL_VERSION);
+    }
+
+    #[tokio::test]
+    async fn events_list_requires_metadata_and_returns_the_descriptor() {
+        let tools = ToolContext::new();
+        let missing = handle_request(&tools, "events/list", Some(&json!({})))
+            .await
+            .expect_err("missing metadata must fail");
+        assert_eq!(missing.code, protocol::UNSUPPORTED_PROTOCOL_VERSION);
+
+        let result = handle_request(&tools, "events/list", Some(&modern(json!({}))))
+            .await
+            .expect("events/list result");
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["events"].as_array().map(Vec::len), Some(1));
+        assert_eq!(result["events"][0]["name"], events::EVENT_NAME);
+        assert_eq!(result["events"][0]["delivery"], json!(["poll", "push"]));
+    }
+
+    #[tokio::test]
+    async fn events_poll_validates_params_before_loading_configuration() {
+        let tools = ToolContext::new();
+        let missing = handle_request(&tools, "events/poll", Some(&json!({})))
+            .await
+            .expect_err("missing metadata must fail");
+        assert_eq!(missing.code, protocol::UNSUPPORTED_PROTOCOL_VERSION);
+
+        let unknown = handle_request(
+            &tools,
+            "events/poll",
+            Some(&modern(json!({"name": "other.event"}))),
+        )
+        .await
+        .expect_err("unknown event name must fail");
+        assert_eq!(unknown.code, protocol::INVALID_PARAMS);
+        assert!(unknown.message.contains("unknown event name"));
+
+        let bad_argument = handle_request(
+            &tools,
+            "events/poll",
+            Some(&modern(json!({
+                "name": events::EVENT_NAME,
+                "arguments": {"topic": "ops"},
+            }))),
+        )
+        .await
+        .expect_err("topic without stream must fail");
+        assert_eq!(bad_argument.code, protocol::INVALID_PARAMS);
+
+        let unknown_argument = handle_request(
+            &tools,
+            "events/poll",
+            Some(&modern(json!({
+                "name": events::EVENT_NAME,
+                "arguments": {"bogus": true},
+            }))),
+        )
+        .await
+        .expect_err("unknown argument must fail");
+        assert_eq!(unknown_argument.code, protocol::INVALID_PARAMS);
+    }
+
+    #[tokio::test]
+    async fn events_stream_remains_an_unknown_method() {
+        let tools = ToolContext::new();
+        let result = handle_request(
+            &tools,
+            "events/stream",
+            Some(&modern(json!({"name": events::EVENT_NAME}))),
+        )
+        .await
+        .expect_err("events/stream is not implemented in this unit");
+        assert_eq!(result.code, protocol::METHOD_NOT_FOUND);
     }
 
     #[tokio::test]

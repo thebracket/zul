@@ -235,7 +235,15 @@ pub fn complete_cached(mut body: Map<String, Value>) -> Value {
 pub fn discover_result() -> Value {
     let mut body = Map::new();
     body.insert("supportedVersions".to_string(), json!([PROTOCOL_VERSION]));
-    body.insert("capabilities".to_string(), json!({"tools": {}}));
+    body.insert(
+        "capabilities".to_string(),
+        json!({
+            "tools": {},
+            "extensions": {
+                "io.modelcontextprotocol/events": {},
+            },
+        }),
+    );
     body.insert(
         "_meta".to_string(),
         json!({
@@ -333,11 +341,23 @@ mod tests {
     }
 
     #[test]
-    fn discovery_advertises_only_tools() {
+    fn discovery_advertises_tools_and_the_events_extension() {
         let result = discover_result();
         assert_eq!(result["resultType"], "complete");
         assert_eq!(result["supportedVersions"], json!([PROTOCOL_VERSION]));
-        assert_eq!(result["capabilities"], json!({"tools": {}}));
+        assert_eq!(
+            result["capabilities"],
+            json!({
+                "tools": {},
+                "extensions": {
+                    "io.modelcontextprotocol/events": {},
+                },
+            })
+        );
+        assert!(
+            result["capabilities"].get("events").is_none(),
+            "events must be advertised as an extension, not a top-level capability"
+        );
         assert_eq!(
             result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
             "zul-mcp"

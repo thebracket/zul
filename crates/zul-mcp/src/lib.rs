@@ -2,10 +2,13 @@
 //! on stdio.
 //!
 //! This library exposes the transport-independent pieces: JSON-RPC envelopes
-//! ([`protocol`]), request dispatch and concurrency ([`server`]), and the tool
-//! catalog and handlers ([`tools`]). The binary in `main.rs` owns stdin/stdout
-//! framing and the event loop.
+//! ([`protocol`]), request dispatch and concurrency ([`server`]), the tool
+//! catalog and handlers ([`tools`]), and MCP Events discovery and polling
+//! ([`events`]). The binary in `main.rs` owns stdin/stdout framing and the
+//! event loop.
 
+/// MCP Events discovery and stateless poll delivery.
+pub mod events;
 /// JSON-RPC 2.0 wire shapes and the MCP `_meta` version gate.
 pub mod protocol;
 /// Request dispatch, concurrency, and the active-request registry.

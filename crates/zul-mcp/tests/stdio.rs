@@ -296,10 +296,24 @@ fn serves_discovery_tools_and_protocol_errors() {
     let result = &discover["result"];
     assert_eq!(result["resultType"], "complete");
     assert_eq!(result["supportedVersions"], json!(["2026-07-28"]));
-    assert_eq!(result["capabilities"], json!({"tools": {}}));
+    assert_eq!(
+        result["capabilities"],
+        json!({
+            "tools": {},
+            "extensions": {
+                "io.modelcontextprotocol/events": {},
+            },
+        })
+    );
     assert!(
-        result["capabilities"].get("extensions").is_none(),
-        "events extension must not be advertised yet: {result}"
+        result["capabilities"].get("events").is_none(),
+        "events must be an extension, not a top-level capability: {result}"
+    );
+    assert!(
+        result["capabilities"]["extensions"]["io.modelcontextprotocol/events"]
+            .get("listChanged")
+            .is_none(),
+        "the events extension must not advertise listChanged: {result}"
     );
     assert_eq!(
         result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
@@ -803,10 +817,10 @@ fn whoami_with_missing_api_key_reports_it_without_contacting_the_realm() {
 
 const COMPLETE_CREDENTIALS_KEY: &str = "zul-mcp-stdio-key-7b2e-DO-NOT-LEAK";
 
-/// Serve one successful Zulip current-user request and return its request line.
-fn serve_one_current_user(listener: TcpListener) -> JoinHandle<String> {
+/// Serve one JSON response and return the request line and headers.
+fn serve_one_response(listener: TcpListener, body: &'static str) -> JoinHandle<String> {
     thread::spawn(move || {
-        let (mut socket, _) = listener.accept().expect("accept whoami request");
+        let (mut socket, _) = listener.accept().expect("accept HTTP request");
         socket
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("read timeout");
@@ -823,8 +837,6 @@ fn serve_one_current_user(listener: TcpListener) -> JoinHandle<String> {
             }
         }
 
-        let body =
-            r#"{"result":"success","msg":"","email":"ada@example.com","full_name":"Ada Lovelace"}"#;
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
@@ -835,6 +847,14 @@ fn serve_one_current_user(listener: TcpListener) -> JoinHandle<String> {
         socket.flush().expect("flush response");
         String::from_utf8_lossy(&request).into_owned()
     })
+}
+
+/// Serve one successful Zulip current-user request.
+fn serve_one_current_user(listener: TcpListener) -> JoinHandle<String> {
+    serve_one_response(
+        listener,
+        r#"{"result":"success","msg":"","email":"ada@example.com","full_name":"Ada Lovelace"}"#,
+    )
 }
 
 #[test]
@@ -905,6 +925,119 @@ fn whoami_with_complete_credentials_never_leaks_the_api_key() {
         request.starts_with("GET /api/v1/users/me"),
         "whoami must authenticate against the realm: {request}"
     );
+}
+
+#[test]
+fn events_list_and_poll_serve_the_extension() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
+    let base_url = format!(
+        "http://{}",
+        listener.local_addr().expect("listener address")
+    );
+    let responder = serve_one_response(
+        listener,
+        r#"{"result":"success","msg":"","messages":[{"id":77}]}"#,
+    );
+    let mut harness = Harness::start_with_env(
+        dir.path(),
+        &[
+            ("ZULIP_BASE_URL", &base_url),
+            ("ZULIP_EMAIL", "ada@example.com"),
+            ("ZULIP_API_KEY", COMPLETE_CREDENTIALS_KEY),
+        ],
+    );
+
+    harness.send(&modern(json!(1), "events/list", json!({})));
+    harness.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "events/list",
+        "params": {},
+    }));
+    harness.send(&modern(
+        json!(3),
+        "events/stream",
+        json!({"name": "zulip.message"}),
+    ));
+    harness.send(&modern(
+        json!(4),
+        "events/poll",
+        json!({"name": "zulip.message", "cursor": null}),
+    ));
+    harness.send(&modern(
+        json!(5),
+        "events/poll",
+        json!({"name": "other.event"}),
+    ));
+    harness.send(&json!({
+        "jsonrpc": "2.0",
+        "id": 6,
+        "method": "events/poll",
+        "params": {"name": "zulip.message"},
+    }));
+
+    let raw = collect(&harness, 6);
+    let responses = by_id(&raw);
+
+    let list = &responses.get("n:1").expect("events/list response")["result"];
+    assert_eq!(list["resultType"], "complete");
+    let events = list["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["name"], "zulip.message");
+    assert_eq!(events[0]["delivery"], json!(["poll", "push"]));
+
+    assert_eq!(
+        responses.get("n:2").expect("events/list without metadata")["error"]["code"],
+        -32022
+    );
+    assert_eq!(
+        responses.get("n:3").expect("events/stream response")["error"]["code"],
+        -32601
+    );
+
+    let poll = &responses.get("n:4").expect("events/poll response")["result"];
+    assert_eq!(poll["resultType"], "complete");
+    assert_eq!(poll["events"], json!([]));
+    assert_eq!(poll["cursor"], json!(format!("v1:{base_url}|77")));
+    assert_eq!(poll["truncated"], false);
+    assert_eq!(poll["hasMore"], false);
+    assert_eq!(poll["nextPollMs"], 15_000);
+    assert!(!poll.to_string().contains(COMPLETE_CREDENTIALS_KEY));
+
+    assert_eq!(
+        responses.get("n:5").expect("unknown event response")["error"]["code"],
+        -32602
+    );
+    assert_eq!(
+        responses.get("n:6").expect("events/poll without metadata")["error"]["code"],
+        -32022
+    );
+
+    let (remaining, status, stderr) = harness.finish();
+    assert!(status.success(), "exit status {status:?}; stderr: {stderr}");
+    assert!(
+        remaining.is_empty(),
+        "unexpected extra stdout lines: {remaining:?}"
+    );
+    assert!(!stderr.contains(COMPLETE_CREDENTIALS_KEY));
+
+    let request = responder.join().expect("responder thread");
+    assert!(
+        request.starts_with("GET /api/v1/messages?"),
+        "events/poll must ask the realm for the newest message: {request}"
+    );
+    for parameter in [
+        "anchor=newest",
+        "num_before=0",
+        "num_after=0",
+        "include_anchor=true",
+    ] {
+        assert!(
+            request.contains(parameter),
+            "latest-message request is missing {parameter}: {request}"
+        );
+    }
 }
 
 #[test]

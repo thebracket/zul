@@ -104,6 +104,35 @@ impl ZulipClient {
         Ok(messages)
     }
 
+    /// Fetch the ID of the newest message visible to the current user.
+    ///
+    /// Returns `None` when the realm has no messages. The request asks for the
+    /// newest anchor itself (`anchor=newest`, `include_anchor=true`) with no
+    /// messages before or after it, so the response carries at most one message.
+    pub async fn latest_message_id(&self) -> Result<Option<i64>> {
+        let data = self
+            .get("/api/v1/messages")
+            .query(&[
+                ("anchor", "newest"),
+                ("num_before", "0"),
+                ("num_after", "0"),
+                ("apply_markdown", "true"),
+                ("client_gravatar", "false"),
+                ("include_anchor", "true"),
+            ])
+            .send()
+            .await?
+            .json::<ZulipApiResponse<MessagesResponse>>()
+            .await?
+            .into_data()?;
+        Ok(data
+            .messages
+            .iter()
+            .filter_map(|message| message.get("id"))
+            .filter_map(serde_json::Value::as_i64)
+            .max())
+    }
+
     /// Fetch messages newer than a known Zulip message ID.
     pub async fn messages_after(&self, anchor_id: i64) -> Result<Vec<ZulipMessage>> {
         let mut anchor = anchor_id.to_string();
