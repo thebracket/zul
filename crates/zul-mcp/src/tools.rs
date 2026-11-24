@@ -203,6 +203,18 @@ impl ToolContext {
         }
     }
 
+    /// Build a context around explicit settings without touching the cache.
+    ///
+    /// Tests use this to point the event handlers at a mock realm without
+    /// reading the developer's configuration. Tools that need the cache still
+    /// open it lazily from the same settings.
+    pub fn with_settings(settings: Rc<Settings>) -> Self {
+        Self {
+            app: RefCell::new(None),
+            settings: RefCell::new(Some(Ok(settings))),
+        }
+    }
+
     /// Return the loaded Zulip settings without opening the local cache.
     ///
     /// `events/poll` needs only credentials and the realm URL, so it must not

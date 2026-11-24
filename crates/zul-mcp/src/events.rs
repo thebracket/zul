@@ -35,9 +35,9 @@ const MAX_MAX_EVENTS: i64 = 200;
 const MAX_EVENT_TEXT_CHARS: usize = 2000;
 
 /// `ZulipClient::messages_after` stops after 25 pages of 1000 messages. A batch
-/// that reaches this size may have more history behind it, so the poll reports
-/// `truncated` instead of silently claiming completeness.
-const MESSAGES_AFTER_BATCH_LIMIT: usize = 25_000;
+/// that reaches this size may have more history behind it, so poll and stream
+/// delivery report `truncated` instead of silently claiming completeness.
+pub(crate) const MESSAGES_AFTER_BATCH_LIMIT: usize = 25_000;
 
 /// Prefix of the opaque, versioned cursor format.
 const CURSOR_PREFIX: &str = "v1:";
@@ -139,6 +139,71 @@ pub struct PollFilter {
     pub exclude_self: bool,
 }
 
+/// Validated `events/stream` parameters.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamParams {
+    /// Filters applied before any event is emitted.
+    pub arguments: PollFilter,
+    /// Opaque resume cursor, or `None` to start from the newest message.
+    pub cursor: Option<String>,
+    /// Maximum age of replayed events, in milliseconds.
+    pub max_age_ms: Option<i64>,
+    /// Client heartbeat suggestion in milliseconds, before clamping.
+    pub heartbeat_ms: Option<i64>,
+}
+
+/// Parse the shared filter arguments used by poll and stream requests.
+fn parse_filter(object: &Map<String, Value>, context: &str) -> Result<PollFilter, PollError> {
+    let mut arguments = match object.get("arguments") {
+        None => Map::new(),
+        Some(Value::Object(arguments)) => arguments.clone(),
+        Some(_) => {
+            return Err(invalid_params(format!(
+                "{context} arguments must be a JSON object"
+            )))
+        }
+    };
+    let stream = take_string(&mut arguments, "stream")?;
+    let topic = take_string(&mut arguments, "topic")?;
+    let sender_email = take_string(&mut arguments, "sender_email")?;
+    let exclude_self = match arguments.remove("exclude_self") {
+        None => true,
+        Some(Value::Bool(value)) => value,
+        Some(_) => return Err(invalid_params("exclude_self must be a boolean")),
+    };
+    reject_remaining(arguments, &format!("{context} arguments"))?;
+    if topic.is_some() && stream.is_none() {
+        return Err(invalid_params(format!("{context} topic requires stream")));
+    }
+    Ok(PollFilter {
+        stream,
+        topic,
+        sender_email,
+        exclude_self,
+    })
+}
+
+fn parse_cursor_param(object: &Map<String, Value>) -> Result<Option<String>, PollError> {
+    match object.get("cursor") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(cursor)) => Ok(Some(cursor.clone())),
+        Some(_) => Err(invalid_params("cursor must be a string or null")),
+    }
+}
+
+fn parse_max_age(object: &Map<String, Value>) -> Result<Option<i64>, PollError> {
+    match object.get("maxAgeMs") {
+        None => Ok(None),
+        Some(Value::Number(number)) => Ok(Some(
+            number
+                .as_i64()
+                .filter(|value| *value >= 0)
+                .ok_or_else(|| invalid_params("maxAgeMs must be a non-negative integer"))?,
+        )),
+        Some(_) => Err(invalid_params("maxAgeMs must be a non-negative integer")),
+    }
+}
+
 /// Why an `events/poll` request could not produce a result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PollError {
@@ -182,44 +247,9 @@ pub fn parse_poll_params(params: &Value) -> Result<PollParams, PollError> {
         return Err(invalid_params(format!("unknown event name: {name}")));
     }
 
-    let mut arguments = match object.get("arguments") {
-        None => Map::new(),
-        Some(Value::Object(arguments)) => arguments.clone(),
-        Some(_) => {
-            return Err(invalid_params(
-                "events/poll arguments must be a JSON object",
-            ))
-        }
-    };
-    let stream = take_string(&mut arguments, "stream")?;
-    let topic = take_string(&mut arguments, "topic")?;
-    let sender_email = take_string(&mut arguments, "sender_email")?;
-    let exclude_self = match arguments.remove("exclude_self") {
-        None => true,
-        Some(Value::Bool(value)) => value,
-        Some(_) => return Err(invalid_params("exclude_self must be a boolean")),
-    };
-    reject_remaining(arguments, "events/poll arguments")?;
-    if topic.is_some() && stream.is_none() {
-        return Err(invalid_params("events/poll topic requires stream"));
-    }
-
-    let cursor = match object.get("cursor") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(cursor)) => Some(cursor.clone()),
-        Some(_) => return Err(invalid_params("cursor must be a string or null")),
-    };
-
-    let max_age_ms = match object.get("maxAgeMs") {
-        None => None,
-        Some(Value::Number(number)) => Some(
-            number
-                .as_i64()
-                .filter(|value| *value >= 0)
-                .ok_or_else(|| invalid_params("maxAgeMs must be a non-negative integer"))?,
-        ),
-        Some(_) => return Err(invalid_params("maxAgeMs must be a non-negative integer")),
-    };
+    let arguments = parse_filter(object, "events/poll")?;
+    let cursor = parse_cursor_param(object)?;
+    let max_age_ms = parse_max_age(object)?;
 
     let max_events = match object.get("maxEvents") {
         None => DEFAULT_MAX_EVENTS,
@@ -239,15 +269,54 @@ pub fn parse_poll_params(params: &Value) -> Result<PollParams, PollError> {
     };
 
     Ok(PollParams {
-        arguments: PollFilter {
-            stream,
-            topic,
-            sender_email,
-            exclude_self,
-        },
+        arguments,
         cursor,
         max_age_ms,
         max_events: max_events as usize,
+    })
+}
+
+/// Validate the `events/stream` params object.
+pub fn parse_stream_params(params: &Value) -> Result<StreamParams, PollError> {
+    let object = params
+        .as_object()
+        .ok_or_else(|| invalid_params("events/stream params must be a JSON object"))?;
+
+    for key in object.keys() {
+        if !matches!(
+            key.as_str(),
+            "name" | "arguments" | "cursor" | "maxAgeMs" | "heartbeatMs" | "_meta"
+        ) {
+            return Err(invalid_params(format!(
+                "events/stream does not accept parameter: {key}"
+            )));
+        }
+    }
+
+    let name = object
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_params("events/stream requires a string name"))?;
+    if name != EVENT_NAME {
+        return Err(invalid_params(format!("unknown event name: {name}")));
+    }
+
+    let heartbeat_ms = match object.get("heartbeatMs") {
+        None => None,
+        Some(Value::Number(number)) => Some(
+            number
+                .as_i64()
+                .filter(|value| *value >= 0)
+                .ok_or_else(|| invalid_params("heartbeatMs must be a non-negative integer"))?,
+        ),
+        Some(_) => return Err(invalid_params("heartbeatMs must be a non-negative integer")),
+    };
+
+    Ok(StreamParams {
+        arguments: parse_filter(object, "events/stream")?,
+        cursor: parse_cursor_param(object)?,
+        max_age_ms: parse_max_age(object)?,
+        heartbeat_ms,
     })
 }
 
@@ -337,7 +406,7 @@ fn poll_result(events: Vec<Value>, cursor: String, truncated: bool, has_more: bo
     protocol::complete_result(body)
 }
 
-fn configured_realm(settings: &Settings) -> String {
+pub(crate) fn configured_realm(settings: &Settings) -> String {
     settings
         .zulip
         .base_url
@@ -352,7 +421,7 @@ pub fn encode_cursor(realm: &str, message_id: i64) -> String {
     format!("{CURSOR_PREFIX}{realm}|{message_id}")
 }
 
-fn parse_cursor(cursor: &str) -> Result<(&str, i64), PollError> {
+pub(crate) fn parse_cursor(cursor: &str) -> Result<(&str, i64), PollError> {
     let rest = cursor
         .strip_prefix(CURSOR_PREFIX)
         .ok_or_else(|| invalid_params("invalid cursor"))?;
@@ -376,7 +445,7 @@ fn event_id(realm: &str, message_id: i64) -> String {
     format!("{realm}#{message_id}")
 }
 
-fn occurrence(message: &ZulipMessage, realm: &str) -> Value {
+pub(crate) fn occurrence(message: &ZulipMessage, realm: &str) -> Value {
     json!({
         "eventId": event_id(realm, message.id),
         "name": EVENT_NAME,
@@ -421,7 +490,7 @@ fn message_type(message: &ZulipMessage) -> &'static str {
     }
 }
 
-fn matches_message(
+pub(crate) fn matches_message(
     filter: &PollFilter,
     message: &ZulipMessage,
     account_email: Option<&str>,
@@ -567,6 +636,46 @@ mod tests {
             assert!(
                 matches!(parse_poll_params(&params), Err(PollError::InvalidParams(_))),
                 "{params} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_params_share_filters_and_reject_poll_only_fields() {
+        let params = parse_stream_params(&json!({
+            "name": EVENT_NAME,
+            "arguments": {"stream": "core", "topic": "ops", "exclude_self": false},
+            "cursor": "v1:https://chat.example|7",
+            "maxAgeMs": 100,
+            "heartbeatMs": 300,
+        }))
+        .expect("valid stream params");
+        assert_eq!(params.arguments.stream.as_deref(), Some("core"));
+        assert_eq!(params.arguments.topic.as_deref(), Some("ops"));
+        assert!(!params.arguments.exclude_self);
+        assert_eq!(params.cursor.as_deref(), Some("v1:https://chat.example|7"));
+        assert_eq!(params.max_age_ms, Some(100));
+        assert_eq!(params.heartbeat_ms, Some(300));
+
+        for invalid in [
+            json!({}),
+            json!({"name": "other.event"}),
+            json!({"name": EVENT_NAME, "maxEvents": 10}),
+            json!({"name": EVENT_NAME, "maxEvents": 10, "maxAgeMs": 0}),
+            json!({"name": EVENT_NAME, "heartbeatMs": -1}),
+            json!({"name": EVENT_NAME, "heartbeatMs": 1.5}),
+            json!({"name": EVENT_NAME, "heartbeatMs": "fast"}),
+            json!({"name": EVENT_NAME, "arguments": {"topic": "ops"}}),
+            json!({"name": EVENT_NAME, "arguments": {"unknown": true}}),
+            json!({"name": EVENT_NAME, "cursor": 4}),
+            json!({"name": EVENT_NAME, "maxAgeMs": -1}),
+        ] {
+            assert!(
+                matches!(
+                    parse_stream_params(&invalid),
+                    Err(PollError::InvalidParams(_))
+                ),
+                "{invalid} must be rejected"
             );
         }
     }

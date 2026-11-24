@@ -86,7 +86,12 @@ pub enum Envelope {
         params: Option<Value>,
     },
     /// A notification that must never receive a response.
-    Notification,
+    Notification {
+        /// JSON-RPC method name.
+        method: String,
+        /// Optional notification parameters.
+        params: Option<Value>,
+    },
     /// A frame that is not a valid JSON-RPC request.
     Invalid {
         /// Identifier to echo when it could be recovered.
@@ -148,8 +153,17 @@ pub fn parse_envelope(value: Value) -> Envelope {
 
     match id {
         Some(id) => Envelope::Request { id, method, params },
-        None => Envelope::Notification,
+        None => Envelope::Notification { method, params },
     }
+}
+
+/// Build a JSON-RPC notification frame.
+pub fn notification(method: &str, params: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params,
+    })
 }
 
 /// Build a successful JSON-RPC response.
@@ -298,8 +312,20 @@ mod tests {
         let notification = json!({"jsonrpc": "2.0", "method": "tools/list"});
         assert!(matches!(
             parse_envelope(notification),
-            Envelope::Notification
+            Envelope::Notification { .. }
         ));
+
+        match parse_envelope(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": 7, "reason": "done"},
+        })) {
+            Envelope::Notification { method, params } => {
+                assert_eq!(method, "notifications/cancelled");
+                assert_eq!(params.expect("params")["requestId"], json!(7));
+            }
+            _ => panic!("expected a notification"),
+        }
     }
 
     #[test]

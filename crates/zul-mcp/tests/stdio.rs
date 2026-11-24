@@ -958,7 +958,7 @@ fn events_list_and_poll_serve_the_extension() {
     harness.send(&modern(
         json!(3),
         "events/stream",
-        json!({"name": "zulip.message"}),
+        json!({"name": "other.event"}),
     ));
     harness.send(&modern(
         json!(4),
@@ -993,7 +993,8 @@ fn events_list_and_poll_serve_the_extension() {
     );
     assert_eq!(
         responses.get("n:3").expect("events/stream response")["error"]["code"],
-        -32601
+        -32602,
+        "an unknown stream event name is rejected before any network use"
     );
 
     let poll = &responses.get("n:4").expect("events/poll response")["result"];
@@ -1038,6 +1039,73 @@ fn events_list_and_poll_serve_the_extension() {
             "latest-message request is missing {parameter}: {request}"
         );
     }
+}
+
+#[test]
+fn stream_aborts_at_eof_without_a_result_or_a_credential_leak() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
+    let base_url = format!(
+        "http://{}",
+        listener.local_addr().expect("listener address")
+    );
+    let responder = serve_one_response(
+        listener,
+        r#"{"result":"success","msg":"","messages":[{"id":77}]}"#,
+    );
+    let mut harness = Harness::start_with_env(
+        dir.path(),
+        &[
+            ("ZULIP_BASE_URL", &base_url),
+            ("ZULIP_EMAIL", "ada@example.com"),
+            ("ZULIP_API_KEY", COMPLETE_CREDENTIALS_KEY),
+        ],
+    );
+
+    harness.send(&modern(
+        json!(1),
+        "events/stream",
+        json!({"name": "zulip.message"}),
+    ));
+
+    let line = harness.recv();
+    let frame: Value = serde_json::from_str(&line).expect("active notification is JSON");
+    assert_eq!(frame["jsonrpc"], "2.0");
+    assert_eq!(frame["method"], "notifications/events/active");
+    assert_eq!(
+        frame["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+        json!(1)
+    );
+    assert_eq!(
+        frame["params"]["cursor"],
+        json!(format!("v1:{base_url}|77"))
+    );
+    assert_eq!(frame["params"]["truncated"], false);
+    assert_eq!(frame["params"]["heartbeatMs"], 15_000);
+    assert!(
+        !line.contains(COMPLETE_CREDENTIALS_KEY),
+        "API key leaked into the active notification: {line}"
+    );
+
+    // Closing stdin must cancel the stream without a final result, and the
+    // process must exit well inside the harness's two-second bound.
+    let (remaining, status, stderr) = harness.finish();
+    assert!(status.success(), "exit status {status:?}; stderr: {stderr}");
+    assert!(
+        remaining.is_empty(),
+        "a cancelled stream must not emit a result: {remaining:?}"
+    );
+    assert!(!stderr.contains(COMPLETE_CREDENTIALS_KEY));
+
+    let request = responder.join().expect("responder thread");
+    assert!(
+        request.starts_with("GET /api/v1/messages?"),
+        "stream setup must resolve the newest message: {request}"
+    );
+    assert!(
+        request.contains("anchor=newest"),
+        "stream setup must ask for the newest message: {request}"
+    );
 }
 
 #[test]

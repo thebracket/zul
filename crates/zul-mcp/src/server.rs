@@ -6,8 +6,10 @@
 //! Streaming methods are exempt from both limits through [`is_long_lived`].
 
 use crate::events::{self, PollError};
+use crate::events_stream::{self, EventsConfig, StreamEnd, StreamHub};
 use crate::protocol::{self, Envelope, RequestId};
 use crate::tools::{self, ToolContext, ToolFailure};
+use libzul::zulip::client::ZulipClient;
 use serde_json::{Map, Value};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -22,13 +24,15 @@ MCP 2026-07-28; set the client's protocol to \"2026-07-28\" and retry";
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const DEFAULT_MAX_INFLIGHT: usize = 64;
 
-/// Limits applied to ordinary request tasks.
+/// Limits applied to request tasks and event streams.
 #[derive(Debug, Clone, Copy)]
 pub struct ServerConfig {
     /// Maximum time one request may run before it is cancelled with `-32603`.
     pub request_timeout: Duration,
     /// Maximum number of concurrent ordinary request tasks.
     pub max_inflight: usize,
+    /// Timing and capacity limits for long-lived event streams.
+    pub events: EventsConfig,
 }
 
 impl Default for ServerConfig {
@@ -36,14 +40,16 @@ impl Default for ServerConfig {
         Self {
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             max_inflight: DEFAULT_MAX_INFLIGHT,
+            events: EventsConfig::default(),
         }
     }
 }
 
-/// One request task tracked for duplicate detection.
+/// One request task tracked for duplicate detection and cancellation.
 struct ActiveRequest {
     generation: u64,
     abort: AbortHandle,
+    long_lived: bool,
 }
 
 /// Everything a request task needs besides the request future itself.
@@ -58,10 +64,21 @@ struct RequestTask {
     registry_guard: ActiveGuard,
 }
 
+/// Everything a stream task needs besides its request parameters.
+struct StreamTask {
+    tx: mpsc::Sender<String>,
+    id: RequestId,
+    tools: Rc<ToolContext>,
+    hub: Rc<StreamHub>,
+    events: EventsConfig,
+    registry_guard: ActiveGuard,
+}
+
 /// Dispatcher for inbound frames and owner of in-flight request tasks.
 pub struct Server {
     tx: mpsc::Sender<String>,
     tools: Rc<ToolContext>,
+    hub: Rc<StreamHub>,
     active: Rc<RefCell<HashMap<String, ActiveRequest>>>,
     inflight: Rc<Cell<usize>>,
     tasks: JoinSet<()>,
@@ -78,9 +95,23 @@ impl Server {
 
     /// Create a dispatcher with explicit request limits.
     pub fn with_config(tx: mpsc::Sender<String>, config: ServerConfig) -> Self {
+        Self::with_context(tx, config, Rc::new(ToolContext::new()))
+    }
+
+    /// Create a dispatcher around an explicit tool context.
+    ///
+    /// Tests use this to inject settings aimed at a mock realm; production uses
+    /// [`Server::new`] or [`Server::with_config`].
+    pub fn with_context(
+        tx: mpsc::Sender<String>,
+        config: ServerConfig,
+        tools: Rc<ToolContext>,
+    ) -> Self {
+        let hub = Rc::new(StreamHub::new(config.events));
         Self {
             tx,
-            tools: Rc::new(ToolContext::new()),
+            tools,
+            hub,
             active: Rc::new(RefCell::new(HashMap::new())),
             inflight: Rc::new(Cell::new(0)),
             tasks: JoinSet::new(),
@@ -101,7 +132,9 @@ impl Server {
         };
         match protocol::parse_envelope(value) {
             Envelope::Request { id, method, params } => self.submit(id, method, params),
-            Envelope::Notification => {}
+            Envelope::Notification { method, params } => {
+                self.handle_notification(&method, params.as_ref())
+            }
             Envelope::Invalid { id, message } => {
                 self.send(protocol::error(
                     id.as_ref(),
@@ -118,8 +151,22 @@ impl Server {
         self.send(protocol::error(None, protocol::PARSE_ERROR, message, None));
     }
 
-    /// Let queued requests finish within `grace`, then cancel the rest.
+    /// Cancel streams and the shared poller, let queued requests finish within
+    /// `grace`, then cancel the rest.
     pub async fn drain(&mut self, grace: Duration) {
+        self.hub.shutdown();
+        let long_lived: Vec<String> = self
+            .active
+            .borrow()
+            .iter()
+            .filter(|(_, request)| request.long_lived)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in long_lived {
+            if let Some(request) = self.active.borrow_mut().remove(&key) {
+                request.abort.abort();
+            }
+        }
         let _ = tokio::time::timeout(grace, async {
             while let Some(finished) = self.tasks.join_next().await {
                 report_task(finished);
@@ -183,27 +230,62 @@ impl Server {
             key: key.clone(),
             generation,
         };
-        let handle = self.tasks.spawn_local(run_request(
-            RequestTask {
+
+        let handle = if long_lived {
+            let task = StreamTask {
                 tx: self.tx.clone(),
-                active: Rc::clone(&self.active),
-                key,
-                generation,
-                timeout: counted.then_some(self.config.request_timeout),
                 id,
-                inflight_guard,
+                tools,
+                hub: Rc::clone(&self.hub),
+                events: self.config.events,
                 registry_guard,
-            },
-            async move { handle_request(&tools, &method, params.as_ref()).await },
-        ));
+            };
+            self.tasks.spawn_local(run_stream(task, params))
+        } else {
+            self.tasks.spawn_local(run_request(
+                RequestTask {
+                    tx: self.tx.clone(),
+                    active: Rc::clone(&self.active),
+                    key,
+                    generation,
+                    timeout: counted.then_some(self.config.request_timeout),
+                    id,
+                    inflight_guard,
+                    registry_guard,
+                },
+                async move { handle_request(&tools, &method, params.as_ref()).await },
+            ))
+        };
         active.borrow_mut().insert(
             task_key,
             ActiveRequest {
                 generation,
                 abort: handle,
+                long_lived,
             },
         );
         self.reap();
+    }
+
+    /// Stop one subscription or request named by `notifications/cancelled`.
+    ///
+    /// Cancellation removes the registry entry first, so an aborted stream task
+    /// can never emit a final result. Notifications never receive a response.
+    fn handle_notification(&mut self, method: &str, params: Option<&Value>) {
+        if method != "notifications/cancelled" {
+            return;
+        }
+        let Some(request_id) = params
+            .and_then(|params| params.get("requestId"))
+            .and_then(RequestId::from_value)
+        else {
+            return;
+        };
+        let removed = self.active.borrow_mut().remove(&request_id.registry_key());
+        if let Some(request) = removed {
+            request.abort.abort();
+            self.reap();
+        }
     }
 
     fn reap(&mut self) {
@@ -233,11 +315,8 @@ impl Server {
 }
 
 /// A streaming method stays open for the connection's lifetime, so it is not
-/// counted against the ordinary request cap and has no request timeout.
-///
-/// No streaming method is implemented yet: `events/stream` will use this seam
-/// when push delivery lands (Unit 4b), and currently still receives the
-/// unknown-method error.
+/// counted against the ordinary request cap and has no request timeout. The
+/// stream hub separately bounds how many may run at once.
 fn is_long_lived(method: &str) -> bool {
     matches!(method, "events/stream")
 }
@@ -397,29 +476,7 @@ async fn handle_request(
         ));
     }
 
-    match protocol::check_request_version(params) {
-        protocol::VersionCheck::Supported => {}
-        protocol::VersionCheck::Missing => {
-            return Err(rpc_error_with_data(
-                protocol::UNSUPPORTED_PROTOCOL_VERSION,
-                format!(
-                    "missing protocol version metadata; set params._meta[\"io.modelcontextprotocol/protocolVersion\"] to \"{}\"",
-                    protocol::PROTOCOL_VERSION
-                ),
-                protocol::unsupported_version_data(None),
-            ));
-        }
-        protocol::VersionCheck::Unsupported(requested) => {
-            return Err(rpc_error_with_data(
-                protocol::UNSUPPORTED_PROTOCOL_VERSION,
-                format!(
-                    "unsupported protocol version; this server supports only MCP {}",
-                    protocol::PROTOCOL_VERSION
-                ),
-                protocol::unsupported_version_data(Some(&requested)),
-            ));
-        }
-    }
+    check_version(params)?;
 
     match method {
         "tools/list" => {
@@ -437,13 +494,138 @@ async fn handle_request(
     }
 }
 
+/// Reject requests that do not declare the one supported MCP revision.
+fn check_version(params: Option<&Value>) -> Result<(), RpcError> {
+    match protocol::check_request_version(params) {
+        protocol::VersionCheck::Supported => Ok(()),
+        protocol::VersionCheck::Missing => Err(rpc_error_with_data(
+            protocol::UNSUPPORTED_PROTOCOL_VERSION,
+            format!(
+                "missing protocol version metadata; set params._meta[\"io.modelcontextprotocol/protocolVersion\"] to \"{}\"",
+                protocol::PROTOCOL_VERSION
+            ),
+            protocol::unsupported_version_data(None),
+        )),
+        protocol::VersionCheck::Unsupported(requested) => Err(rpc_error_with_data(
+            protocol::UNSUPPORTED_PROTOCOL_VERSION,
+            format!(
+                "unsupported protocol version; this server supports only MCP {}",
+                protocol::PROTOCOL_VERSION
+            ),
+            protocol::unsupported_version_data(Some(&requested)),
+        )),
+    }
+}
+
 /// Methods that require per-request protocol metadata. Discovery is exempt and
-/// `initialize` is handled before this check; `events/stream` stays unknown
-/// until push delivery lands.
+/// `initialize` is handled before this check. `events/stream` is dispatched by
+/// the long-lived request path and performs the same gate there.
 fn is_known_method(method: &str) -> bool {
     matches!(
         method,
         "tools/list" | "tools/call" | "events/list" | "events/poll"
+    )
+}
+
+/// Serve one `events/stream` request: validate, subscribe, then write frames
+/// until the subscription ends. Only a server-initiated end produces a final
+/// JSON-RPC result.
+async fn run_stream(task: StreamTask, params: Option<Value>) {
+    let StreamTask {
+        tx,
+        id,
+        tools,
+        hub,
+        events,
+        registry_guard,
+    } = task;
+    // Kept until the task ends so a duplicate id or cancellation can abort it
+    // and release the registry entry.
+    let _registry_guard = registry_guard;
+
+    let subscription = match stream_setup(&tools, &hub, &events, &id, params.as_ref()).await {
+        Ok(subscription) => subscription,
+        Err(err) => {
+            let response = protocol::error(Some(&id), err.code, err.message, err.data);
+            let _ = tx.send(protocol::to_line(&response)).await;
+            return;
+        }
+    };
+
+    if let StreamEnd::Terminated = events_stream::serve(subscription, tx.clone()).await {
+        let result = protocol::success(&id, events_stream::stream_result(&id.to_value()));
+        let _ = tx.send(protocol::to_line(&result)).await;
+    }
+}
+
+async fn stream_setup(
+    tools: &ToolContext,
+    hub: &Rc<StreamHub>,
+    events: &EventsConfig,
+    id: &RequestId,
+    params: Option<&Value>,
+) -> Result<events_stream::Subscription, RpcError> {
+    check_version(params)?;
+    let params = params.ok_or_else(|| {
+        rpc_error(
+            protocol::INVALID_PARAMS,
+            "events/stream requires a params object",
+        )
+    })?;
+    let params = events::parse_stream_params(params).map_err(poll_error)?;
+
+    let settings = tools.settings().map_err(|problem| {
+        rpc_error(
+            protocol::INTERNAL_ERROR,
+            format!("events/stream failed: {}", tools::one_line(&problem)),
+        )
+    })?;
+    let realm = events::configured_realm(&settings);
+    let start_cursor = match params.cursor.as_deref() {
+        Some(cursor) => {
+            let (cursor_realm, message_id) = events::parse_cursor(cursor).map_err(poll_error)?;
+            if cursor_realm != realm {
+                return Err(rpc_error(
+                    protocol::INVALID_PARAMS,
+                    "cursor belongs to another realm",
+                ));
+            }
+            message_id
+        }
+        None => {
+            let (base_url, email, api_key) = settings.require_auth().map_err(stream_auth_error)?;
+            let client = ZulipClient::new(base_url, email, api_key);
+            client
+                .latest_message_id()
+                .await
+                .map_err(|err| {
+                    rpc_error(
+                        protocol::INTERNAL_ERROR,
+                        format!(
+                            "events/stream failed: {}",
+                            tools::one_line(&err.to_string())
+                        ),
+                    )
+                })?
+                .unwrap_or(0)
+        }
+    };
+    if params.cursor.is_some() {
+        settings.require_auth().map_err(stream_auth_error)?;
+    }
+
+    let heartbeat = events.granted_heartbeat(params.heartbeat_ms);
+    hub.subscribe(id.clone(), start_cursor, params, heartbeat, settings)
+        .map_err(|err| rpc_error(protocol::INTERNAL_ERROR, err.message()))
+}
+
+fn stream_auth_error(problem: impl std::fmt::Display) -> RpcError {
+    rpc_error(
+        protocol::INTERNAL_ERROR,
+        format!(
+            "events/stream failed: {}",
+            tools::one_line(&problem.to_string())
+        ),
     )
 }
 
@@ -676,16 +858,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn events_stream_remains_an_unknown_method() {
-        let tools = ToolContext::new();
-        let result = handle_request(
-            &tools,
-            "events/stream",
-            Some(&modern(json!({"name": events::EVENT_NAME}))),
-        )
-        .await
-        .expect_err("events/stream is not implemented in this unit");
-        assert_eq!(result.code, protocol::METHOD_NOT_FOUND);
+    async fn events_stream_rejects_invalid_params_without_opening_a_stream() {
+        LocalSet::new()
+            .run_until(async {
+                let (tx, mut rx) = mpsc::channel(8);
+                let mut server = Server::new(tx);
+                server
+                    .handle_line(
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "events/stream",
+                            "params": modern(json!({"name": "other.event"})),
+                        })
+                        .to_string(),
+                    )
+                    .await;
+
+                let response = next_response(&mut rx).await;
+                assert_eq!(response["id"], 1);
+                assert_eq!(response["error"]["code"], protocol::INVALID_PARAMS);
+                assert!(server.active.borrow().is_empty());
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), rx.recv())
+                        .await
+                        .is_err(),
+                    "a rejected stream must not emit notifications"
+                );
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -747,6 +948,7 @@ mod tests {
                     ServerConfig {
                         request_timeout: Duration::from_millis(50),
                         max_inflight: 8,
+                        events: EventsConfig::default(),
                     },
                 );
                 let started = Instant::now();
@@ -781,6 +983,7 @@ mod tests {
                     ServerConfig {
                         request_timeout: Duration::from_secs(30),
                         max_inflight: 8,
+                        events: EventsConfig::default(),
                     },
                 );
                 server.handle_line(&stalled(json!(1))).await;
@@ -821,6 +1024,7 @@ mod tests {
                     ServerConfig {
                         request_timeout: Duration::from_secs(30),
                         max_inflight: 8,
+                        events: EventsConfig::default(),
                     },
                 );
 
@@ -877,6 +1081,7 @@ mod tests {
                     ServerConfig {
                         request_timeout: Duration::from_secs(30),
                         max_inflight: 2,
+                        events: EventsConfig::default(),
                     },
                 );
                 server.handle_line(&stalled(json!(1))).await;
@@ -910,6 +1115,7 @@ mod tests {
                     ServerConfig {
                         request_timeout: Duration::from_secs(30),
                         max_inflight: 1,
+                        events: EventsConfig::default(),
                     },
                 );
                 server.handle_line(&stalled(json!(1))).await;
@@ -919,7 +1125,7 @@ mod tests {
                             "jsonrpc": "2.0",
                             "id": 2,
                             "method": "events/stream",
-                            "params": modern(json!({})),
+                            "params": modern(json!({"name": "other.event"})),
                         })
                         .to_string(),
                     )
@@ -929,8 +1135,8 @@ mod tests {
                 assert_eq!(response["id"], 2);
                 assert_eq!(
                     response["error"]["code"],
-                    protocol::METHOD_NOT_FOUND,
-                    "events/stream is not implemented yet, but it is exempt from the cap"
+                    protocol::INVALID_PARAMS,
+                    "events/stream is exempt from the in-flight cap"
                 );
                 server.drain(Duration::from_millis(20)).await;
             })
@@ -947,6 +1153,7 @@ mod tests {
                     ServerConfig {
                         request_timeout: Duration::from_secs(30),
                         max_inflight: 8,
+                        events: EventsConfig::default(),
                     },
                 );
                 server.handle_line(&stalled(json!(1))).await;
