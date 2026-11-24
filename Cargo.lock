@@ -4903,6 +4903,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "zul-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dotenvy",
+ "libzul",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "zul-tui"
 version = "0.1.0"
 dependencies = [

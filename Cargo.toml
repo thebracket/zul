@@ -3,11 +3,13 @@ resolver = "2"
 members = [
     "crates/libzul",
     "crates/zul-cli",
+    "crates/zul-mcp",
     "crates/zul-tui",
 ]
 default-members = [
     "crates/libzul",
     "crates/zul-cli",
+    "crates/zul-mcp",
     "crates/zul-tui",
 ]
 
