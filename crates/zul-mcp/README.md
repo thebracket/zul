@@ -48,12 +48,20 @@ not resolve to this checkout.
 
 ## Documentation verification
 
-The tool list, defaults and limits, discovery capabilities, and key-handshake
-behaviour in this README are manually verified against the built binary. They are
-not asserted by `cargo test`; this manual check is the Planner-accepted residual
-for this docs-only unit. Re-run the smoke check and re-read the limits/defaults
+The tool catalog, discovery capabilities, event descriptor, and version-gate
+behaviour are guarded by `cargo test`: `crates/zul-mcp/tests/stdio.rs`
+(`serves_discovery_tools_and_protocol_errors`,
+`events_list_and_poll_serve_the_extension`) asserts the exact discovery
+capabilities (tools plus the events extension), the eight tool names in order,
+the single `zulip.message` descriptor with `delivery: ["poll","push"]`, and
+`-32022` for missing `_meta`. What those tests do not assert is the exact
+three-line transcript (including the descriptor's payload field details), the
+prose cursor/truncation semantics, and the OpenCode config/automation examples;
+verify those by re-running the recipe below and re-reading the limits/defaults
 tables whenever the tool catalog, event descriptor, protocol revision, or
-constants change.
+constants change. A dedicated stream-level test for page-cap and mixed
+aged+page-cap cursor behaviour is still missing and accepted as a follow-up
+(REV-T2); those semantics remain guarded by code reading, not by this recipe.
 
 Run three NDJSON frames against a throwaway home, with credentials and dotenv
 disabled, so no local configuration is read:
@@ -61,17 +69,28 @@ disabled, so no local configuration is read:
 ```sh
 zul_mcp=./target/debug/zul-mcp   # or target/release after a release build
 tmp=$(mktemp -d)
+run_clean() {
+  env -u ZULIP_BASE_URL -u ZULIP_SITE -u ZULIP_EMAIL -u ZULIP_API_KEY \
+    HOME="$tmp" XDG_CONFIG_HOME="$tmp/config" XDG_CACHE_HOME="$tmp/cache" \
+    ZUL_DOTENV= "$zul_mcp" "$@"
+}
+
 printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"server/discover"}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}' \
   '{"jsonrpc":"2.0","id":3,"method":"events/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}' \
-| env -u ZULIP_BASE_URL -u ZULIP_SITE -u ZULIP_EMAIL -u ZULIP_API_KEY \
-    HOME="$tmp" XDG_CONFIG_HOME="$tmp/config" XDG_CACHE_HOME="$tmp/cache" \
-    ZUL_DOTENV= "$zul_mcp" 2>"$tmp/stderr.log"
+| run_clean 2>"$tmp/stderr.log"
 cat "$tmp/stderr.log" >&2   # startup/shutdown diagnostics only
+
+# Negative version-gate check: tools/list without _meta must return -32022.
+printf '%s\n' '{"jsonrpc":"2.0","id":4,"method":"tools/list"}' \
+| run_clean 2>/dev/null
+
+rm -rf "$tmp"
 ```
 
-The expected stdout is exactly three JSON lines, one result per request id:
+The first invocation's stdout is exactly three JSON lines, one result per
+request id:
 
 - id `1`: discovery capabilities are
   `{"tools":{},"extensions":{"io.modelcontextprotocol/events":{}}}`.
@@ -81,9 +100,11 @@ The expected stdout is exactly three JSON lines, one result per request id:
 - id `3`: `events/list` returns one `zulip.message` descriptor with
   `delivery: ["poll","push"]` and nullable payload `stream`/`topic` fields.
 
-The frame ids and the `_meta` protocol component id are part of the check: the
-responses must echo the ids, and omitting the protocol metadata must fail with
-`-32022`. Diagnostics belong on stderr; stdout must stay pure JSON-RPC.
+The separate negative invocation's stdout is exactly one JSON line: id `4` with
+`error.code` `-32022`. The frame ids are part of the check: every response must
+echo its id. Omitting the protocol metadata must fail, and the negative
+invocation demonstrates it. Diagnostics belong on stderr; stdout must stay pure
+JSON-RPC. The recipe removes its throwaway home at the end.
 
 ## Credentials
 
@@ -361,7 +382,9 @@ Pull controls (`events/poll`):
   not mark truncation.
 - `maxEvents`: 1–200, default 50. If more matching messages are available, the
   response sets `hasMore: true` and the cursor points at the last returned
-  message; poll again with that cursor.
+  message; poll again with that cursor. `hasMore` is independent of `truncated`:
+  a page-cap-truncated poll can report `hasMore: false` while older history
+  remains.
 - `nextPollMs` is 15000.
 - Without a cursor, a poll starts from now: it returns no events and a cursor
   anchored at the current latest message ID.
