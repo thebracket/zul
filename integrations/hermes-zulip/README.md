@@ -55,13 +55,21 @@ refuses to connect.
 
 ## Install
 
-Install into the Python environment Hermes itself runs under, not a separate
-scratch venv. The standard Hermes installer keeps that venv under
-`${HERMES_HOME:-$HOME/.hermes}/hermes-agent/venv`:
+First identify the Python interpreter used by the **running gateway** (its
+process executable / service command), not just the shell's `python` or an old
+`hermes-agent/venv` path. Managed Hermes installations can re-exec into a
+CPython 3.14 environment under their install store. Installing in a scratch
+venv or launching `python -m hermes_cli.main` does not guarantee that venv
+survives Hermes bootstrap. The following commands describe the existing
+shared-interpreter installation; set `HERMES_PY` to the verified interpreter.
+For a profile-only installation that avoids changing shared packages, see
+[the isolated trial guide](PROFILE_SETUP.md), including its explicit manual
+vendoring workaround and installer limitation.
 
 ```sh
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
-HERMES_PY="$HERMES_HOME/hermes-agent/venv/bin/python"
+# Set this to the verified gateway interpreter before continuing:
+: "${HERMES_PY:?Set HERMES_PY to the gateway Python executable}"
 
 # From a checkout of this repository (builds the Rust extension):
 uv pip install --python "$HERMES_PY" ./integrations/hermes-zulip
@@ -88,7 +96,9 @@ If Hermes was installed another way (system Python, pipx, a distro package),
 substitute that interpreter above. `hermes pm` manages Hermes' own optional
 dependencies (Node, Chromium, MCP helpers); it does not install this wheel.
 
-Restart the gateway after enabling the plugin. Verify discovery with:
+For an existing multi-profile gateway, use the profile-scoped activation and
+reload procedure in [PROFILE_SETUP.md](PROFILE_SETUP.md); do not blindly restart
+the host or start a second gateway. Verify discovery with:
 
 ```sh
 hermes plugins list          # zulip-platform should be listed and enabled
