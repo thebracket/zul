@@ -208,11 +208,15 @@ targets accept:
 - `#<name>/<topic>` — shorthand for the same;
 - `@<email>` — a direct message to one Zulip user.
 
-**Authorization.** The gateway authorizes senders before dispatch. Set
-`ZULIP_ALLOWED_USERS` to a comma-separated list of Zulip user IDs or emails, or
-`ZULIP_ALLOW_ALL_USERS=true` to admit everyone. Without an allowlist, unknown
-users go through Hermes' normal DM pairing/approval flow. Group messages respect
-the same allowlist. `ZULIP_ALLOWED_STREAMS` narrows further to named streams.
+**Authorization.** The gateway authorizes senders before dispatch. Configure
+both `platforms.zulip.allowed_users` and `extra.allowed_users` with authenticated
+bot-visible emails plus numeric IDs; see [PROFILE_SETUP.md](PROFILE_SETUP.md)
+for the multiplex core path and masked-email caveat. Keep allow-all false for
+a restricted trial. Ordinary allowlisted DMs do not require a mention;
+`extra.dm_policy: disabled` drops ordinary and private group DMs before core
+checks, while `allowlist` enables normal core sender authorization. Private
+group DMs retain group scope, not DM-only permissions. `ZULIP_ALLOWED_STREAMS`
+narrows streams only; there is no topic filter.
 
 ## Limits and residuals
 
@@ -300,7 +304,7 @@ console-script entry points, and importing the installer without the gateway.
 | `hermes plugins list` shows `zulip-platform` but it fails to load with an import error | The wheel is missing from the environment Hermes runs under. Run `"$HERMES_PY" -c "import zul_bridge"` with the same interpreter and reinstall. |
 | Plugin is discovered but not enabled | `hermes plugins enable zulip-platform`. The enable key is the manifest `name`, not the install directory (`plugins/zulip`). Restart the gateway. |
 | `Zulip is not configured: ... must be set` | Set the named `ZULIP_*` variables in `$HERMES_HOME/.env` (or the profile's env) and restart. `ZULIP_SITE`/`ZULIP_BASE_URL`, `ZULIP_EMAIL`, and `ZULIP_API_KEY` are all required. |
-| `Zulip is not configured` while libzul's own settings exist | libzul's settings presence check cannot read a corrupt settings file, so the credentials look absent. Repair the libzul settings (`~/.config/zul/config.toml` and its secret file), or set the `ZULIP_*` variables explicitly. |
+| `Zulip is not configured` while libzul's own settings exist | Expected: the Hermes adapter deliberately requires complete profile-scoped credentials; libzul's global settings are not an adapter fallback. Populate only the intended profile's `.env`. |
 | No stream traffic reaches the agent | The bot must be subscribed to the stream; `ZULIP_REQUIRE_MENTION` must be satisfied; `ZULIP_ALLOWED_STREAMS` and the user allowlist can filter traffic. Check the gateway log for dropped or malformed events. |
 | Replies work in DMs but not streams | Stream replies need a topic. Use a session that came from a stream message, or target `stream:<name>/<topic>`. |
 | Typing indicator never appears | Expected for targets parsed from a stream name (no numeric stream id). A canonical chat id from an inbound message carries the id and works. |
