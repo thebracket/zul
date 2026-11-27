@@ -25,6 +25,22 @@ async def _handle(adapter, event):
     return adapter.handled_events[-1]
 
 
+@pytest.mark.parametrize("policy", [None, "open", "disabled"])
+@pytest.mark.parametrize("group", [False, True])
+async def test_dm_disabled_policy(config, policy, group):
+    if policy is not None:
+        config.extra["dm_policy"] = policy
+    adapter = _adapter(config)
+    participants = [{"id": 1, "email": "bot@example.com"},
+                    {"id": 7, "email": "ada@example.com"}]
+    if group:
+        participants.append({"id": 8, "email": "bob@example.com"})
+    message = await _handle(adapter, make_dm_event(dm_participants=participants))
+    assert (message is None) is (policy == "disabled")
+    # Opting out of private transport must not disable ordinary stream intake.
+    assert await _handle(adapter, make_stream_event(id=99)) is not None
+
+
 async def test_stream_mapping_and_source_fields(config):
     adapter = _adapter(config)
     event = make_stream_event(plain_text="hello there")

@@ -70,7 +70,23 @@ async def main():
     assert GatewayAuthorizationMixin._principal_authorized(policy, alice, allow_adapter_delegation=True) is False
     alice.chat_type = "dm"
     assert GatewayAuthorizationMixin._principal_authorized(policy, alice, allow_adapter_delegation=True) is True
-    print("profile/group real contract ok")
+    # Intake denial must precede core grants, even for an authorized human.
+    for dm_policy in ("disabled", "open", None):
+        for count in (2, 3):
+            extra = {} if dm_policy is None else {"dm_policy": dm_policy}
+            adapter = module.ZulipAdapter(PlatformConfig(enabled=True, extra=extra))
+            adapter._bot_email = "bot@example.invalid"
+            received = []
+            async def authorize(event):
+                received.append(GatewayAuthorizationMixin._principal_authorized(
+                    SimpleNamespace(_adapter_profile_for_source=lambda source: None,
+                        _chat_scoped_grant=lambda *args, **kwargs: True),
+                    event.source, allow_adapter_delegation=True))
+            adapter.handle_message = authorize
+            await adapter._handle_event(dict(id=100, kind="dm", plain_text="hello",
+                sender_id=2, sender_email="alice@example.invalid", dm_participants=participants[:count]))
+            assert received == ([] if dm_policy == "disabled" else [True])
+    print("profile/group/DM policy real contract ok")
 
 
 if __name__ == "__main__":

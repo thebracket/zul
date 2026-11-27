@@ -424,6 +424,10 @@ class ZulipAdapter(BasePlatformAdapter):
         }
 
     def _dm_mapping(self, event: dict[str, Any], text: str) -> dict[str, Any] | None:
+        # Zulip private messages include both one-to-one and group DMs.
+        # Apply the transport-level opt-out before either becomes a core event.
+        if (getattr(self.config, "extra", None) or {}).get("dm_policy") == "disabled":
+            return None
         participants = event.get("dm_participants")
         if not isinstance(participants, list):
             participants = []
