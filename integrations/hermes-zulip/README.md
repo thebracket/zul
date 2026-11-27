@@ -150,10 +150,11 @@ gateway:
         allowed_streams: support,eng
 ```
 
-Keep `ZULIP_API_KEY` in `.env` only. The adapter reads site, email, and API key
-from the environment or `extra` first, then falls back to the credentials in
-libzul's own settings file (`~/.config/zul/config.toml` and its secret file),
-so an existing `zul` CLI setup can supply them too.
+Keep `ZULIP_API_KEY` in the active Hermes profile's `.env` only. The adapter
+requires site, email, and API key resolved by Hermes for that profile (with
+`extra` as the profile-local fallback). It never borrows missing credentials
+from libzul's process environment or global XDG settings. Normal `zul` CLI
+configuration defaults are unchanged.
 
 ## Behavior
 

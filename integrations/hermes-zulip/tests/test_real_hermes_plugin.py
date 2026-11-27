@@ -20,6 +20,20 @@ _HERMES_REPO = os.environ.get("HERMES_REPO")
 
 
 @pytest.mark.skipif(not _HERMES_REPO, reason="HERMES_REPO is not set")
+def test_real_profile_and_group_contract(tmp_path):
+    env = {**os.environ, "HERMES_HOME": str(tmp_path / "hermes-home"),
+           "ZULIP_BASE_URL": "https://personal.invalid",
+           "ZULIP_EMAIL": "personal@example.invalid", "ZULIP_API_KEY": "dummy"}
+    env["PYTHONPATH"] = os.pathsep.join((
+        str(_HERMES_REPO), str(Path(__file__).resolve().parents[1] / "python"),
+        os.environ.get("PYTHONPATH", "")))
+    completed = subprocess.run(
+        [sys.executable, str(Path(__file__).with_name("profile_group_contract.py"))],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.skipif(not _HERMES_REPO, reason="HERMES_REPO is not set")
 def test_real_hermes_loads_and_registers_plugin(tmp_path):
     repo = Path(_HERMES_REPO)
     if not (repo / "hermes_cli" / "plugins.py").is_file():
@@ -156,6 +170,7 @@ def test_real_hermes_loads_and_registers_plugin(tmp_path):
         "PYTHONPATH": os.pathsep.join((
             str(repo),
             str(Path(__file__).resolve().parents[1] / "python"),
+            os.environ.get("PYTHONPATH", ""),
         )),
         "HERMES_HOME": str(home),
         "ZULIP_SITE": "https://chat.example.com",

@@ -195,6 +195,7 @@ async def test_group_dm_keeps_other_recipients(config):
     ])
     message = await _handle(adapter, event)
     assert message.source.chat_name == "Ada, Grace"
+    assert message.source.chat_type == "group"
     target = decode_chat_id(message.source.chat_id)
     assert target.recipients == ((7, "ada@example.com"), (8, "grace@example.com"))
 

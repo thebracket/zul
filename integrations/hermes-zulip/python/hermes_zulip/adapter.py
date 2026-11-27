@@ -145,39 +145,21 @@ def _bridge_kwargs(extra: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _make_bridge(extra: dict[str, Any]):
-    """Construct the blocking bridge; split out so tests and callers can fake it."""
-    return zul_bridge.Bridge(**_bridge_kwargs(extra))  # type: ignore[union-attr]
-
-
-def _bridge_config_status() -> dict[str, Any]:
-    """Read libzul's credential-presence flags without network access."""
-    if zul_bridge is None:
-        return {}
-    try:
-        status = zul_bridge.config_status()
-    except Exception:
-        return {}
-    return status if isinstance(status, dict) else {}
+def _make_bridge(settings: dict[str, Any]):
+    """Pass only complete, profile-resolved credentials across the native boundary."""
+    if not all(settings.get(name) for name in ("base_url", "email", "api_key")):
+        raise ValueError("complete profile-scoped Zulip credentials are required")
+    return zul_bridge.Bridge(**settings)  # type: ignore[union-attr]
 
 
 def _missing_config(extra: dict[str, Any]) -> list[str]:
-    """Required env names that neither ``extra``/env nor libzul's settings supply."""
+    """Required credential names missing from the current Hermes profile."""
     values = {
         "ZULIP_SITE": str(_site_from(extra) or "").strip(),
         "ZULIP_EMAIL": str(_email_from(extra) or "").strip(),
         "ZULIP_API_KEY": str(_api_key_from(extra) or "").strip(),
     }
-    if all(values.values()):
-        return []
-    status = _bridge_config_status()
-    known = {
-        "ZULIP_SITE": "base_url",
-        "ZULIP_EMAIL": "email",
-        "ZULIP_API_KEY": "api_key",
-    }
-    return [name for name, value in values.items()
-            if not value and not status.get(known[name])]
+    return [name for name, value in values.items() if not value]
 
 
 def _message_text(event: dict[str, Any]) -> str:
@@ -265,7 +247,10 @@ class ZulipAdapter(BasePlatformAdapter):
             await self.disconnect()
 
         extra = getattr(self.config, "extra", {}) or {}
-        missing = _missing_config(extra)
+        settings = _bridge_kwargs(extra)
+        missing = [env for env, key in (("ZULIP_SITE", "base_url"),
+                   ("ZULIP_EMAIL", "email"), ("ZULIP_API_KEY", "api_key"))
+                   if not settings[key]]
         if missing:
             logger.error("[Zulip] missing configuration: %s", ", ".join(missing))
             self._set_fatal_error(
@@ -275,13 +260,15 @@ class ZulipAdapter(BasePlatformAdapter):
             )
             return False
 
+        self.site, self.email, self.api_key = (settings[key] for key in
+                                              ("base_url", "email", "api_key"))
         identity = f"{self.site}:{self.email}"
         if not self._acquire_platform_lock("zulip", identity, f"Zulip account {self.email}"):
             return False
 
         bridge = None
         try:
-            bridge = await asyncio.to_thread(_make_bridge, extra)
+            bridge = await asyncio.to_thread(_make_bridge, settings)
             account = await asyncio.to_thread(bridge.whoami)
         except asyncio.CancelledError:
             if bridge is not None:
@@ -466,7 +453,7 @@ class ZulipAdapter(BasePlatformAdapter):
             "text": text,
             "chat_id": encode_dm(recipients),
             "chat_name": ", ".join(names),
-            "chat_type": "dm",
+            "chat_type": "group" if len(set(recipients)) > 1 else "dm",
             "thread_id": None,
             "topic": None,
             "user_id": sender_email or (str(sender_id) if sender_id is not None else None),
@@ -681,7 +668,7 @@ async def _standalone_send(pconfig, chat_id: str, message: str, *, thread_id: st
 
     bridge = None
     try:
-        bridge = await asyncio.to_thread(_make_bridge, extra)
+        bridge = await asyncio.to_thread(_make_bridge, settings)
     except Exception as exc:
         detail = _redact(exc, settings["api_key"])
         logger.error("[Zulip] standalone send failed: %s", detail)

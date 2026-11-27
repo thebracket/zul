@@ -195,11 +195,11 @@ def test_validate_config_from_extra(config, fake_bridge):
     assert fake_bridge.config_status_calls == 0
 
 
-def test_validate_config_falls_back_to_libzul_status(config, fake_bridge):
+def test_validate_config_rejects_libzul_status(config, fake_bridge):
     config.extra.update({"site": "https://chat.example.com", "email": "bot@example.com"})
     fake_bridge.config_status_result = {"base_url": True, "email": True, "api_key": True}
-    assert validate_config(config) is True
-    assert fake_bridge.config_status_calls == 1
+    assert validate_config(config) is False
+    assert fake_bridge.config_status_calls == 0
 
     fake_bridge.config_status_result = {"base_url": True, "email": True, "api_key": False}
     assert validate_config(config) is False
@@ -214,12 +214,12 @@ def test_validate_config_without_extension_does_not_fall_back(config, monkeypatc
 def test_validate_config_rejects_missing_site_or_email(config, fake_bridge):
     fake_bridge.config_status_result = {"base_url": False, "email": False, "api_key": False}
     assert validate_config(config) is False
-    assert fake_bridge.config_status_calls == 1
+    assert fake_bridge.config_status_calls == 0
 
 
-def test_validate_config_accepts_libzul_site_and_email(config, fake_bridge):
+def test_validate_config_rejects_libzul_site_and_email(config, fake_bridge):
     fake_bridge.config_status_result = {"base_url": True, "email": True, "api_key": True}
-    assert validate_config(config) is True
+    assert validate_config(config) is False
 
 
 def test_missing_config_returns_the_env_names(config, fake_bridge):
@@ -230,7 +230,7 @@ def test_missing_config_returns_the_env_names(config, fake_bridge):
     assert _missing_config(config.extra) == ["ZULIP_API_KEY"]
 
     fake_bridge.config_status_result = {"base_url": False, "email": False, "api_key": True}
-    assert _missing_config(config.extra) == []
+    assert _missing_config(config.extra) == ["ZULIP_API_KEY"]
 
 
 def test_target_ref_registration_functions():

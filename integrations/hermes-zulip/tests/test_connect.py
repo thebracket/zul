@@ -78,15 +78,30 @@ async def test_connect_rejects_missing_api_key_without_libzul_fallback(
     assert fake_bridge.instances == []
 
 
-async def test_connect_accepts_api_key_from_libzul_config(
+async def test_connect_rejects_api_key_from_libzul_config(
         config, fake_bridge, monkeypatch):
     monkeypatch.setenv("ZULIP_SITE", "https://chat.example.com")
     monkeypatch.setenv("ZULIP_EMAIL", "bot@example.com")
     fake_bridge.config_status_result = {"base_url": True, "email": True, "api_key": True}
     adapter = ZulipAdapter(config)
-    assert await adapter.connect() is True
     try:
-        assert fake_bridge.instances[0].api_key == ""
+        assert await adapter.connect() is False
+        assert fake_bridge.instances == []
+        assert _lock_identities() == set()
+    finally:
+        await adapter.disconnect()
+
+
+async def test_connect_locks_the_same_resolved_account_it_passes_to_native(
+        config, fake_bridge, monkeypatch):
+    adapter = ZulipAdapter(config)
+    _env(monkeypatch, site="https://team.invalid", email="team@example.invalid", key="dummy")
+    try:
+        assert await adapter.connect() is True
+        bridge = fake_bridge.instances[0]
+        assert (bridge.base_url, bridge.email, bridge.api_key) == (
+            "https://team.invalid", "team@example.invalid", "dummy")
+        assert ("zulip", f"{bridge.base_url}:{bridge.email}") in _lock_identities()
     finally:
         await adapter.disconnect()
 
