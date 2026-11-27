@@ -24,6 +24,10 @@ A full-screen Ratatui interface built on libzul for browsing streams, topics, an
 
 A stdio Model Context Protocol server built on libzul. It implements MCP 2026-07-28, exposes Zulip read, search, and send tools (sends are dry-run unless explicitly confirmed), and advertises the MCP Events extension with a `zulip.message` event so a capable host can wake an agent when a message arrives. It reuses the same configuration and credentials as the other crates. See [`crates/zul-mcp/README.md`](crates/zul-mcp/README.md) for client setup, the tool reference, and watch/automation examples.
 
+### Hermes adapter (Zulip)
+
+[`integrations/hermes-zulip`](integrations/hermes-zulip/README.md) packages a Hermes Agent gateway plugin with a PyO3 bridge over libzul, so a Hermes agent can serve Zulip streams, topics, and direct messages. Install the wheel into the Hermes environment, run `hermes-zulip-install`, then `hermes plugins enable zulip-platform`. The integration README covers setup, configuration, behavior, limits, and validation.
+
 ## AI Usage Disclosure
 
 This crate was largely created with LLM coding agents, and then fixed by hand.

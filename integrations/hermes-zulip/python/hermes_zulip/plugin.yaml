@@ -1,0 +1,58 @@
+name: zulip-platform
+label: Zulip
+kind: platform
+version: 0.1.0
+description: >
+  Zulip gateway adapter for Hermes Agent: streams and topics map to group
+  sessions, direct messages map to DM sessions, and replies stay in the
+  originating topic.
+author: Zulip Thigy contributors
+homepage: https://github.com/thebracket/zul
+requires_env:
+  - name: ZULIP_SITE
+    description: "Zulip realm URL (for example https://chat.example.com); ZULIP_BASE_URL is also accepted and wins when both are set"
+    prompt: "Zulip site URL"
+    url: "https://zulip.com/api/"
+    password: false
+  - name: ZULIP_EMAIL
+    description: "Email address of the Zulip bot account"
+    prompt: "Zulip bot email"
+    password: false
+  - name: ZULIP_API_KEY
+    description: "API key for the Zulip bot account (Settings > Personal > API key)"
+    prompt: "Zulip API key"
+    url: "https://zulip.com/api/api-keys"
+    password: true
+optional_env:
+  - name: ZULIP_BASE_URL
+    description: "Alias for ZULIP_SITE; ZULIP_BASE_URL wins when both are set"
+    prompt: "Zulip site URL"
+    password: false
+  - name: ZULIP_REQUIRE_MENTION
+    description: "Require an @-mention before a stream message reaches the agent (default true)"
+    prompt: "Require mention in streams"
+    password: false
+  - name: ZULIP_ALLOWED_STREAMS
+    description: "Comma-separated stream names to accept; empty accepts every stream"
+    prompt: "Allowed streams (comma-separated)"
+    password: false
+  - name: ZULIP_ALLOWED_USERS
+    description: "Comma-separated user IDs or emails allowed to talk to the bot"
+    prompt: "Allowed users (comma-separated)"
+    password: false
+  - name: ZULIP_ALLOW_ALL_USERS
+    description: "Allow every Zulip user to talk to the bot (overrides ZULIP_ALLOWED_USERS)"
+    prompt: "Allow all users"
+    password: false
+  - name: ZULIP_HOME_CHANNEL
+    description: "Default target for cron delivery (/sethome); use stream:<stream>/<topic>, @<email>, or a canonical chat id"
+    prompt: "Home channel"
+    password: false
+  - name: ZULIP_MAX_MESSAGE_LENGTH
+    description: "Maximum characters per Zulip message before splitting (default 10000)"
+    prompt: "Max message length"
+    password: false
+  - name: ZULIP_QUEUE_TIMEOUT_SECS
+    description: "Optional idle timeout for the Zulip event queue, in seconds"
+    prompt: "Event queue timeout (seconds)"
+    password: false
